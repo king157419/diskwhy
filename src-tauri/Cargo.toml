@@ -1,0 +1,23 @@
+[package]
+name = "diskwhy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DiskWhy 桌面壳（Tauri 2，只做 IPC 转发）"
+authors = ["DiskWhy contributors"]
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "diskwhy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+diskwhy-core = { path = "../crates/diskwhy-core" }

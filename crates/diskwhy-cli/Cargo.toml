@@ -1,0 +1,15 @@
+[package]
+name = "diskwhy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DiskWhy 命令行"
+
+[[bin]]
+name = "diskwhy-cli"
+path = "src/main.rs"
+
+[dependencies]
+diskwhy-core = { path = "../diskwhy-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口能力：只开放 core 默认权限；应用自定义命令（scan/list_dir 等）按 Tauri 2 规则默认对所有窗口可用",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

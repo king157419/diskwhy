@@ -83,8 +83,13 @@ async function doSave() {
       <div class="privacy small">
         <b>会发送什么：</b>文件夹名、父路径（C:\Users\你的用户名 会换成 ~）、最大的 10 个子项名和大小、文件类型分布、总大小、修改日期。<br />
         <b>绝不发送：</b>任何文件的内容。AI 的回答一律标“AI 推测 · 需要你来判断”，不会被当成“可以放心清理”。<br />
-        设置保存在 %LOCALAPPDATA%\DiskWhy\settings.json（API Key 以明文保存在本机）。
+        设置保存在 %LOCALAPPDATA%\DiskWhy\settings.json。
       </div>
+
+      <p class="key-warn small" role="note">
+        ⚠ API Key 目前<b>明文</b>保存在上面的 settings.json 里，没有加密：能登录这台电脑这个账户的人或程序都能读到。
+        建议只用本机 Ollama（不需要 Key），或给 DiskWhy 单独建一个额度很低、随时可以作废的 Key。
+      </p>
 
       <p v-if="result" class="small" :class="resultOk ? 'ok-line' : 'ai-error'">{{ result }}</p>
 

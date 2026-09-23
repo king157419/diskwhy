@@ -24,6 +24,14 @@ pub struct NodeView {
     pub reparse_skipped: bool,
     pub cloud_placeholder: bool,
     pub system_reserved: bool,
+    /// 硬链接的“多余名字”：空间记在别的路径上，这里为 0。
+    #[serde(default)]
+    pub hardlink_dup: bool,
+    /// 商店应用目录映射：和 `mapped_to` 是同一份数据，空间记在那边。
+    #[serde(default)]
+    pub mapped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_to: Option<String>,
     pub files: u64,
     pub dirs: u64,
     /// 直接子项数（内存里的，Rest 算一个）。
@@ -59,8 +67,12 @@ pub fn type_label(n: &Node) -> String {
     match n.kind {
         NodeKind::Rest => "其余文件合计".into(),
         NodeKind::Dir => {
-            if n.reparse_skipped {
+            if n.mapped {
+                "目录映射（同一份数据）".into()
+            } else if n.reparse_skipped {
                 "链接/挂载点（未跟随）".into()
+            } else if n.inaccessible && !n.children.is_empty() {
+                format!("文件夹（无权限，只量了已知的 {} 个子目录）", n.children.len())
             } else if n.inaccessible {
                 "文件夹（无权限）".into()
             } else if n.system_reserved {
@@ -72,6 +84,8 @@ pub fn type_label(n: &Node) -> String {
         NodeKind::File => {
             if n.cloud_placeholder {
                 "云端占位文件".into()
+            } else if n.hardlink_dup {
+                "硬链接（空间记在别处）".into()
             } else if n.system_reserved {
                 "系统保留文件".into()
             } else {
@@ -106,6 +120,9 @@ pub fn node_view(n: &Node, parent_path: Option<&str>, parent_alloc: u64) -> Node
         reparse_skipped: n.reparse_skipped,
         cloud_placeholder: n.cloud_placeholder,
         system_reserved: n.system_reserved,
+        hardlink_dup: n.hardlink_dup,
+        mapped: n.mapped,
+        mapped_to: None,
         files: n.files,
         dirs: n.dirs,
         child_count: n.children.len(),
@@ -155,6 +172,9 @@ pub fn listing(result: &ScanResult, path: &str, limit: usize, ctx: Option<&Expla
         .take(limit)
         .map(|c| {
             let mut v = node_view(c, Some(&node.path), node.allocated);
+            if c.mapped {
+                v.mapped_to = mapped_to(result, &c.path);
+            }
             if let Some(ctx) = ctx {
                 let t = Target { node: c, path: &v.path, parent: Some(node), ancestors: &chain };
                 v.explanation = Some(explain::explain_with_inherited(&t, inherited.as_ref(), ctx));
@@ -163,6 +183,9 @@ pub fn listing(result: &ScanResult, path: &str, limit: usize, ctx: Option<&Expla
         })
         .collect();
     let mut me = node_view(node, None, parent_alloc);
+    if node.mapped {
+        me.mapped_to = mapped_to(result, &node.path);
+    }
     if let Some(ctx) = ctx {
         let anc = &chain[..chain.len() - 1];
         let t = Target { node, path: &node.path, parent: anc.last().copied(), ancestors: anc };
@@ -174,6 +197,151 @@ pub fn listing(result: &ScanResult, path: &str, limit: usize, ctx: Option<&Expla
         total_children: node.children.len(),
         breadcrumb: chain.iter().map(|n| Crumb { name: n.name.clone(), path: n.path.clone() }).collect(),
     })
+}
+
+/// 映射目录对应的“真正记账”路径。
+pub fn mapped_to(result: &ScanResult, path: &str) -> Option<String> {
+    result.mapped_dirs.iter().find(|m| m.path.eq_ignore_ascii_case(path)).map(|m| m.same_as.clone())
+}
+
+// ───────────────────────── 阶段 C：方块图（treemap）数据 ─────────────────────────
+
+/// 方块图的一个节点（只带画图和悬停提示需要的字段；详情仍走 `listing`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreemapNode {
+    pub name: String,
+    /// File 由父路径拼出；Rest 为父目录路径。
+    pub path: String,
+    pub kind: NodeKind,
+    pub allocated: u64,
+    /// safe / review / keep / unknown（与列表色标一致）
+    pub tier: String,
+    pub what: String,
+    pub owner: Option<String>,
+    pub inaccessible: bool,
+    pub reparse_skipped: bool,
+    pub system_reserved: bool,
+    pub cloud_placeholder: bool,
+    pub hardlink_dup: bool,
+    pub mapped: bool,
+    /// 能否双击进入（有子项的普通目录）。
+    pub can_open: bool,
+    pub children: Vec<TreemapNode>,
+    /// 因为太小 / 太多没有发过来的子项合计（前端画成“其他”）。
+    pub hidden_bytes: u64,
+    pub hidden_count: usize,
+}
+
+/// 每层最多发多少个子项、占根的最小比例。
+const TM_LEVELS: [(usize, f64); 3] = [(300, 0.0), (80, 0.0004), (40, 0.001)];
+
+/// 取以 `path` 为根、最多 `depth` 层（1~3）的方块图数据。每个节点都带档位和一句话说明。
+pub fn treemap(result: &ScanResult, path: &str, depth: usize, ctx: Option<&ExplainCtx>) -> Option<TreemapNode> {
+    let chain = find_dir(&result.tree, path)?;
+    let node = *chain.last().unwrap();
+    let anc = &chain[..chain.len() - 1];
+    let me = tm_node(result, node, &node.path, anc, None, ctx);
+    let root_alloc = node.allocated.max(1);
+    let mut chain_v: Vec<&Node> = chain.clone();
+    Some(tm_fill(result, me, node, &mut chain_v, 0, depth.clamp(1, 3), root_alloc, ctx))
+}
+
+fn tm_node(
+    result: &ScanResult,
+    n: &Node,
+    path: &str,
+    ancestors: &[&Node],
+    inherited: Option<&crate::explain::rules::InheritedHit>,
+    ctx: Option<&ExplainCtx>,
+) -> TreemapNode {
+    let _ = result;
+    let (tier, what, owner) = match ctx {
+        Some(ctx) => {
+            let t = Target { node: n, path, parent: ancestors.last().copied(), ancestors };
+            let e = match inherited {
+                Some(h) => explain::explain_with_inherited(&t, Some(h), ctx),
+                None if ancestors.is_empty() => explain::explain(&t, ctx),
+                None => explain::explain_with_inherited(&t, None, ctx),
+            };
+            let tier = if e.is_unknown() {
+                "unknown"
+            } else {
+                match e.tier {
+                    explain::Tier::Safe => "safe",
+                    explain::Tier::Review => "review",
+                    explain::Tier::Keep => "keep",
+                }
+            };
+            (tier.to_string(), e.what, e.owner)
+        }
+        None => ("unknown".to_string(), String::new(), None),
+    };
+    TreemapNode {
+        name: n.name.clone(),
+        path: path.to_string(),
+        kind: n.kind,
+        allocated: n.allocated,
+        tier,
+        what,
+        owner,
+        inaccessible: n.inaccessible,
+        reparse_skipped: n.reparse_skipped,
+        system_reserved: n.system_reserved,
+        cloud_placeholder: n.cloud_placeholder,
+        hardlink_dup: n.hardlink_dup,
+        mapped: n.mapped,
+        can_open: n.kind == NodeKind::Dir && !n.reparse_skipped && !n.children.is_empty(),
+        children: Vec::new(),
+        hidden_bytes: 0,
+        hidden_count: 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tm_fill<'a>(
+    result: &ScanResult,
+    mut me: TreemapNode,
+    node: &'a Node,
+    chain: &mut Vec<&'a Node>,
+    level: usize,
+    depth: usize,
+    root_alloc: u64,
+    ctx: Option<&ExplainCtx>,
+) -> TreemapNode {
+    if level >= depth || node.kind != NodeKind::Dir || node.children.is_empty() {
+        return me;
+    }
+    let (max_n, min_frac) = TM_LEVELS[level.min(TM_LEVELS.len() - 1)];
+    let min_bytes = (root_alloc as f64 * min_frac) as u64;
+    let inherited = ctx.and_then(|c| c.rules.best_inherited(chain));
+    let mut sent = 0usize;
+    for c in &node.children {
+        if c.allocated == 0 {
+            continue;
+        }
+        if sent >= max_n || c.allocated < min_bytes.max(1) {
+            me.hidden_bytes += c.allocated;
+            me.hidden_count += 1;
+            continue;
+        }
+        sent += 1;
+        let path = match c.kind {
+            NodeKind::Dir => c.path.clone(),
+            NodeKind::File => join(&node.path, &c.name),
+            NodeKind::Rest => node.path.clone(),
+        };
+        let child = tm_node(result, c, &path, chain, inherited.as_ref(), ctx);
+        let child = if c.kind == NodeKind::Dir {
+            chain.push(c);
+            let x = tm_fill(result, child, c, chain, level + 1, depth, root_alloc, ctx);
+            chain.pop();
+            x
+        } else {
+            child
+        };
+        me.children.push(child);
+    }
+    me
 }
 
 /// 按路径找任意节点（目录或文件）。返回 (从根到父目录的链, 节点)。
@@ -264,6 +432,8 @@ impl Node {
             reparse_skipped: self.reparse_skipped,
             cloud_placeholder: self.cloud_placeholder,
             system_reserved: self.system_reserved,
+            hardlink_dup: self.hardlink_dup,
+            mapped: self.mapped,
             files: self.files,
             dirs: self.dirs,
             children: Vec::new(),

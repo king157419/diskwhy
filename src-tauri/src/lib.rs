@@ -6,26 +6,41 @@
 //! - `start_scan`         (root, onProgress: Channel<ScanProgress>) -> ScanSummary（含各档合计 tiers）
 //! - `cancel_scan`
 //! - `list_dir`           (path, limit?) -> DirListing（子项按 allocated 降序，每项带 explanation）
+//! - `get_treemap`        (path, depth?) -> TreemapNode（阶段 C：方块图数据，最多 3 层，每块带档位）
+//! - `node_info`          (path, kind) -> NodeView（方块图里点了更深一层的块时取详情）
+//! - `save_snapshot`      -> 保存路径（弹系统“另存为”对话框，写 gzip JSON）
+//! - `open_snapshot`      (path?) -> ScanSummary（弹“打开”对话框读快照，替换当前结果；解释照常现算）
+//! - `startup_snapshot`   -> 启动参数里给的快照路径（`diskwhy.exe 某次扫描.dwsnap`，或双击关联的 .dwsnap）
 //! - `relaunch_as_admin`  以管理员身份重启（ShellExecuteW runas），成功后退出当前进程
 //! - `get_settings` / `save_settings(settings)` -> LLM 设置（%LOCALAPPDATA%\DiskWhy\settings.json）
 //! - `test_llm(settings)` -> 连接测试结果文本
 //! - `ask_ai(path)`       -> Explanation（source = Llm，tier = review），只在用户点“问 AI”时调用
+//!
+//! 插件：`tauri-plugin-opener`（前端打开参考链接）、`tauri-plugin-dialog`（快照的保存/打开对话框，
+//! 只在 Rust 侧调用，前端不需要 dialog 权限）。
 
 use diskwhy_core::explain::llm::{self, LlmSettings};
 use diskwhy_core::explain::{tier_summary, ExplainCtx, Explanation, Target, TierSummary};
 use diskwhy_core::scan::scan;
-use diskwhy_core::view::{find_node, listing, DirListing};
+use diskwhy_core::snapshot::{self, SnapshotMeta};
+use diskwhy_core::view::{self, find_dir, find_node, listing, node_view, DirListing, NodeView, TreemapNode};
 use diskwhy_core::win::{is_elevated, list_fixed_drives, relaunch_as_admin as core_relaunch, DriveInfo, RelaunchError};
-use diskwhy_core::{Attribution, InaccessibleDir, NodeKind, ScanOptions, ScanProgress, ScanResult, SizeMode};
+use diskwhy_core::{
+    Attribution, InaccessibleDir, MappedDir, NodeKind, ScanOptions, ScanProgress, ScanResult, SizeMode,
+};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
 #[derive(Default)]
 struct AppState {
     result: Mutex<Option<Arc<ScanResult>>>,
+    /// 当前结果如果来自快照，记下来源。
+    snapshot: Mutex<Option<SnapshotInfo>>,
     cancel: Mutex<Arc<AtomicBool>>,
     scanning: AtomicBool,
     /// 解释上下文（环境变量 + 规则库 + 注册表快照 + 设置），第一次用到时加载一次。
@@ -59,6 +74,10 @@ impl AppState {
         let warnings = w.as_ref().map(|x| x.1.clone()).unwrap_or_default();
         *w = Some((Arc::new(next), warnings));
     }
+
+    fn result(&self) -> Result<Arc<ScanResult>, String> {
+        self.result.lock().unwrap().clone().ok_or_else(|| "还没有扫描结果".to_string())
+    }
 }
 
 #[derive(Serialize)]
@@ -71,7 +90,16 @@ struct EnvInfo {
     llm_ready: bool,
 }
 
-/// 扫描完成后返回给前端的摘要（不含整棵树；树通过 list_dir 按需取）。
+/// 快照来源信息（给界面显示）。
+#[derive(Serialize, Clone)]
+struct SnapshotInfo {
+    path: String,
+    meta: SnapshotMeta,
+    /// 读取用时（毫秒）。
+    load_ms: u64,
+}
+
+/// 扫描完成后返回给前端的摘要（不含整棵树；树通过 list_dir / get_treemap 按需取）。
 #[derive(Serialize)]
 struct ScanSummary {
     root: String,
@@ -90,6 +118,32 @@ struct ScanSummary {
     top_files_per_dir: usize,
     /// 本次扫描按规则库归到 safe / review / keep 的合计。
     tiers: TierSummary,
+    /// 商店应用目录映射（阶段 C 去重）。
+    mapped_dirs: Vec<MappedDir>,
+    /// 结果来自快照时不为空。
+    snapshot: Option<SnapshotInfo>,
+}
+
+fn summarize(r: &ScanResult, tiers: TierSummary, snapshot: Option<SnapshotInfo>) -> ScanSummary {
+    ScanSummary {
+        root: r.root.clone(),
+        total_bytes: r.total_bytes,
+        used_bytes: r.used_bytes,
+        free_bytes: r.free_bytes,
+        cluster_size: r.cluster_size,
+        buckets: r.buckets.clone(),
+        duration_ms: r.duration_ms,
+        files: r.files,
+        dirs: r.dirs,
+        elevated: r.elevated,
+        inaccessible_total: r.inaccessible_total,
+        inaccessible_sample: r.inaccessible_dirs.iter().take(50).cloned().collect(),
+        size_mode: r.size_mode,
+        top_files_per_dir: r.top_files_per_dir,
+        tiers,
+        mapped_dirs: r.mapped_dirs.clone(),
+        snapshot,
+    }
 }
 
 #[tauri::command]
@@ -123,6 +177,7 @@ async fn start_scan(
     *state.cancel.lock().unwrap() = cancel.clone();
     // 扫描期间释放旧结果，避免同时占两份内存
     *state.result.lock().unwrap() = None;
+    *state.snapshot.lock().unwrap() = None;
     let ctx = state.ctx();
 
     let res = tauri::async_runtime::spawn_blocking(move || {
@@ -136,23 +191,7 @@ async fn start_scan(
     state.scanning.store(false, Ordering::SeqCst);
 
     let (r, tiers) = res.map_err(|e| format!("扫描线程异常：{e}"))?.map_err(|e| e.to_string())?;
-    let summary = ScanSummary {
-        root: r.root.clone(),
-        total_bytes: r.total_bytes,
-        used_bytes: r.used_bytes,
-        free_bytes: r.free_bytes,
-        cluster_size: r.cluster_size,
-        buckets: r.buckets.clone(),
-        duration_ms: r.duration_ms,
-        files: r.files,
-        dirs: r.dirs,
-        elevated: r.elevated,
-        inaccessible_total: r.inaccessible_total,
-        inaccessible_sample: r.inaccessible_dirs.iter().take(50).cloned().collect(),
-        size_mode: r.size_mode,
-        top_files_per_dir: r.top_files_per_dir,
-        tiers,
-    };
+    let summary = summarize(&r, tiers, None);
     *state.result.lock().unwrap() = Some(Arc::new(r));
     Ok(summary)
 }
@@ -164,9 +203,127 @@ fn cancel_scan(state: State<'_, AppState>) {
 
 #[tauri::command]
 fn list_dir(path: String, limit: Option<usize>, state: State<'_, AppState>) -> Result<DirListing, String> {
-    let r = state.result.lock().unwrap().clone().ok_or("还没有扫描结果")?;
+    let r = state.result()?;
     let ctx = state.ctx();
     listing(&r, &path, limit.unwrap_or(1000), Some(&ctx)).ok_or_else(|| format!("在扫描结果里找不到目录：{path}"))
+}
+
+#[tauri::command]
+async fn get_treemap(path: String, depth: Option<usize>, state: State<'_, AppState>) -> Result<TreemapNode, String> {
+    let r = state.result()?;
+    let ctx = state.ctx();
+    tauri::async_runtime::spawn_blocking(move || {
+        view::treemap(&r, &path, depth.unwrap_or(3), Some(&ctx)).ok_or_else(|| format!("在扫描结果里找不到目录：{path}"))
+    })
+    .await
+    .map_err(|e| format!("方块图线程异常：{e}"))?
+}
+
+/// 任意节点（目录 / 文件 / “其余小文件”）的详情视图，带解释。
+#[tauri::command]
+fn node_info(path: String, kind: NodeKind, state: State<'_, AppState>) -> Result<NodeView, String> {
+    let r = state.result()?;
+    let ctx = state.ctx();
+    let not_found = || format!("在扫描结果里找不到：{path}");
+    let (chain, node, full) = if kind == NodeKind::Rest {
+        let chain = find_dir(&r.tree, &path).ok_or_else(not_found)?;
+        let dir = *chain.last().unwrap();
+        let rest = dir.children.iter().find(|c| c.kind == NodeKind::Rest).ok_or_else(not_found)?;
+        (chain, rest, dir.path.clone())
+    } else {
+        let (chain, node) = find_node(&r.tree, &path).ok_or_else(not_found)?;
+        let full = if node.kind == NodeKind::Dir { node.path.clone() } else { path.clone() };
+        (chain, node, full)
+    };
+    let parent = chain.last().copied();
+    let parent_path = parent.map(|p| p.path.as_str());
+    let parent_alloc = parent.map(|p| p.allocated).unwrap_or(r.used_bytes);
+    let mut v = node_view(node, parent_path, parent_alloc);
+    if node.kind == NodeKind::Rest {
+        v.path = full.clone();
+    }
+    if node.mapped {
+        v.mapped_to = view::mapped_to(&r, &node.path);
+    }
+    let t = Target { node, path: &full, parent, ancestors: &chain };
+    v.explanation = Some(diskwhy_core::explain::explain(&t, &ctx));
+    Ok(v)
+}
+
+#[tauri::command]
+async fn save_snapshot(app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let r = state.result()?;
+    let default_name = format!(
+        "DiskWhy-{}-{}.dwsnap",
+        r.root.trim_end_matches(['\\', ':']).replace(['\\', ':'], "_"),
+        diskwhy_core::explain::now_unix()
+    );
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(fp) = app
+            .dialog()
+            .file()
+            .set_title("保存扫描快照")
+            .set_file_name(default_name)
+            .add_filter("DiskWhy 快照", &["dwsnap"])
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let p: PathBuf = fp.into_path().map_err(|e| e.to_string())?;
+        let p2 = p.clone();
+        let n = snapshot::with_big_stack(move || snapshot::save(&r, &p2, env!("CARGO_PKG_VERSION")))?;
+        Ok(Some(format!("{}（{}）", p.display(), view::human_bytes(n))))
+    })
+    .await
+    .map_err(|e| format!("保存线程异常：{e}"))?
+}
+
+#[tauri::command]
+async fn open_snapshot(path: Option<String>, app: AppHandle, state: State<'_, AppState>) -> Result<Option<ScanSummary>, String> {
+    if state.scanning.load(Ordering::SeqCst) {
+        return Err("正在扫描，先等扫描结束或取消".into());
+    }
+    let ctx = state.ctx();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let p: PathBuf = match path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let Some(fp) = app
+                    .dialog()
+                    .file()
+                    .set_title("打开扫描快照")
+                    .add_filter("DiskWhy 快照 / CLI JSON", &["dwsnap", "json"])
+                    .blocking_pick_file()
+                else {
+                    return Ok(None);
+                };
+                fp.into_path().map_err(|e| e.to_string())?
+            }
+        };
+        let t = std::time::Instant::now();
+        let p2 = p.clone();
+        let (r, meta) = snapshot::with_big_stack(move || snapshot::load(&p2))?;
+        let load_ms = t.elapsed().as_millis() as u64;
+        let tiers = tier_summary(&r.tree, &ctx);
+        let info = SnapshotInfo { path: p.display().to_string(), meta, load_ms };
+        Ok::<_, String>(Some((r, tiers, info)))
+    })
+    .await
+    .map_err(|e| format!("读取线程异常：{e}"))??;
+    let Some((r, tiers, info)) = res else { return Ok(None) };
+    let summary = summarize(&r, tiers, Some(info.clone()));
+    *state.result.lock().unwrap() = Some(Arc::new(r));
+    *state.snapshot.lock().unwrap() = Some(info);
+    Ok(Some(summary))
+}
+
+/// 启动参数里的快照文件（第一个以 .dwsnap / .json 结尾的参数）。前端启动时问一次，有就直接打开。
+#[tauri::command]
+fn startup_snapshot() -> Option<String> {
+    std::env::args().skip(1).find(|a| {
+        let l = a.to_lowercase();
+        (l.ends_with(".dwsnap") || l.ends_with(".json")) && std::path::Path::new(a).is_file()
+    })
 }
 
 #[tauri::command]
@@ -203,7 +360,7 @@ async fn test_llm(settings: LlmSettings) -> Result<String, String> {
 
 #[tauri::command]
 async fn ask_ai(path: String, state: State<'_, AppState>) -> Result<Explanation, String> {
-    let r = state.result.lock().unwrap().clone().ok_or("还没有扫描结果")?;
+    let r = state.result()?;
     let ctx = state.ctx();
     tauri::async_runtime::spawn_blocking(move || {
         let (chain, node) = find_node(&r.tree, &path).ok_or_else(|| format!("在扫描结果里找不到：{path}"))?;
@@ -221,6 +378,8 @@ async fn ask_ai(path: String, state: State<'_, AppState>) -> Result<Explanation,
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_env,
@@ -228,6 +387,11 @@ pub fn run() {
             start_scan,
             cancel_scan,
             list_dir,
+            get_treemap,
+            node_info,
+            save_snapshot,
+            open_snapshot,
+            startup_snapshot,
             relaunch_as_admin,
             get_settings,
             save_settings,

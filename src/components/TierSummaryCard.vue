@@ -24,7 +24,7 @@ const cells = computed(() => [
   <section class="tiers card" aria-label="本次扫描各档合计">
     <div class="attr-head">
       <span class="attr-title">本次扫描能腾多少</span>
-      <span class="muted small">按规则库归档，命中 {{ tiers.rules_hit }}/{{ tiers.rules_total }} 条规则</span>
+      <span class="muted small" title="按规则库把去重后的每个字节归到一档；硬链接和商店应用目录映射只算一次。量不到的“无权限”部分不在这四项里。">按规则库归档，命中 {{ tiers.rules_hit }}/{{ tiers.rules_total }} 条规则</span>
     </div>
     <div class="tier-cells">
       <div v-for="c in cells" :key="c.key" class="tier-cell" :class="'tc-' + c.key" :title="c.note">
@@ -33,8 +33,5 @@ const cells = computed(() => [
         <div class="tc-top muted small">{{ c.top || c.note }}</div>
       </div>
     </div>
-    <p class="muted small tiers-foot">
-      四项之和可能比已用空间多：硬链接、商店应用目录映射等会被重复计数（见上方提示，阶段 C 去重）。
-    </p>
   </section>
 </template>

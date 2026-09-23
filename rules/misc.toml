@@ -391,3 +391,111 @@ how = "manual"
 how_detail = "只清标绿的缓存子文件夹。"
 refs = []
 verified_on = "2026-09-23"
+
+# ───────── 阶段 C：阶段 B 遗留的未知项（查过文档；查不到的写 review + 线索） ─────────
+
+[[rule]]
+id = "vscode-home-dir"
+owner = "Visual Studio Code"
+category = "app"
+tier = "review"
+scope = "self"
+match = ['%USERPROFILE%\.vscode']
+what = "VS Code 的扩展和启动参数所在的文件夹"
+why = "官方文档：扩展装在 %USERPROFILE%\\.vscode\\extensions（里面的扩展有单独的规则）。argv.json 是启动参数；cli 子文件夹从名字看是 VS Code 命令行工具（code tunnel 等）用的，我没在官方文档里找到单独说明"
+lose = "别整个删：所有扩展都会消失，要重新安装；argv.json 里的启动参数也会丢。"
+how = "migrate"
+how_detail = "扩展多、C 盘紧张时，可以用 --extensions-dir 启动参数或 VSCODE_EXTENSIONS 环境变量把扩展目录放到别的盘（官方文档写明支持）。"
+refs = ["https://code.visualstudio.com/docs/configure/extensions/extension-marketplace"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "antigravity-home-dir"
+owner = "Google Antigravity（编辑器）"
+category = "app"
+tier = "review"
+scope = "self"
+match = ['%USERPROFILE%\.antigravity', '%USERPROFILE%\.antigravity-ide']
+what = "Google Antigravity 编辑器的扩展文件夹"
+why = "Antigravity 是基于 VS Code 的编辑器，这个文件夹的结构和 ~\\.vscode 一样（extensions + argv.json）。Antigravity 官方文档没有写这个文件夹；Google 开发者论坛上有用户提到 2.0 版的 IDE 改用 .antigravity-ide（不是官方说明，仅供参考）"
+lose = "删了 Antigravity 里装的扩展都会消失，要重新安装。"
+how = "manual"
+how_detail = "不用 Antigravity 了就先卸载它，再删这个文件夹；还在用就在编辑器的扩展面板里卸掉不需要的扩展。"
+refs = ["https://discuss.ai.google.dev/t/fix-for-antigravity-2-0-hijacking-the-ide-and-how-to-restore-your-lost-settings-extensions-for-windows-user/146158"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "codex-desktop-local"
+owner = "Codex 桌面版（OpenAI）"
+category = "app"
+tier = "review"
+match = ['%LOCALAPPDATA%\OpenAI\Codex']
+what = "Codex 桌面版从安装包里复制出来的程序和运行时"
+why = "从文件看：bin 里是 codex.exe、node.exe 和几个按哈希命名的文件夹，runtimes 里是 cua_node 等运行时。openai/codex 仓库的 issue #42412 描述了桌面版会把商店安装包里的运行时搬到这个用户可写的目录。OpenAI 官方文档里没有这个文件夹的说明"
+lose = "我不确定删了会不会自动重新生成；在用 Codex 桌面版的话，删了可能打不开或要重新准备运行时。"
+how = "manual"
+how_detail = "不用 Codex 桌面版了：先在“设置 > 应用”里卸载，再删这里。还在用就别动。"
+refs = ["https://github.com/openai/codex/issues/42412"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "codex-runtimes-cache"
+owner = "Codex（OpenAI，推测）"
+category = "app"
+tier = "review"
+match = ['%USERPROFILE%\.cache\codex-runtimes']
+what = "看起来是 Codex 自带的一套运行时（Python、Node 和原生依赖）"
+why = "线索：codex-primary-runtime\\dependencies 下有 native / python / node 三套运行时和 runtime.json，旁边的 codex-primary-runtime.previous-<GUID> 像是上一版的残留。没有找到官方文档说明它由谁创建、删了会不会自动重下"
+lose = "我不确定：删了可能要让 Codex 重新下载运行时，期间相关功能用不了。"
+how = "manual"
+how_detail = "先退出 Codex。名字带 .previous- 的旧版本文件夹看起来是升级残留，删它风险最小；codex-primary-runtime 本身建议保留。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "aclos-game-recorder"
+owner = "不确定（可能与腾讯《无畏契约》的“无畏时刻”录像有关）"
+category = "userdata"
+tier = "review"
+match = ['%APPDATA%\ACLOS', '%USERPROFILE%\AppData\ACLOS']
+what = "某个游戏相关程序的数据，以及它录下来的游戏视频"
+why = "线索：Roaming\\ACLOS 是 Electron 程序的数据（Cache、GPUCache 等），还有 GameProxyCrashReports、TcVersions、Fixs；AppData\\ACLOS 下的 aclos-highlight、wonderfulVideos… 里是几 GB 的视频。网上有视频说《无畏契约》国服的“无畏时刻”自动录像默认存在 C 盘的 ACLOS 文件夹——没有找到官方说明，注册表里也没有登记，仅供参考"
+lose = "录像删了就找不回来；程序文件删了，相关的录制 / 加速功能可能失效。Cache 类子文件夹有单独规则（可放心清）。"
+how = "manual"
+how_detail = "先确认是哪款软件（看游戏客户端里有没有“高光时刻 / 无畏时刻”之类的录像设置，一般能改保存位置）。录像想留就在软件里把保存位置改到别的盘再搬走；不想留就在软件里删。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "electron-updater-cache"
+owner = "用 electron-builder 打包的软件"
+category = "installer"
+tier = "safe"
+owner_from_path = true
+kind = "dir"
+match = ['%LOCALAPPDATA%\*-updater']
+when_child = ["installer.exe", "pending", "update-info.json"]
+what = "软件自动更新时下载下来的安装包"
+why = "electron-builder 的自动更新模块把新版安装包下载到 %LOCALAPPDATA%\\<软件名>-updater（源码：app-builder-lib 的 updaterCacheDirName = 软件名小写 + \"-updater\"，electron-updater 的缓存根目录在 Windows 上是 LOCALAPPDATA）"
+lose = "只是已经下载的更新安装包；删了下次更新会重新下载。软件正提示“重启以安装更新”时先完成更新再删。"
+how = "delete"
+how_detail = "退出对应软件后删除整个文件夹即可。"
+refs = [
+  "https://github.com/electron-userland/electron-builder/blob/master/packages/app-builder-lib/src/appInfo.ts",
+  "https://github.com/electron-userland/electron-builder/blob/master/packages/electron-updater/src/AppAdapter.ts",
+]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "pandoc-local"
+owner = "Pandoc（文档格式转换工具）"
+category = "app"
+tier = "review"
+match = ['%LOCALAPPDATA%\Pandoc']
+what = "Pandoc 的程序本体"
+why = "文件夹里是 pandoc.exe、MANUAL.html、COPYRIGHT.txt，和 Pandoc 官方安装包的内容一致。pandoc.org 的安装说明只写了 MSI 会安装 pandoc 并把目录加进 PATH，没有写默认装在哪；本机注册表的“已安装应用”里没有找到它的登记"
+lose = "删了 pandoc 命令就没了：依赖它的工具（文档转换脚本、一些编辑器的导出功能）会失败。"
+how = "manual"
+how_detail = "还用就留着；不用了先看“设置 > 应用”里有没有 Pandoc 可以卸载，没有再手动删。子文件夹 pandoc-3.1.11 像是另一份单独解压的版本，我不确定是谁放的。"
+refs = ["https://pandoc.org/installing.html"]
+verified_on = "2026-09-23"

@@ -29,6 +29,8 @@ struct MockFs {
     /// 记录所有 compressed_size 调用（用来证明占位文件从未被“打开”）
     queried: Mutex<Vec<String>>,
     delay: Duration,
+    /// 列不出目录时“从别处知道”的子目录（模拟 WindowsApps 的包目录清单）
+    known: HashMap<String, Vec<String>>,
 }
 
 fn file(name: &str, size: u64, a: u32) -> RawEntry {
@@ -70,6 +72,9 @@ impl FsBackend for MockFs {
     fn compressed_size(&self, path: &str) -> Option<u64> {
         self.queried.lock().unwrap().push(path.to_string());
         self.compressed.get(&path.to_lowercase()).copied()
+    }
+    fn known_children(&self, dir: &str) -> Vec<String> {
+        self.known.get(&dir.to_lowercase()).cloned().unwrap_or_default()
     }
 }
 
@@ -303,4 +308,25 @@ fn view_listing_and_top_dirs() {
     assert!(view::listing(&r, r"M:\nope", 10, None).is_none());
     // JSON 可序列化
     let _ = serde_json::to_string(&view::truncate_tree(&r.tree, 2)).unwrap();
+}
+
+#[test]
+fn mock_windowsapps_known_package_dirs_are_measured_even_though_parent_denied() {
+    let mut fs = MockFs::default();
+    fs.add(r"M:\", vec![dir("Program Files")]);
+    fs.add(r"M:\Program Files", vec![dir("WindowsApps")]);
+    fs.deny(r"M:\Program Files\WindowsApps");
+    fs.known.insert(r"m:\program files\windowsapps".into(), vec!["PkgA_1.0_x64__abc".into(), "Gone_2.0_x64__zzz".into()]);
+    fs.add(r"M:\Program Files\WindowsApps\PkgA_1.0_x64__abc", vec![file("app.exe", 10 * CLUSTER, 0)]);
+    let used = 100 * CLUSTER;
+    let r = scan_with(&fs, r"M:\", volume(used), false, &ScanOptions::default(), &AtomicBool::new(false), |_| {}).unwrap();
+    let wa = find(find(&r.tree, "Program Files"), "WindowsApps");
+    assert!(wa.inaccessible, "目录本身仍标无权限（清单不完整）");
+    assert_eq!(wa.children.len(), 1, "不存在的包目录被丢掉");
+    assert_eq!(wa.allocated, 10 * CLUSTER);
+    assert_eq!(r.buckets.scanned, 10 * CLUSTER);
+    assert_eq!(r.buckets.inaccessible, 90 * CLUSTER, "差额推算只剩量不到的部分");
+    assert_eq!(r.buckets.total(), used as i128);
+    let l = view::listing(&r, r"M:\Program Files", 10, None).unwrap();
+    assert!(l.children[0].type_label.contains("已知的 1 个子目录"), "{}", l.children[0].type_label);
 }

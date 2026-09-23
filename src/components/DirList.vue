@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { tierKey, type DirListing, type NodeView } from "../api";
+import { tierKey, tmKey, type DirListing, type NodeView } from "../api";
 import { TIER_SHORT, humanBytes, pct } from "../format";
 
 defineProps<{ listing: DirListing; selectedPath: string | null }>();
@@ -17,7 +17,8 @@ function icon(n: NodeView): string {
 }
 
 function canOpen(n: NodeView): boolean {
-  return n.kind === "Dir" && !n.inaccessible && !n.reparse_skipped && n.child_count > 0;
+  // 无权限但量了已知子目录的（WindowsApps）也能进
+  return n.kind === "Dir" && !n.reparse_skipped && !n.mapped && n.child_count > 0;
 }
 
 function onClick(n: NodeView) {
@@ -26,7 +27,7 @@ function onClick(n: NodeView) {
 }
 
 function rowKey(n: NodeView): string {
-  return n.kind === "Rest" ? n.path + "|rest" : n.path;
+  return tmKey(n);
 }
 </script>
 
@@ -60,7 +61,7 @@ function rowKey(n: NodeView): string {
           :class="{
             selected: selectedPath === rowKey(n),
             clickable: canOpen(n),
-            dim: n.inaccessible || n.reparse_skipped || n.cloud_placeholder,
+            dim: n.inaccessible || n.reparse_skipped || n.cloud_placeholder || n.mapped || n.hardlink_dup,
           }"
           role="button"
           tabindex="0"
@@ -76,6 +77,8 @@ function rowKey(n: NodeView): string {
             <span v-if="n.system_reserved" class="tag tag-sys">系统保留</span>
             <span v-if="n.inaccessible" class="tag tag-inacc">无权限</span>
             <span v-if="n.reparse_skipped" class="tag">未跟随</span>
+            <span v-if="n.mapped" class="tag tag-map" :title="'和 ' + (n.mapped_to ?? '另一个路径') + ' 是同一份数据，空间记在那边'">映射</span>
+            <span v-if="n.hardlink_dup" class="tag tag-map" title="硬链接：这个文件还有别的名字，空间记在另一个路径上">硬链接</span>
           </span>
           <span class="c-what" :title="n.explanation?.what">
             <span class="chip" :class="'chip-' + tierKey(n.explanation)">{{ TIER_SHORT[tierKey(n.explanation)] }}</span>

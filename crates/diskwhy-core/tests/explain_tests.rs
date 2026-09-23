@@ -89,6 +89,8 @@ fn tree(entries: &[(&str, u64)]) -> Node {
                 reparse_skipped: false,
                 cloud_placeholder: false,
                 system_reserved: false,
+                hardlink_dup: false,
+                mapped: false,
                 files: 1,
                 dirs: 0,
                 children: vec![],
@@ -109,6 +111,8 @@ fn tree(entries: &[(&str, u64)]) -> Node {
             reparse_skipped: false,
             cloud_placeholder: false,
             system_reserved: false,
+            hardlink_dup: false,
+            mapped: false,
             files: children.iter().map(|c| c.files).sum(),
             dirs: children.iter().map(|c| if c.kind == NodeKind::Dir { 1 + c.dirs } else { 0 }).sum(),
             children,
@@ -822,5 +826,109 @@ fn llm_end_to_end_against_local_fake_server() {
     let user = std::env::var("USERNAME").unwrap_or_default().to_lowercase();
     if !user.is_empty() && p.to_lowercase().contains(&format!(r"\users\{user}\")) {
         assert!(!raw.to_lowercase().contains(&format!(r"users\\\\{user}")), "真实请求里用户名没脱敏");
+    }
+}
+
+// ───────────────────────── 阶段 C：管理员才看得到的目录 + 阶段 B 遗留未知项 ─────────────────────────
+
+/// 以管理员身份扫描时会多出来的系统目录，全部必须是 keep（没有删除按钮）。
+#[test]
+fn admin_only_system_dirs_are_all_keep() {
+    let ctx = embedded_ctx();
+    let t = tree(&[
+        (r"C:\System Volume Information\{3808876b-c176-4e48-b7ae-04046e6cc752}", 4_000_000_000),
+        (r"C:\System Volume Information\Syscache.hve", 10_000_000),
+        (r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\wt.exe", 5_000_000),
+        (r"C:\Windows\WinSxS\amd64_microsoft-windows-foo_31bf3856ad364e35_10.0.1_none_x\foo.dll", 1_000_000),
+        (r"C:\Windows\System32\config\SOFTWARE", 100_000_000),
+        (r"C:\Windows\System32\sru\SRUDB.dat", 50_000_000),
+        (r"C:\Windows\ServiceProfiles\NetworkService\AppData\Local\x.dat", 1_000),
+        (r"C:\Windows\CSC\v2.0.6\x", 1_000),
+        (r"C:\Windows\Prefetch\X.pf", 1_000),
+        (r"C:\ProgramData\Microsoft\Windows\AppRepository\StateRepository-Machine.srd", 30_000_000),
+        (r"C:\ProgramData\Microsoft\Windows\Hyper-V\data.vmcx", 1_000),
+        (r"C:\ProgramData\Packages\Microsoft.Foo_8wekyb3d8bbwe\x", 1_000),
+        (r"C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Cache\x", 1_000),
+        (r"C:\ProgramData\Microsoft\Crypto\SystemKeys\k", 1_000),
+        (r"C:\ProgramData\Microsoft\Diagnosis\ETLLogs\x.etl", 1_000),
+        (r"C:\ProgramData\Microsoft\Search\Data\Applications\Windows\Windows.edb", 1_000),
+        (r"C:\ProgramData\Microsoft\Windows Defender\Scans\x", 1_000),
+    ]);
+    for p in [
+        r"C:\System Volume Information",
+        r"C:\System Volume Information\{3808876b-c176-4e48-b7ae-04046e6cc752}",
+        r"C:\Program Files\WindowsApps",
+        r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe",
+        r"C:\Windows\WinSxS",
+        r"C:\Windows\WinSxS\amd64_microsoft-windows-foo_31bf3856ad364e35_10.0.1_none_x",
+        r"C:\Windows\System32\config",
+        r"C:\Windows\System32\config\SOFTWARE",
+        r"C:\Windows\System32\sru",
+        r"C:\Windows\ServiceProfiles",
+        r"C:\Windows\ServiceProfiles\NetworkService",
+        r"C:\Windows\CSC",
+        r"C:\Windows\Prefetch",
+        r"C:\ProgramData\Microsoft\Windows\AppRepository",
+        r"C:\ProgramData\Microsoft\Windows\Hyper-V",
+        r"C:\ProgramData\Packages",
+        r"C:\ProgramData\Packages\Microsoft.Foo_8wekyb3d8bbwe",
+        r"C:\ProgramData\Microsoft\Windows Defender Advanced Threat Protection",
+        r"C:\ProgramData\Microsoft\Crypto",
+        r"C:\ProgramData\Microsoft\Diagnosis",
+        r"C:\ProgramData\Microsoft\Search\Data",
+        r"C:\ProgramData\Microsoft\Windows Defender",
+    ] {
+        let e = ex(&t, p, &ctx);
+        assert_eq!(e.tier, Tier::Keep, "{p} 应该是 keep，实际 {:?}（{:?}）", e.tier, e.source);
+        assert!(!e.how.contains(&How::Delete), "{p} keep 档不能给删除");
+        assert!(rule_id(&e).is_some(), "{p} 应由规则库说明：{:?}", e.source);
+    }
+    assert_eq!(rule_id(&ex(&t, r"C:\Windows\System32\config", &ctx)), Some("registry-hives"));
+    assert_eq!(rule_id(&ex(&t, r"C:\ProgramData\Microsoft\Windows\AppRepository", &ctx)), Some("appx-repository"));
+    assert_eq!(rule_id(&ex(&t, r"C:\System Volume Information", &ctx)), Some("system-volume-information"));
+}
+
+/// 阶段 B 的 7 个未知项现在都有规则；查不到官方说明的都是 review 而且写了“不确定 / 线索”。
+#[test]
+fn former_unknowns_now_have_rules() {
+    let ctx = embedded_ctx();
+    let t = tree(&[
+        (r"C:\Users\bob\AppData\Local\OpenAI\Codex\bin\codex.exe", 200_000_000),
+        (r"C:\Users\bob\.cache\codex-runtimes\codex-primary-runtime\runtime.json", 1_000),
+        (r"C:\Users\bob\.vscode\argv.json", 1_000),
+        (r"C:\Users\bob\.vscode\extensions\ms-python.python-1\x.js", 1_000_000),
+        (r"C:\Users\bob\.antigravity\argv.json", 1_000),
+        (r"C:\Users\bob\AppData\Roaming\ACLOS\TcVersions\a.zip", 1_000_000),
+        (r"C:\Users\bob\AppData\ACLOS\aclos-highlight\v.mp4", 1_000_000),
+        (r"C:\Users\bob\AppData\Local\kimi-desktop-updater\installer.exe", 400_000_000),
+        (r"C:\Users\bob\AppData\Local\someapp-updater\notes.txt", 1_000),
+        (r"C:\Users\bob\AppData\Local\Pandoc\pandoc.exe", 200_000_000),
+    ]);
+    let cases = [
+        (r"C:\Users\bob\AppData\Local\OpenAI\Codex", "codex-desktop-local", Tier::Review),
+        (r"C:\Users\bob\.cache\codex-runtimes", "codex-runtimes-cache", Tier::Review),
+        (r"C:\Users\bob\.vscode", "vscode-home-dir", Tier::Review),
+        (r"C:\Users\bob\.vscode\extensions", "vscode-family-extensions", Tier::Review),
+        (r"C:\Users\bob\.antigravity", "antigravity-home-dir", Tier::Review),
+        (r"C:\Users\bob\AppData\Roaming\ACLOS", "aclos-game-recorder", Tier::Review),
+        (r"C:\Users\bob\AppData\ACLOS", "aclos-game-recorder", Tier::Review),
+        (r"C:\Users\bob\AppData\Local\kimi-desktop-updater", "electron-updater-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Pandoc", "pandoc-local", Tier::Review),
+    ];
+    for (p, id, tier) in cases {
+        let e = ex(&t, p, &ctx);
+        assert_eq!(rule_id(&e), Some(id), "{p}：{:?}", e.source);
+        assert_eq!(e.tier, tier, "{p}");
+    }
+    // electron-updater 规则靠 when_child 认：没有 installer.exe / pending 的 *-updater 不命中
+    let other = ex(&t, r"C:\Users\bob\AppData\Local\someapp-updater", &ctx);
+    assert_ne!(rule_id(&other), Some("electron-updater-cache"));
+    // 名字推断出具体软件
+    let k = ex(&t, r"C:\Users\bob\AppData\Local\kimi-desktop-updater", &ctx);
+    assert!(k.owner.as_deref().unwrap_or("").contains("electron-builder"), "{:?}", k.owner);
+    // 查不到官方说明的，说明里要写明
+    for p in [r"C:\Users\bob\.cache\codex-runtimes", r"C:\Users\bob\AppData\Roaming\ACLOS"] {
+        let e = ex(&t, p, &ctx);
+        assert!(e.why.contains("没有找到") || e.lose.contains("不确定"), "{p} 应写明没核实：{}", e.why);
     }
 }

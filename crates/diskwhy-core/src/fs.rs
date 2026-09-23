@@ -61,12 +61,56 @@ pub struct RawEntry {
     pub reparse_tag: u32,
 }
 
+/// 卷上一个文件的唯一标识：(卷序列号, 128 位文件 ID)。
+///
+/// learn.microsoft.com（BY_HANDLE_FILE_INFORMATION / FILE_ID_INFO）：文件 ID 加卷序列号
+/// 在一台机器上唯一标识一个文件；两个路径 key 相同 = 同一份数据（硬链接或目录映射）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileKey {
+    pub volume: u64,
+    pub id: [u8; 16],
+}
+
+impl FileKey {
+    /// 测试用：从一个整数造 key。
+    pub fn from_u64(volume: u64, id: u64) -> Self {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&id.to_le_bytes());
+        FileKey { volume, id: b }
+    }
+}
+
+/// 打开文件句柄一次拿到的信息（给硬链接去重用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileInfo {
+    /// 与 GetCompressedFileSizeW 同口径的磁盘占用（未按簇取整）。
+    pub on_disk: u64,
+    /// nNumberOfLinks（硬链接个数，普通文件为 1）。
+    pub links: u32,
+    /// 只在 links > 1 时取（省一次查询）。
+    pub key: Option<FileKey>,
+}
+
 /// 扫描用的文件系统接口。
 pub trait FsBackend: Sync {
     /// 列出目录内容（不含 `.` 和 `..`）。失败时返回 Win32 错误码。
     fn list_dir(&self, path: &str) -> Result<Vec<RawEntry>, u32>;
     /// GetCompressedFileSizeW：返回磁盘实际占用字节（未按簇取整）。取不到返回 None。
     fn compressed_size(&self, path: &str) -> Option<u64>;
+    /// 打开一次文件，同时取磁盘占用、硬链接数和（链接数 > 1 时）文件 ID。
+    /// 默认实现退回 [`FsBackend::compressed_size`]、链接数按 1 算（不参与去重）。
+    fn file_info(&self, path: &str) -> Option<FileInfo> {
+        self.compressed_size(path).map(|on_disk| FileInfo { on_disk, links: 1, key: None })
+    }
+    /// 目录自身的文件 ID（用于识别商店应用的目录映射）。取不到返回 None。
+    fn dir_key(&self, _path: &str) -> Option<FileKey> {
+        None
+    }
+    /// 目录本身列不出来（无权限）时，从别的来源知道的子目录名。
+    /// 目前只用于 `Program Files\WindowsApps`：普通用户不能列目录，但每个包的目录可读。
+    fn known_children(&self, _dir: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// 把路径拼成 `parent\name`，正确处理卷根的结尾反斜杠。

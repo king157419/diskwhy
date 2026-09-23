@@ -137,6 +137,18 @@ impl RegistrySnapshot {
     }
 }
 
+/// 当前用户商店应用包的安装目录（见 `win::package_root_folders`）。非 Windows 返回空。
+pub fn package_root_folders() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        win::package_root_folders()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use super::InstalledApp;
@@ -208,6 +220,46 @@ mod win {
             RegCloseKey(sub);
         }
         RegCloseKey(h);
+    }
+
+    /// 当前用户已安装的商店应用包的安装目录（`PackageRootFolder`）。
+    /// 位置：HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages\<包全名>。
+    /// 普通用户列不出 `Program Files\WindowsApps`，但每个包自己的目录是可读的——用这份清单去量。
+    pub fn package_root_folders() -> Vec<String> {
+        const REPO: &str = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+        let mut out = Vec::new();
+        unsafe {
+            let wp = wide(REPO);
+            let mut h: HKEY = null_mut();
+            if RegOpenKeyExW(HKEY_CURRENT_USER, wp.as_ptr(), 0, KEY_READ, &mut h) != ERROR_SUCCESS {
+                return out;
+            }
+            let mut idx = 0u32;
+            loop {
+                let mut name = [0u16; 256];
+                let mut len = name.len() as u32;
+                let rc = RegEnumKeyExW(h, idx, name.as_mut_ptr(), &mut len, null(), null_mut(), null_mut(), null_mut());
+                if rc == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                idx += 1;
+                if rc != ERROR_SUCCESS {
+                    continue;
+                }
+                let mut sub: HKEY = null_mut();
+                if RegOpenKeyExW(h, name.as_ptr(), 0, KEY_READ, &mut sub) != ERROR_SUCCESS {
+                    continue;
+                }
+                if let Some(p) = get_string(sub, "PackageRootFolder").filter(|s| !s.trim().is_empty()) {
+                    out.push(p);
+                }
+                RegCloseKey(sub);
+            }
+            RegCloseKey(h);
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     pub fn read_all() -> Vec<InstalledApp> {

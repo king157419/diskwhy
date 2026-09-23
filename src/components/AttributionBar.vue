@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { ScanSummary } from "../api";
-import { humanBytes, pct } from "../format";
+import { fmtInt, humanBytes, pct } from "../format";
 
 const props = defineProps<{ summary: ScanSummary }>();
 
@@ -83,12 +83,22 @@ const denom = computed(() => segs.value.reduce((s, x) => s + x.bytes, 0) || 1);
         <span class="muted">{{ pct(s.bytes, summary.used_bytes) }}</span>
       </li>
     </ul>
+    <p
+      v-if="summary.buckets.dedup_enabled"
+      class="muted small dedup-line"
+      title="同一份数据只算一次。硬链接主要在 WinSxS 与 System32 等目录之间，空间记在 WinSxS 以外的那个名字上；商店应用目录映射是 AppData 下的同名文件夹和 Packages\…\LocalCache 里是同一份数据（两边目录的文件 ID 相同），空间记在 Packages 那一侧。“无权限”是去重之后用卷已用空间差额推算的。"
+    >
+      已去重 {{ humanBytes(summary.buckets.hardlink_dedup + summary.buckets.mapped_dedup) }}：硬链接
+      {{ fmtInt(summary.buckets.hardlink_dedup_files) }} 个多余名字 {{ humanBytes(summary.buckets.hardlink_dedup) }}<template
+        v-if="summary.buckets.mapped_dirs > 0"
+      >
+        · 商店应用目录映射 {{ summary.buckets.mapped_dirs }} 处 {{ humanBytes(summary.buckets.mapped_dedup) }}</template
+      >（同一份数据只算一次）
+    </p>
     <p v-if="summary.buckets.overcount > 0" class="warn-line">
-      注意：扫到的文件合计比卷已用空间多 {{ humanBytes(summary.buckets.overcount) }}。这是同一份数据被多个路径看到而重复计数
-      （硬链接、应用目录映射等，常见于 WinSxS 和商店应用），阶段 C 会去重。在此之前，无权限目录的真实大小无法从差额推算，暂按 0 显示。
+      注意：去重之后扫到的合计仍比卷已用空间多 {{ humanBytes(summary.buckets.overcount) }}，说明还有没识别出来的重复计数
+      （或扫描期间盘上数据在变）。这时“无权限”的真实大小无法从差额推算，暂按 0 显示。
     </p>
-    <p v-else-if="summary.buckets.inaccessible > 0" class="muted small">
-      “无权限”一项是推算值：卷已用空间减去所有量得到的部分。以管理员身份扫描可以把它变小。
-    </p>
+    <p v-if="!summary.buckets.dedup_enabled" class="warn-line">这份结果没有做硬链接 / 目录映射去重（旧版本的快照），重复计数会让各项之和偏大。</p>
   </section>
 </template>

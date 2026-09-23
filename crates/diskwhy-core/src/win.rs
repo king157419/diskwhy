@@ -3,7 +3,7 @@
 //! 所有 API 签名按 learn.microsoft.com 与 docs.rs windows-sys 0.61 核对过。
 //! 路径一律加 `\\?\` 前缀以绕过 MAX_PATH。
 
-use crate::fs::{filetime_to_unix, FsBackend, RawEntry};
+use crate::fs::{filetime_to_unix, FileInfo, FileKey, FsBackend, RawEntry};
 use crate::model::VolumeSpace;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
@@ -16,9 +16,12 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{
-    FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
-    GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetDriveTypeW,
-    GetLogicalDrives, GetVolumeInformationW, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
+    CreateFileW, FileCompressionInfo, FileIdInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+    FindFirstFileExW, FindNextFileW, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW,
+    GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx, GetLogicalDrives,
+    GetVolumeInformationW, BY_HANDLE_FILE_INFORMATION, FILE_COMPRESSION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FIND_FIRST_EX_LARGE_FETCH, OPEN_EXISTING, WIN32_FIND_DATAW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -112,6 +115,120 @@ impl FsBackend for Win32Fs {
             Some(((high as u64) << 32) | low as u64)
         }
     }
+
+    /// 打开一次句柄（只要 FILE_READ_ATTRIBUTES），取：
+    /// - `GetFileInformationByHandleEx(FileCompressionInfo)` 的 CompressedFileSize —— 与
+    ///   GetCompressedFileSizeW 同口径（压缩 / 稀疏 / WOF 文件给实际占用，其余给文件大小），
+    ///   由 `tests/real_fs_tests.rs` 的对照测试逐文件核对；
+    /// - `GetFileInformationByHandle` 的 nNumberOfLinks；
+    /// - 链接数 > 1 时再取 `FileIdInfo`（128 位文件 ID + 64 位卷序列号，ReFS 也唯一），
+    ///   失败时退回 BY_HANDLE_FILE_INFORMATION 的 (dwVolumeSerialNumber, nFileIndexHigh/Low)。
+    ///
+    /// 打不开时退回 GetCompressedFileSizeW（链接数按 1 算，不参与去重）。
+    fn file_info(&self, path: &str) -> Option<FileInfo> {
+        let w = wide(&long_path(path));
+        unsafe {
+            let h = CreateFileW(
+                w.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+            if h == INVALID_HANDLE_VALUE {
+                return self.compressed_size(path).map(|on_disk| FileInfo { on_disk, links: 1, key: None });
+            }
+            let mut bh: BY_HANDLE_FILE_INFORMATION = zeroed();
+            let have_bh = GetFileInformationByHandle(h, &mut bh) != 0;
+            let mut ci: FILE_COMPRESSION_INFO = zeroed();
+            let on_disk = if GetFileInformationByHandleEx(
+                h,
+                FileCompressionInfo,
+                &mut ci as *mut FILE_COMPRESSION_INFO as *mut c_void,
+                size_of::<FILE_COMPRESSION_INFO>() as u32,
+            ) != 0
+            {
+                Some(ci.CompressedFileSize.max(0) as u64)
+            } else if have_bh {
+                // 文件系统不支持压缩信息（如 FAT）：GetCompressedFileSizeW 此时也返回文件大小。
+                Some(((bh.nFileSizeHigh as u64) << 32) | bh.nFileSizeLow as u64)
+            } else {
+                None
+            };
+            let links = if have_bh { bh.nNumberOfLinks.max(1) } else { 1 };
+            let key = if links > 1 { file_key(h, have_bh.then_some(&bh)) } else { None };
+            CloseHandle(h);
+            match on_disk {
+                Some(on_disk) => Some(FileInfo { on_disk, links, key }),
+                None => self.compressed_size(path).map(|on_disk| FileInfo { on_disk, links: 1, key: None }),
+            }
+        }
+    }
+
+    /// `X:\Program Files\WindowsApps` 列不出来时，用注册表里当前用户的包安装目录
+    /// （`PackageRootFolder`）补上能量的那部分。清单只读一次。
+    fn known_children(&self, dir: &str) -> Vec<String> {
+        static PKG: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let b = dir.as_bytes();
+        if b.len() < 3 || b[1] != b':' || !dir[2..].eq_ignore_ascii_case(r"\Program Files\WindowsApps") {
+            return Vec::new();
+        }
+        let prefix = format!("{}\\", dir.to_lowercase());
+        PKG.get_or_init(crate::explain::registry::package_root_folders)
+            .iter()
+            .filter_map(|p| {
+                let pl = p.to_lowercase();
+                let rest = pl.strip_prefix(&prefix)?;
+                if rest.is_empty() || rest.contains('\\') {
+                    return None;
+                }
+                Some(p[prefix.len()..].to_string())
+            })
+            .collect()
+    }
+
+    /// 目录自身的文件 ID（CreateFileW 打开目录必须带 FILE_FLAG_BACKUP_SEMANTICS）。
+    fn dir_key(&self, path: &str) -> Option<FileKey> {
+        let w = wide(&long_path(path));
+        unsafe {
+            let h = CreateFileW(
+                w.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            );
+            if h == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut bh: BY_HANDLE_FILE_INFORMATION = zeroed();
+            let have_bh = GetFileInformationByHandle(h, &mut bh) != 0;
+            let k = file_key(h, have_bh.then_some(&bh));
+            CloseHandle(h);
+            k
+        }
+    }
+}
+
+/// FileIdInfo 优先；失败退回 BY_HANDLE_FILE_INFORMATION 的 64 位文件索引。
+unsafe fn file_key(h: HANDLE, bh: Option<&BY_HANDLE_FILE_INFORMATION>) -> Option<FileKey> {
+    let mut fi: FILE_ID_INFO = zeroed();
+    if GetFileInformationByHandleEx(
+        h,
+        FileIdInfo,
+        &mut fi as *mut FILE_ID_INFO as *mut c_void,
+        size_of::<FILE_ID_INFO>() as u32,
+    ) != 0
+    {
+        return Some(FileKey { volume: fi.VolumeSerialNumber, id: fi.FileId.Identifier });
+    }
+    let bh = bh?;
+    let idx = ((bh.nFileIndexHigh as u64) << 32) | bh.nFileIndexLow as u64;
+    Some(FileKey::from_u64(bh.dwVolumeSerialNumber as u64, idx))
 }
 
 /// 卷根（`C:\`）的容量 / 空闲 / 簇大小。

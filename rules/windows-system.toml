@@ -645,3 +645,175 @@ how = "manual"
 how_detail = "用 winget list 查看，winget uninstall <软件ID> 卸载。"
 refs = ["https://learn.microsoft.com/en-us/windows/package-manager/winget/"]
 verified_on = "2026-09-23"
+
+[[rule]]
+id = "default-user-profile"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemDrive%\Users\Default']
+what = "新账户的模板文件夹"
+why = "在这台电脑上新建 Windows 账户时，会照着这个文件夹生成它的个人文件夹"
+lose = "不要删：以后新建账户可能出错。一般只有几 MB。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "public-user-folder"
+owner = "Windows"
+category = "userdata"
+tier = "keep"
+match = ['%PUBLIC%']
+what = "所有账户共用的“公用”文件夹"
+why = "公用文档、公用桌面等放在这里，这台电脑上的每个账户都能看到"
+lose = "里面如果有文件，是大家共用的个人文件，不能当垃圾删。"
+how = "manual"
+how_detail = "点进去看是谁放的什么；不需要的文件自己挪走或删除。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── 阶段 C：以管理员身份扫描时才看得到的系统目录（全部 keep） ─────────
+# System Volume Information / WindowsApps / WinSxS / Prefetch / 搜索索引 / Defender 沿用上面已有的规则；
+# %SystemRoot% 整棵树由 windows-dir（tree）兜底为 keep，下面几条只是把说明写得更具体。
+
+[[rule]]
+id = "registry-hives"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\System32\config']
+what = "注册表文件（SYSTEM、SOFTWARE、SAM、SECURITY、DEFAULT 等）"
+why = "Windows 的注册表按“配置单元”存成这些文件，开机时加载；RegBack 等子文件夹是它们的备份"
+lose = "绝对不能删：删了 Windows 无法启动。普通权限也读不了。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-hives"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "service-profiles"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\ServiceProfiles']
+what = "系统服务账户（LocalService、NetworkService）的“个人文件夹”"
+why = "以这两个内置账户运行的系统服务，把自己的缓存和设置放在这里，结构和普通用户的文件夹一样"
+lose = "不要手动删，相关系统服务可能出错。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "srum-database"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\System32\sru']
+what = "系统资源使用情况数据库（SRUM）"
+why = "Windows 按应用记录耗电、网络流量等使用情况，“设置”里的电池用量、数据使用量统计就来自这里"
+lose = "不要手动删：会丢失这些统计，系统服务也在一直写它。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "offline-files-csc"
+owner = "Windows"
+category = "cache"
+tier = "keep"
+match = ['%SystemRoot%\CSC']
+what = "“脱机文件”功能的本地缓存"
+why = "开启“脱机文件”后，网络共享上的文件会在这里存一份，断网时也能打开；没开的话一般很小"
+lose = "不要手动删：还没同步回服务器的改动会丢。"
+how = "builtin_tool"
+how_detail = "“控制面板 > 同步中心 > 管理脱机文件”里可以查看占用、删除临时文件或关闭脱机文件。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "programdata-windows"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Windows']
+what = "Windows 各系统组件放在 ProgramData 里的数据"
+why = "开始菜单里“所有用户”的快捷方式、商店应用的部署记录、Hyper-V 虚拟机配置、诊断和电源报告等都在这里，很多子文件夹只有系统能访问"
+lose = "不要手动删。其中错误报告（WER）等能清的子文件夹有单独的规则。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "appx-repository"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Windows\AppRepository']
+what = "商店应用（AppX / MSIX）的安装登记数据"
+why = "Windows 用这里的数据库记录每个账户装了哪些商店应用、装在哪里、版本是多少"
+lose = "绝对不要删：商店应用会打不开，也没法更新或卸载。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "programdata-packages"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%ProgramData%\Packages']
+what = "商店应用在系统范围内的数据（每个子文件夹对应一个应用包）"
+why = "只有系统能访问。从文件夹名看，每个子文件夹是一个商店应用包的名字；具体存什么，官方文档没有写，我不确定"
+lose = "不要手动删；不清楚内容时一律保留。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "defender-endpoint"
+owner = "Microsoft Defender"
+category = "system"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Windows Defender Advanced Threat Protection']
+what = "Microsoft Defender for Endpoint（企业版 Defender）的数据"
+why = "设备加入企业的安全管理后，Defender 的检测、上报和缓存数据放在这里"
+lose = "不要手动删，会影响安全防护；公司电脑请联系 IT。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "machine-crypto-keys"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Crypto']
+what = "本机的加密密钥（证书私钥、TPM 相关密钥等）"
+why = "系统和软件用来加密、签名、证明设备身份的密钥存在这里"
+lose = "绝对不要删：证书会失效，可能影响 BitLocker、企业 Wi-Fi / VPN 认证等。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-diagnosis"
+owner = "Windows"
+category = "log"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Diagnosis']
+what = "Windows 诊断数据（遥测）在本机的暂存"
+why = "Windows 收集的诊断数据在上传前先放在这里"
+lose = "不要手动删（系统服务在用）；想清掉请用系统设置。"
+how = "builtin_tool"
+how_detail = "“设置 > 隐私和安全性 > 诊断和反馈 > 删除诊断数据”。"
+refs = []
+verified_on = "2026-09-23"

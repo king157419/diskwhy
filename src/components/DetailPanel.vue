@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { askAi, tierKey, type Explanation, type NodeView } from "../api";
 import { HOW_LABEL, TIER_BIG, TIER_HINT, attrText, fmtInt, fmtTime, humanBytes, sourceLabel } from "../format";
 
 const props = defineProps<{ node: NodeView | null; llmReady: boolean }>();
-const emit = defineEmits<{ openSettings: [] }>();
+const emit = defineEmits<{ openSettings: []; openPath: [path: string] }>();
 
 const aiResult = ref<Explanation | null>(null);
 const aiLoading = ref(false);
 const aiError = ref("");
 const copied = ref("");
+const linkError = ref("");
 
 watch(
   () => (props.node ? props.node.path + "|" + props.node.kind : ""),
@@ -24,7 +26,7 @@ const ex = computed(() => props.node?.explanation ?? null);
 const tk = computed(() => tierKey(ex.value));
 const canAsk = computed(() => {
   const e = ex.value;
-  if (!e || !props.node || props.node.kind === "Rest") return false;
+  if (!e || !props.node || props.node.kind === "Rest" || props.node.pseudo) return false;
   return e.source.kind === "unknown" || e.source.kind === "heuristic";
 });
 
@@ -32,7 +34,10 @@ const status = computed(() => {
   const n = props.node;
   if (!n) return [] as string[];
   const s: string[] = [];
-  if (n.inaccessible) s.push(`无法读取（Win32 错误 ${n.error_code}${n.error_code === 5 ? "：拒绝访问" : ""}）`);
+  if (n.pseudo) return s;
+  if (n.inaccessible && n.child_count > 0)
+    s.push(`列不出目录（Win32 错误 ${n.error_code}），但从注册表里知道其中 ${n.child_count} 个子目录，已经量上；其余部分算在“无权限”里`);
+  else if (n.inaccessible) s.push(`无法读取（Win32 错误 ${n.error_code}${n.error_code === 5 ? "：拒绝访问" : ""}）`);
   if (n.reparse_skipped) s.push("这是链接/挂载点，指向别处，没有跟进去统计，避免重复计算");
   if (n.cloud_placeholder) s.push("云端占位文件：内容在云上，本地几乎不占空间；DiskWhy 只读属性，没有打开它");
   if (n.system_reserved) s.push("属于系统保留项（回收站 / 卷影 / 页面文件等）");
@@ -61,6 +66,15 @@ async function doAsk() {
   }
 }
 
+async function openLink(url: string) {
+  linkError.value = "";
+  try {
+    await openUrl(url);
+  } catch (e) {
+    linkError.value = `打不开链接（${e}），可以点“复制”后粘到浏览器里`;
+  }
+}
+
 async function copy(text: string) {
   try {
     await navigator.clipboard.writeText(text);
@@ -77,6 +91,14 @@ async function copy(text: string) {
     <template v-if="node">
       <h2 class="d-name" :title="node.name">{{ node.name }}</h2>
       <div class="d-type">{{ node.type_label }} · {{ humanBytes(node.allocated) }}</div>
+      <div v-if="node.mapped" class="dup-callout">
+        <b>这是商店应用的目录映射</b>：和「{{ node.mapped_to ?? "另一个路径" }}」是同一份数据（两边目录的文件 ID 相同），
+        空间已经记在那边，这里按 0 算，避免重复。
+        <div v-if="node.mapped_to"><button class="btn" @click="emit('openPath', node.mapped_to)">跳到真正记账的位置</button></div>
+      </div>
+      <div v-if="node.hardlink_dup" class="dup-callout">
+        <b>这是硬链接</b>：这个文件还有别的名字（同一个文件 ID），空间已经记在另一个路径上，这里按 0 算。删掉这个名字腾不出空间。
+      </div>
 
       <section v-if="ex" class="explain" :class="'ex-' + tk">
         <div class="ex-head">
@@ -117,9 +139,10 @@ async function copy(text: string) {
         <div v-if="ex.refs.length" class="ex-refs small">
           <span class="muted">参考：</span>
           <div v-for="r in ex.refs" :key="r" class="ref">
-            <span class="ref-url">{{ r }}</span>
-            <button class="mini" @click="copy(r)">{{ copied === r ? "已复制" : "复制链接" }}</button>
+            <a class="ref-url ref-link" :href="r" :title="'用默认浏览器打开 ' + r" @click.prevent="openLink(r)">{{ r }}</a>
+            <button class="mini" @click="copy(r)">{{ copied === r ? "已复制" : "复制" }}</button>
           </div>
+          <p v-if="linkError" class="ai-error small">{{ linkError }}</p>
         </div>
 
         <div v-if="canAsk" class="ask">
@@ -156,7 +179,7 @@ async function copy(text: string) {
         <div class="ex-source small"><span class="muted">来源：</span>{{ sourceLabel(aiResult) }}</div>
       </section>
 
-      <dl class="d-grid">
+      <dl v-if="!node.pseudo" class="d-grid">
         <dt>路径</dt>
         <dd class="path">{{ node.path }}</dd>
         <dt>实际占用</dt>
@@ -177,7 +200,7 @@ async function copy(text: string) {
       <ul v-if="status.length" class="d-status">
         <li v-for="s in status" :key="s">{{ s }}</li>
       </ul>
-      <p class="muted small">阶段 B 只做解释，不提供删除按钮。</p>
+      <p class="muted small">目前只做解释，不提供删除按钮（带护栏的删除在下一阶段）。</p>
     </template>
     <template v-else>
       <p class="muted">点击左侧列表中的一项查看详情。</p>

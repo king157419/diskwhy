@@ -93,6 +93,8 @@ export function sourceLabel(e: Explanation): string {
       return `启发式推测：${s.name}`;
     case "llm":
       return `AI 推测（模型 ${s.model}）`;
+    case "attribution":
+      return "归属统计（用卷已用空间差额推算，不是规则库）";
     default:
       return "未知";
   }

@@ -10,10 +10,12 @@
 //! 本库不依赖 Tauri。
 
 pub mod attribution;
+pub mod dedup;
 pub mod explain;
 pub mod fs;
 pub mod model;
 pub mod scan;
+pub mod snapshot;
 pub mod view;
 #[cfg(windows)]
 pub mod win;

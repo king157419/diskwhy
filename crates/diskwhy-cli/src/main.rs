@@ -5,6 +5,11 @@
 //!                           [--mode exact|fast] [--threads N] [--keep-files 50] [--quiet]
 //!   diskwhy-cli explain <root> [--top 50] [--json out.json] [--md coverage.md] [--mode exact|fast] [--quiet]
 //!     扫描后对前 N 大目录逐个解释（档位 / 来源 / 这是什么），统计规则 / 启发式 / 未知各多少。
+//!
+//! 阶段 C：
+//!   --no-dedup          关掉硬链接 / 目录映射去重（用于对比耗时和结果）
+//!   --snapshot <file>   扫描后把完整结果存成快照（gzip JSON，.dwsnap）
+//!   --from <file>       不扫描，直接读快照（或 --json 输出）再出报告；此时 <root> 可省略
 
 use diskwhy_core::scan::scan;
 use diskwhy_core::view::{human_bytes, node_view, top_dirs, truncate_tree, NodeView};
@@ -17,8 +22,9 @@ use std::time::Instant;
 mod explain_cmd;
 
 const USAGE: &str = "用法：
-  diskwhy-cli scan <root> [--top 30] [--json out.json] [--json-depth 3] [--mode exact|fast] [--threads N] [--keep-files 50] [--quiet]
-  diskwhy-cli explain <root> [--top 50] [--json out.json] [--md coverage.md] [--mode exact|fast] [--quiet]";
+  diskwhy-cli scan <root> [--top 30] [--json out.json] [--json-depth 3] [--mode exact|fast] [--threads N] [--keep-files 50] [--no-dedup] [--snapshot out.dwsnap] [--quiet]
+  diskwhy-cli explain <root> [--top 50] [--json out.json] [--md coverage.md] [--mode exact|fast] [--no-dedup] [--quiet]
+  diskwhy-cli scan|explain --from snapshot.dwsnap [--top N]   （读快照，不扫描）";
 
 #[derive(PartialEq)]
 enum Cmd {
@@ -37,6 +43,9 @@ struct Args {
     threads: usize,
     keep_files: usize,
     quiet: bool,
+    no_dedup: bool,
+    snapshot: Option<String>,
+    from: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +68,9 @@ fn parse_args() -> Result<Args, String> {
         threads: 0,
         keep_files: 50,
         quiet: false,
+        no_dedup: false,
+        snapshot: None,
+        from: None,
     };
     while let Some(x) = it.next() {
         let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} 缺少参数值"));
@@ -77,6 +89,9 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--quiet" | "-q" => a.quiet = true,
+            "--no-dedup" => a.no_dedup = true,
+            "--snapshot" => a.snapshot = Some(val("--snapshot")?),
+            "--from" => a.from = Some(val("--from")?),
             s if s.starts_with("--") => return Err(format!("未知参数 {s}\n{USAGE}")),
             s => {
                 if a.root.is_empty() {
@@ -87,7 +102,7 @@ fn parse_args() -> Result<Args, String> {
             }
         }
     }
-    if a.root.is_empty() {
+    if a.root.is_empty() && a.from.is_none() {
         return Err(format!("缺少扫描根目录\n{USAGE}"));
     }
     Ok(a)
@@ -121,11 +136,34 @@ fn main() {
         top_files_per_dir: args.keep_files,
         size_mode: args.mode,
         threads: args.threads,
+        dedup: !args.no_dedup,
         ..Default::default()
     };
     let cancel = AtomicBool::new(false);
     let quiet = args.quiet;
     let mut last_print = Instant::now();
+    if let Some(from) = args.from.clone() {
+        let t = Instant::now();
+        let loaded = snapshot::with_big_stack(move || snapshot::load(std::path::Path::new(&from)));
+        match loaded {
+            Ok((r, meta)) => {
+                println!(
+                    "已读取快照：{}（{}，保存于 Unix {}，程序版本 {}），读取用时 {:.2} 秒",
+                    args.from.as_deref().unwrap_or(""),
+                    if meta.kind == "snapshot" { "完整快照" } else { "CLI --json 输出，树可能被截断" },
+                    meta.saved_at,
+                    if meta.app_version.is_empty() { "未知" } else { &meta.app_version },
+                    t.elapsed().as_secs_f64()
+                );
+                save_then_report(r, &args);
+            }
+            Err(e) => {
+                eprintln!("读取快照失败：{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let res = scan(&args.root, &opts, &cancel, |p| {
         if quiet || last_print.elapsed().as_millis() < 500 {
             return;
@@ -155,7 +193,31 @@ fn main() {
             std::process::exit(1);
         }
     };
+    save_then_report(r, &args);
+}
 
+/// 有 `--snapshot` 就先存快照（扫描结果或 `--from` 读进来的都行），再出报告。
+fn save_then_report(r: ScanResult, args: &Args) {
+    if let Some(p) = args.snapshot.clone() {
+        let t = Instant::now();
+        let r2 = std::sync::Arc::new(r);
+        let r3 = r2.clone();
+        let saved = snapshot::with_big_stack(move || snapshot::save(&r3, std::path::Path::new(&p), env!("CARGO_PKG_VERSION")));
+        match saved {
+            Ok(n) => eprintln!("快照已写入 {}（{}，用时 {:.2} 秒）", args.snapshot.as_deref().unwrap_or(""), human_bytes(n), t.elapsed().as_secs_f64()),
+            Err(e) => {
+                eprintln!("写快照失败：{e}");
+                std::process::exit(1);
+            }
+        }
+        let r = std::sync::Arc::try_unwrap(r2).unwrap_or_else(|a| (*a).clone());
+        report(r, args);
+    } else {
+        report(r, args);
+    }
+}
+
+fn report(r: ScanResult, args: &Args) {
     if args.cmd == Cmd::Explain {
         explain_cmd::run(&r, &args);
         return;
@@ -218,15 +280,35 @@ fn main() {
     );
     row("未归属", b.unattributed, if b.scope_is_volume_root { "" } else { "（扫描根不是卷根，含扫描范围外的内容）" });
     if b.overcount > 0 {
-        println!("  {:<14} -{:>10}  硬链接等重复计数（阶段 C 去重）", "重复计数", human_bytes(b.overcount));
+        let note = if b.dedup_enabled {
+            "去重后仍多出来的部分（没识别出的重复计数，或扫描期间卷上数据在变）"
+        } else {
+            "没有去重：硬链接 / 目录映射被重复计数"
+        };
+        println!("  {:<14} -{:>10}  {note}", "重复计数", human_bytes(b.overcount));
+    }
+    if b.dedup_enabled {
+        println!(
+            "  去重：硬链接 {} 个多余名字、{}；商店应用目录映射 {} 处、{}（已从上面各项里扣除）",
+            b.hardlink_dedup_files,
+            human_bytes(b.hardlink_dedup),
+            b.mapped_dirs,
+            human_bytes(b.mapped_dedup)
+        );
+        for m in r.mapped_dirs.iter().take(10) {
+            println!("    {} = {}（{}）", m.path, m.same_as, human_bytes(m.bytes));
+        }
+    } else {
+        println!("  去重：未开启（--no-dedup 或旧快照）");
     }
     let total = b.total();
     println!(
-        "  合计 {} B {} 卷已用 {} B（差额原始值 gap = {} B）",
+        "  合计 {} B {} 卷已用 {} B（差额原始值 gap = {} B = {:+.2} GB）",
         total,
         if total == used as i128 { "==" } else { "!=" },
         used,
-        b.gap
+        b.gap,
+        b.gap as f64 / (1u64 << 30) as f64
     );
 
     if let Some(path) = &args.json {
@@ -272,6 +354,7 @@ impl ShallowTree for ScanResult {
             inaccessible_total: self.inaccessible_total,
             size_mode: self.size_mode,
             top_files_per_dir: self.top_files_per_dir,
+            mapped_dirs: self.mapped_dirs.clone(),
         }
     }
 }

@@ -8,11 +8,12 @@
 //! - 云占位文件只读目录枚举给出的属性，绝不打开（也不调 GetCompressedFileSizeW）。
 
 use crate::attribution::{compute_attribution, Measured};
-use crate::fs::{attrs, errors, join, reparse, round_up, FsBackend, RawEntry};
+use crate::dedup::{self, Occurrence};
+use crate::fs::{attrs, errors, join, reparse, round_up, FileKey, FsBackend, RawEntry};
 use crate::model::*;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 卷根下按名字归类为“系统保留”的条目（大小写不敏感）。
@@ -92,6 +93,20 @@ struct Ctx<'a, B: FsBackend> {
     inacc_sys: AtomicU64,
     inacc_other: AtomicU64,
     inacc_list: Mutex<Vec<InaccessibleDir>>,
+    /// 链接数 > 1 的文件出现记录（去重用）。
+    occ: Mutex<Vec<Occurrence>>,
+}
+
+/// 硬链接密集区（Fast 模式下只在这些地方打开句柄查链接数）：卷根下的 `Windows`、
+/// `Program Files`、`Program Files (x86)`。WinSxS 的硬链接另一端几乎都在这些目录里。
+pub fn is_hardlink_dense(dir: &str) -> bool {
+    let b = dir.as_bytes();
+    if b.len() < 3 || b[1] != b':' {
+        return false;
+    }
+    let rest = dir[3..].to_ascii_lowercase();
+    let first = rest.split('\\').next().unwrap_or("");
+    matches!(first, "windows" | "program files" | "program files (x86)")
 }
 
 impl<'a, B: FsBackend> Ctx<'a, B> {
@@ -99,20 +114,31 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
         self.cancel.load(Relaxed)
     }
 
-    fn allocated_for(&self, path: &str, e: &RawEntry) -> u64 {
+    /// 返回 (allocated, 硬链接 key)。key 只在去重开启且 nNumberOfLinks > 1 时有值。
+    ///
+    /// - Exact + 去重：每个文件用 `file_info` 打开一次句柄，同时拿到占用和链接数
+    ///   （取代原来的 GetCompressedFileSizeW，同样是一次打开，所以耗时增加很少）；
+    /// - Fast + 去重：只对压缩/稀疏/reparse 文件，以及硬链接密集区（`Windows`、`Program Files*`）
+    ///   里的文件打开句柄；其余按逻辑大小按簇取整，不参与去重；
+    /// - 去重关闭：与阶段 A/B 完全相同。
+    fn allocated_for(&self, path: &str, e: &RawEntry, dense: bool) -> (u64, Option<FileKey>) {
+        let special = e.attrs & (attrs::COMPRESSED | attrs::SPARSE_FILE | attrs::REPARSE_POINT) != 0;
         let need_query = match self.opts.size_mode {
             SizeMode::Exact => true,
-            SizeMode::Fast => {
-                e.attrs & (attrs::COMPRESSED | attrs::SPARSE_FILE | attrs::REPARSE_POINT) != 0
-            }
+            SizeMode::Fast => special || (self.opts.dedup && dense),
         };
         if need_query {
-            if let Some(v) = self.fs.compressed_size(path) {
-                return round_up(v, self.cluster);
+            if self.opts.dedup {
+                if let Some(fi) = self.fs.file_info(path) {
+                    let key = if fi.links > 1 { fi.key } else { None };
+                    return (round_up(fi.on_disk, self.cluster), key);
+                }
+            } else if let Some(v) = self.fs.compressed_size(path) {
+                return (round_up(v, self.cluster), None);
             }
         }
         // 取不到时退回逻辑大小（同样按簇取整，与卷上的实际分配粒度一致）。
-        round_up(e.size, self.cluster)
+        (round_up(e.size, self.cluster), None)
     }
 
     fn record_inaccessible(&self, path: &str, code: u32, sys: bool) {
@@ -129,9 +155,9 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
         }
     }
 
-    // TODO(阶段 C): 硬链接 / 目录映射去重（nNumberOfLinks > 1 或 FileId 相同只计一次）。
-    // 阶段 A 不去重，重复部分体现在 Attribution.overcount。
-    fn file_node(&self, parent: &str, e: RawEntry, sys: bool) -> Node {
+    /// 硬链接：扫描时先照常计入，并把 (key, 目录, 名字, 占用) 记下来；扫描结束后
+    /// [`crate::dedup::apply`] 统一挑一个路径记账，其余名字记 0（结果与线程调度无关）。
+    fn file_node(&self, parent: &str, dir_arc: &mut Option<Arc<str>>, e: RawEntry, sys: bool, dense: bool) -> Node {
         let placeholder = e.attrs & attrs::CLOUD_PLACEHOLDER_MASK != 0;
         let allocated = if placeholder {
             // 绝不打开：内容不在本地，本地占用按 0 计。
@@ -139,7 +165,14 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
             self.cloud_logical.fetch_add(e.size, Relaxed);
             0
         } else {
-            self.allocated_for(&join(parent, &e.name), &e)
+            let (a, key) = self.allocated_for(&join(parent, &e.name), &e, dense);
+            if let Some(key) = key {
+                let dir = dir_arc.get_or_insert_with(|| Arc::from(parent)).clone();
+                if let Ok(mut v) = self.occ.lock() {
+                    v.push(Occurrence { key, dir, name: e.name.clone(), alloc: a, sys });
+                }
+            }
+            a
         };
         if placeholder {
             self.cloud_alloc.fetch_add(allocated, Relaxed);
@@ -164,6 +197,8 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
             reparse_skipped: false,
             cloud_placeholder: placeholder,
             system_reserved: sys,
+            hardlink_dup: false,
+            mapped: false,
             files: 1,
             dirs: 0,
             children: Vec::new(),
@@ -185,6 +220,8 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
             reparse_skipped: false,
             cloud_placeholder: false,
             system_reserved: sys,
+            hardlink_dup: false,
+            mapped: false,
             files: 0,
             dirs: 0,
             children: Vec::new(),
@@ -208,6 +245,35 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
                 node.inaccessible = true;
                 node.error_code = code;
                 self.record_inaccessible(&node.path, code, sys);
+                // 列不出目录，但从别处知道一些子目录（WindowsApps 的包目录）：能量的先量上。
+                // 节点仍记“无权限”（清单不完整），差额推算照常进行，只是推算值会小一些。
+                let known = self.fs.known_children(&node.path);
+                if !known.is_empty() {
+                    let kids: Vec<Node> = known
+                        .into_par_iter()
+                        // 注册表里还记着、但目录已经不在的包：跳过，不算无权限。
+                        .filter(|n| {
+                            !matches!(
+                                self.fs.list_dir(&join(&node.path, n)),
+                                Err(errors::ERROR_FILE_NOT_FOUND) | Err(errors::ERROR_PATH_NOT_FOUND)
+                            )
+                        })
+                        .map(|n| {
+                            let p = join(&node.path, &n);
+                            self.scan_dir(p, n, attrs::DIRECTORY, 0, 0, sys, depth + 1)
+                        })
+                        .filter(|c| c.files > 0 || c.dirs > 0 || c.inaccessible)
+                        .collect();
+                    self.dirs.fetch_add(kids.len() as u64, Relaxed);
+                    for c in &kids {
+                        node.logical += c.logical;
+                        node.allocated += c.allocated;
+                        node.files += c.files;
+                        node.dirs += c.dirs + 1;
+                    }
+                    node.children = kids;
+                    node.children.sort_unstable_by(|a, b| b.allocated.cmp(&a.allocated).then_with(|| a.name.cmp(&b.name)));
+                }
                 return node;
             }
         };
@@ -215,6 +281,8 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
         let mut files: Vec<Node> = Vec::new();
         let mut subdirs: Vec<(String, String, u32, i64, u32, bool)> = Vec::new();
         let mut skipped: Vec<Node> = Vec::new();
+        let dense = self.opts.size_mode == SizeMode::Fast && self.opts.dedup && is_hardlink_dense(&node.path);
+        let mut dir_arc: Option<Arc<str>> = None;
 
         for e in entries {
             if self.cancelled() {
@@ -235,7 +303,7 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
                     subdirs.push((child_path, e.name, e.attrs, e.mtime, tag, child_sys));
                 }
             } else {
-                files.push(self.file_node(&node.path, e, child_sys));
+                files.push(self.file_node(&node.path, &mut dir_arc, e, child_sys, dense));
             }
         }
 
@@ -264,6 +332,8 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
                 reparse_skipped: false,
                 cloud_placeholder: false,
                 system_reserved: sys,
+                hardlink_dup: false,
+                mapped: false,
                 files: rest.len() as u64,
                 dirs: 0,
                 children: Vec::new(),
@@ -342,6 +412,7 @@ where
         inacc_sys: AtomicU64::new(0),
         inacc_other: AtomicU64::new(0),
         inacc_list: Mutex::new(Vec::new()),
+        occ: Mutex::new(Vec::new()),
     };
 
     // 先确认根能打开，给出明确错误。
@@ -397,7 +468,8 @@ where
         return Err(ScanError::Cancelled);
     }
 
-    let measured = Measured {
+    let mut tree = tree;
+    let mut measured = Measured {
         scanned: ctx.scanned.load(Relaxed),
         system_reserved: ctx.sys.load(Relaxed),
         cloud_alloc: ctx.cloud_alloc.load(Relaxed),
@@ -406,10 +478,32 @@ where
         inaccessible_dirs_system: ctx.inacc_sys.load(Relaxed),
         inaccessible_dirs_other: ctx.inacc_other.load(Relaxed),
     };
-    let buckets = compute_attribution(used, &measured, ctx.root_is_volume);
+
+    // 去重（硬链接 + 商店应用目录映射）：扫描完成后统一处理，结果与线程调度无关。
+    let occ = std::mem::take(&mut *ctx.occ.lock().unwrap_or_else(|e| e.into_inner()));
+    let stats = if opts.dedup {
+        let st = pool.install(|| dedup::apply(&mut tree, occ, fs));
+        measured.scanned = measured.scanned.saturating_sub(st.removed_scanned);
+        measured.system_reserved = measured.system_reserved.saturating_sub(st.removed_sys);
+        Some(st)
+    } else {
+        None
+    };
+
+    let mut buckets = compute_attribution(used, &measured, ctx.root_is_volume);
+    let mut mapped_dirs = Vec::new();
+    if let Some(st) = stats {
+        buckets.dedup_enabled = true;
+        buckets.hardlink_dedup = st.hardlink_bytes;
+        buckets.hardlink_dedup_files = st.hardlink_files;
+        buckets.mapped_dedup = st.mapped_bytes;
+        buckets.mapped_dirs = st.mapped.len() as u64;
+        mapped_dirs = st.mapped;
+    }
     let inaccessible_dirs = ctx.inacc_list.into_inner().unwrap_or_default();
 
     Ok(ScanResult {
+        mapped_dirs,
         root: root.clone(),
         total_bytes: volume.total_bytes,
         used_bytes: used,

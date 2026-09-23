@@ -18,7 +18,7 @@ pub enum NodeKind {
 }
 
 /// 文件树节点。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub name: String,
     /// 完整路径。Dir 节点总有值；File/Rest 节点在内存里为空，见模块说明。
@@ -51,6 +51,14 @@ pub struct Node {
     /// 位于系统保留项之下（回收站 / 卷影 / pagefile 等，按名字归类）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub system_reserved: bool,
+    /// 硬链接去重：这个文件还有别的名字（nNumberOfLinks > 1），它的空间已记在另一个路径上，
+    /// 这里 allocated 记 0（阶段 C）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hardlink_dup: bool,
+    /// 目录映射去重：这个目录和另一个路径是同一份数据（文件 ID 相同，商店应用的 AppData 映射），
+    /// 空间记在另一边，这里 allocated 记 0、子项不再展开；对应关系见 `ScanResult.mapped_dirs`。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mapped: bool,
     /// 子树中文件数（Rest 节点为被合并的文件数；File 节点为 1）。
     pub files: u64,
     /// 子树中目录数（不含自身）。
@@ -95,8 +103,24 @@ pub struct Attribution {
     pub cloud_placeholder_logical: u64,
     /// 其余说不清的部分 = used - 其余各项。
     pub unattributed: u64,
-    /// 扫描量出的字节超过卷已用空间的部分（主要是硬链接重复计数，阶段 C 去重）。
+    /// 扫描量出的字节（去重之后）仍超过卷已用空间的部分。阶段 C 去重后应接近 0；
+    /// 仍不为 0 说明还有没识别出的重复计数（或扫描期间卷上数据在变）。
     pub overcount: u64,
+    /// 是否做了去重（硬链接 + 目录映射）。旧快照里没有这个字段，读出来为 false。
+    #[serde(default)]
+    pub dedup_enabled: bool,
+    /// 硬链接去重掉的字节：同一个文件（卷序列号 + 文件 ID 相同）在多个路径出现，只算一次。
+    #[serde(default)]
+    pub hardlink_dedup: u64,
+    /// 被去重的硬链接“多余名字”个数。
+    #[serde(default)]
+    pub hardlink_dedup_files: u64,
+    /// 目录映射去重掉的字节（商店应用 `Packages\…\LocalCache\Roaming\X` 与 `AppData\Roaming\X` 是同一份）。
+    #[serde(default)]
+    pub mapped_dedup: u64,
+    /// 识别出的映射目录个数。
+    #[serde(default)]
+    pub mapped_dirs: u64,
     /// 差额的原始值（used - 量到的各项；可能为负）。
     pub gap: i64,
     /// 本次扫描根是不是卷根（不是卷根时，差额里包含“扫描范围之外”的内容）。
@@ -107,7 +131,7 @@ pub struct Attribution {
 }
 
 /// 一个无法访问的目录。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InaccessibleDir {
     pub path: String,
     pub error_code: u32,
@@ -115,7 +139,7 @@ pub struct InaccessibleDir {
 }
 
 /// 扫描结果。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanResult {
     pub root: String,
     /// 卷总容量（GetDiskFreeSpaceExW lpTotalNumberOfBytes）。
@@ -135,6 +159,21 @@ pub struct ScanResult {
     pub inaccessible_total: u64,
     pub size_mode: SizeMode,
     pub top_files_per_dir: usize,
+    /// 识别出的目录映射（去重时被记 0 的一侧 → 真正记账的一侧）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapped_dirs: Vec<MappedDir>,
+}
+
+/// 一对“同一份数据、两个路径”的目录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappedDir {
+    /// 记 0 的一侧（例如 `C:\Users\me\AppData\Roaming\Claude`）。
+    pub path: String,
+    /// 空间记在这一侧（例如 `C:\Users\me\AppData\Local\Packages\Claude_…\LocalCache\Roaming\Claude`）。
+    pub same_as: String,
+    /// 被去掉的字节（= same_as 那一侧量到的占用）。
+    pub bytes: u64,
+    pub files: u64,
 }
 
 /// 扫描进度。
@@ -171,6 +210,8 @@ pub struct ScanOptions {
     pub threads: usize,
     /// 进度回调间隔（毫秒），要求 ≤ 200。
     pub progress_interval_ms: u64,
+    /// 硬链接 + 目录映射去重（阶段 C，默认开）。关掉时行为与阶段 A/B 相同（用于对比耗时）。
+    pub dedup: bool,
 }
 
 impl Default for ScanOptions {
@@ -180,6 +221,7 @@ impl Default for ScanOptions {
             size_mode: SizeMode::Exact,
             threads: 0,
             progress_interval_ms: 100,
+            dedup: true,
         }
     }
 }

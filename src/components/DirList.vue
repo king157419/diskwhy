@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { DirListing, NodeView } from "../api";
-import { humanBytes, pct } from "../format";
+import { tierKey, type DirListing, type NodeView } from "../api";
+import { TIER_SHORT, humanBytes, pct } from "../format";
 
 defineProps<{ listing: DirListing; selectedPath: string | null }>();
 const emit = defineEmits<{ open: [path: string]; select: [node: NodeView] }>();
@@ -40,16 +40,17 @@ function rowKey(n: NodeView): string {
         </button>
       </template>
       <span class="muted crumb-total">
-        {{ humanBytes(listing.node.allocated) }} · {{ listing.total_children }} 项
+        {{ humanBytes(listing.node.allocated) }} · {{ listing.total_children }} 项 · 点文件夹进入，右键或点“详情”看说明
       </span>
     </nav>
     <div class="table">
       <div class="thead">
         <span class="c-name">名称</span>
+        <span class="c-what">这是什么</span>
         <span class="c-bar">占父目录</span>
         <span class="c-size">实际占用</span>
         <span class="c-pct">占比</span>
-        <span class="c-type">类型</span>
+        <span class="c-act"></span>
       </div>
       <div class="tbody">
         <div
@@ -66,19 +67,26 @@ function rowKey(n: NodeView): string {
           @click="onClick(n)"
           @keydown.enter="onClick(n)"
           @contextmenu.prevent="emit('select', n)"
-          :title="canOpen(n) ? '点击进入这个文件夹' : '点击查看详情'"
+          :title="(canOpen(n) ? '点击进入这个文件夹；' : '') + n.type_label"
         >
           <span class="c-name">
+            <i class="tier-bar" :class="'tb-' + tierKey(n.explanation)"></i>
             <span class="ico" :class="icon(n)"></span>
             <span class="nm">{{ n.name }}</span>
             <span v-if="n.system_reserved" class="tag tag-sys">系统保留</span>
             <span v-if="n.inaccessible" class="tag tag-inacc">无权限</span>
             <span v-if="n.reparse_skipped" class="tag">未跟随</span>
           </span>
+          <span class="c-what" :title="n.explanation?.what">
+            <span class="chip" :class="'chip-' + tierKey(n.explanation)">{{ TIER_SHORT[tierKey(n.explanation)] }}</span>
+            <span class="what-text">{{ n.explanation?.what ?? "" }}</span>
+          </span>
           <span class="c-bar"><i :style="{ width: Math.max(0.5, n.percent_of_parent) + '%' }"></i></span>
           <span class="c-size">{{ humanBytes(n.allocated) }}</span>
           <span class="c-pct">{{ pct(n.allocated, listing.node.allocated) }}</span>
-          <span class="c-type">{{ n.type_label }}</span>
+          <span class="c-act">
+            <button class="mini" title="查看说明" @click.stop="emit('select', n)">详情</button>
+          </span>
         </div>
         <div v-if="listing.children.length === 0" class="empty muted">这个文件夹是空的</div>
         <div v-if="listing.total_children > listing.children.length" class="empty muted">

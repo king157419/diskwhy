@@ -3,6 +3,8 @@
 //! 用法：
 //!   diskwhy-cli scan <root> [--top 30] [--json out.json] [--json-depth 3]
 //!                           [--mode exact|fast] [--threads N] [--keep-files 50] [--quiet]
+//!   diskwhy-cli explain <root> [--top 50] [--json out.json] [--md coverage.md] [--mode exact|fast] [--quiet]
+//!     扫描后对前 N 大目录逐个解释（档位 / 来源 / 这是什么），统计规则 / 启发式 / 未知各多少。
 
 use diskwhy_core::scan::scan;
 use diskwhy_core::view::{human_bytes, node_view, top_dirs, truncate_tree, NodeView};
@@ -12,9 +14,21 @@ use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-const USAGE: &str = "用法：diskwhy-cli scan <root> [--top 30] [--json out.json] [--json-depth 3] [--mode exact|fast] [--threads N] [--keep-files 50] [--quiet]";
+mod explain_cmd;
+
+const USAGE: &str = "用法：
+  diskwhy-cli scan <root> [--top 30] [--json out.json] [--json-depth 3] [--mode exact|fast] [--threads N] [--keep-files 50] [--quiet]
+  diskwhy-cli explain <root> [--top 50] [--json out.json] [--md coverage.md] [--mode exact|fast] [--quiet]";
+
+#[derive(PartialEq)]
+enum Cmd {
+    Scan,
+    Explain,
+}
 
 struct Args {
+    cmd: Cmd,
+    md: Option<String>,
     root: String,
     top: usize,
     json: Option<String>,
@@ -27,14 +41,18 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    match it.next().as_deref() {
-        Some("scan") => {}
+    let cmd = match it.next().as_deref() {
+        Some("scan") => Cmd::Scan,
+        Some("explain") => Cmd::Explain,
         Some("-h") | Some("--help") | None => return Err(USAGE.into()),
         Some(other) => return Err(format!("未知子命令 {other}\n{USAGE}")),
-    }
+    };
+    let default_top = if cmd == Cmd::Explain { 50 } else { 30 };
     let mut a = Args {
+        cmd,
+        md: None,
         root: String::new(),
-        top: 30,
+        top: default_top,
         json: None,
         json_depth: 3,
         mode: SizeMode::Exact,
@@ -47,6 +65,7 @@ fn parse_args() -> Result<Args, String> {
         match x.as_str() {
             "--top" => a.top = val("--top")?.parse().map_err(|_| "--top 需要数字")?,
             "--json" => a.json = Some(val("--json")?),
+            "--md" => a.md = Some(val("--md")?),
             "--json-depth" => a.json_depth = val("--json-depth")?.parse().map_err(|_| "--json-depth 需要数字")?,
             "--threads" => a.threads = val("--threads")?.parse().map_err(|_| "--threads 需要数字")?,
             "--keep-files" => a.keep_files = val("--keep-files")?.parse().map_err(|_| "--keep-files 需要数字")?,
@@ -137,6 +156,10 @@ fn main() {
         }
     };
 
+    if args.cmd == Cmd::Explain {
+        explain_cmd::run(&r, &args);
+        return;
+    }
     let used = r.used_bytes;
     println!("DiskWhy 扫描结果：{}", r.root);
     println!(

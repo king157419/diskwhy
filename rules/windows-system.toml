@@ -1,0 +1,647 @@
+# Windows 系统项。文案均为 DiskWhy 自己撰写（MIT）。
+# 路径用 TOML 单引号字面量，反斜杠不用转义。
+
+# ───────── 顶层容器（只说明这一层，子项各看各的规则）─────────
+
+[[rule]]
+id = "system-drive-root"
+owner = "Windows"
+category = "system"
+tier = "keep"
+scope = "self"
+kind = "dir"
+match = ['%SystemDrive%']
+what = "系统盘（C 盘）的根目录"
+why = "Windows、软件和所有账户的文件都在这块盘上"
+lose = "这是整块盘，不存在“删掉”一说。请点进下面的文件夹，看具体是哪一块大。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "users-root"
+owner = "Windows"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%SystemDrive%\Users']
+what = "所有 Windows 账户的个人文件夹都在这里"
+why = "每个登录过这台电脑的账户都有一个自己的文件夹（桌面、文档、软件数据等）"
+lose = "不能整个删：里面是各个账户的个人文件和软件数据。请点进去看具体是哪一块大。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "user-profile"
+owner = "Windows"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%USERPROFILE%']
+what = "你这个账户的个人文件夹"
+why = "桌面、文档、下载、图片，以及软件存放数据的 AppData 都在这里面"
+lose = "不能整个删：里面既有你的文件，也有软件的设置和缓存。请点进去看具体是哪一块大。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "appdata-root"
+owner = "Windows"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%USERPROFILE%\AppData']
+what = "软件存放个人设置、缓存和数据的总文件夹（默认隐藏）"
+why = "几乎所有软件都把自己的配置、登录信息、缓存放在这里的 Local / Roaming / LocalLow 三个子文件夹里"
+lose = "不能整个删：删了所有软件的设置和登录状态都会丢，很多软件会打不开。里面有能清的缓存，请点进去逐项看。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "appdata-local"
+owner = "Windows"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%LOCALAPPDATA%']
+what = "只属于这台电脑的软件数据（AppData\\Local）"
+why = "软件把比较大、不需要跟着账户漫游的东西放这里，比如缓存、下载的组件、只给你装的程序"
+lose = "不能整个删：缓存和软件本体、个人数据混在一起。请点进去逐项看，缓存类会标成绿色。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "appdata-roaming"
+owner = "Windows"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%APPDATA%']
+what = "软件的设置和个人数据（AppData\\Roaming）"
+why = "软件把配置、账户信息、聊天记录数据库等放这里；在公司域环境下这部分会跟着账户走"
+lose = "不能整个删：删了软件的设置、登录状态甚至本地聊天记录会丢。请点进去逐项看。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "appdata-locallow"
+owner = "Windows"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%USERPROFILE%\AppData\LocalLow']
+what = "低权限程序（浏览器插件、部分游戏）存放数据的地方"
+why = "以“低完整性级别”运行的程序只能往这里写，常见于游戏存档、Unity 游戏缓存"
+lose = "不能整个删：可能有游戏存档。请点进去逐项看。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "local-programs"
+owner = "Windows"
+category = "app"
+tier = "keep"
+scope = "self"
+match = ['%LOCALAPPDATA%\Programs']
+what = "只给你这个账户安装的软件（不需要管理员权限的那种）"
+why = "很多软件（VS Code、Ollama、Python 等）默认装在这里，不装到 Program Files"
+lose = "不能直接删：删了这些软件就打不开，卸载信息也会残留。不用的软件请在“设置 > 应用”里卸载。"
+how = "manual"
+how_detail = "打开“设置 > 应用 > 已安装的应用”，卸载不用的软件。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "program-files"
+owner = "Windows"
+category = "app"
+tier = "keep"
+scope = "self"
+match = ['%ProgramFiles%', '%ProgramFiles(x86)%']
+what = "软件的安装目录（Program Files）"
+why = "安装软件时，程序文件默认放在这里（x86 那个是 32 位软件）"
+lose = "不能直接删里面的文件夹：软件会打不开，卸载信息残留。想腾空间请卸载不用的软件。"
+how = "manual"
+how_detail = "打开“设置 > 应用 > 已安装的应用”，按大小排序，卸载不用的软件。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "programdata-root"
+owner = "Windows"
+category = "system"
+tier = "keep"
+scope = "self"
+match = ['%ProgramData%']
+what = "所有账户共用的软件数据（ProgramData，默认隐藏）"
+why = "软件把对所有用户都有效的配置、许可证、更新包、缓存放在这里"
+lose = "不能整个删：很多软件和驱动的配置在这里，删了可能打不开或要重装。请点进去逐项看。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid"]
+verified_on = "2026-09-23"
+
+# ───────── Windows 目录 ─────────
+
+[[rule]]
+id = "windows-dir"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%']
+what = "Windows 系统本身"
+why = "操作系统的程序、驱动、组件都在这里"
+lose = "不能手动删任何东西，删错一个文件都可能让系统启动不了。想让它变小，请用 Windows 自带的清理工具。"
+how = "builtin_tool"
+how_detail = "打开“设置 > 系统 > 存储 > 临时文件”，勾选想清理的项目后点“删除文件”；或运行“磁盘清理”（cleanmgr）并点“清理系统文件”。"
+refs = ["https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "winsxs"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\WinSxS']
+what = "Windows 组件仓库：系统组件和更新的所有版本"
+why = "装更新、开关 Windows 功能、修复系统都要用；里面很多文件和 System32 是同一份（硬链接），实际占用比看上去小"
+lose = "绝对不能手动删，删了可能导致系统无法更新甚至无法启动。可以用系统命令清掉被新版本替代的旧组件。"
+how = "builtin_tool"
+how_detail = "以管理员身份打开终端，运行：DISM /Online /Cleanup-Image /StartComponentCleanup 。先看能省多少：DISM /Online /Cleanup-Image /AnalyzeComponentStore 。"
+refs = ["https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/clean-up-the-winsxs-folder"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "system32"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\System32', '%SystemRoot%\SysWOW64']
+what = "Windows 的核心程序和系统库（SysWOW64 是给 32 位程序用的那一套）"
+why = "系统运行时时刻都在用"
+lose = "绝对不能删，删了系统会坏。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "driverstore"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\System32\DriverStore']
+what = "驱动仓库：装过的所有驱动安装包"
+why = "Windows 需要重装或回滚驱动时从这里取；显卡驱动更新多次后会积累好几个旧版本"
+lose = "不能手动删文件夹，删错了设备可能用不了。旧驱动可以用系统工具删。"
+how = "builtin_tool"
+how_detail = "“磁盘清理 > 清理系统文件”里勾选“设备驱动程序包”；或管理员终端里先 pnputil /enum-drivers 查看，再用 pnputil /delete-driver oemXX.inf 删除确认不用的旧驱动。"
+refs = ["https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/pnputil-command-syntax"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-installer-cache"
+owner = "Windows Installer"
+category = "installer"
+tier = "keep"
+match = ['%SystemRoot%\Installer']
+what = "已装软件的安装包缓存（.msi / .msp）"
+why = "卸载、修复、打补丁时 Windows Installer 要用到原来的安装包"
+lose = "不能手动删：删了以后相关软件可能卸载不掉、修复不了、更新失败。想让它变小，就卸载不用的软件。"
+how = "manual"
+how_detail = "在“设置 > 应用”里卸载不用的软件，对应的安装包会跟着删掉。不要用第三方工具“清理孤立补丁”，除非你非常确定。"
+refs = ["https://learn.microsoft.com/en-us/windows/win32/msi/windows-installer-portal"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "prefetch"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\Prefetch']
+what = "预读取记录：帮常用程序启动更快"
+why = "Windows 记下程序启动时要读哪些文件，下次提前读好"
+lose = "别删：删了会自己重新生成，还会让程序头几次启动变慢，腾不出多少空间。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-temp"
+owner = "Windows"
+category = "cache"
+tier = "safe"
+match = ['%SystemRoot%\Temp']
+what = "系统级临时文件"
+why = "系统服务、安装程序运行时留下的中间文件"
+lose = "不丢数据；正在使用的文件会删不掉，跳过即可。"
+how = ["delete", "builtin_tool"]
+how_detail = "推荐用“设置 > 系统 > 存储 > 临时文件”清理；手动删需要管理员权限。"
+refs = ["https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "user-temp"
+owner = "Windows"
+category = "cache"
+tier = "safe"
+match = ['%TEMP%', '%LOCALAPPDATA%\Temp']
+what = "你账户下的临时文件"
+why = "软件运行、解压、安装时放中间文件的地方，本该用完就删，但很多软件会遗留"
+lose = "一般不丢数据；正在运行的程序可能还在用其中一部分（会删不掉，跳过即可）。刚下载还没安装完的安装包也可能在这里。"
+how = ["delete", "builtin_tool"]
+how_detail = "关掉不用的程序后删除里面的内容；或用“设置 > 系统 > 存储 > 临时文件”。"
+refs = ["https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-update-download"
+owner = "Windows 更新"
+category = "cache"
+tier = "safe"
+match = ['%SystemRoot%\SoftwareDistribution\Download']
+what = "Windows 更新下载的安装包"
+why = "Windows 更新先把补丁下载到这里再安装"
+lose = "已经装好的更新不受影响；正在进行的更新会重新下载。"
+how = "builtin_tool"
+how_detail = "用“设置 > 系统 > 存储 > 临时文件”里的“Windows 更新清理”，或“磁盘清理 > 清理系统文件”。不建议在更新进行中手动删。"
+refs = ["https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "software-distribution"
+owner = "Windows 更新"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\SoftwareDistribution']
+what = "Windows 更新的工作目录（更新记录数据库等）"
+why = "Windows 更新用它记录装过哪些补丁"
+lose = "除了 Download 子文件夹，其余别手动删，可能导致更新记录丢失或更新出错。"
+how = "builtin_tool"
+how_detail = "用“设置 > 系统 > 存储 > 临时文件”里的“Windows 更新清理”。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "delivery-optimization"
+owner = "Windows 更新"
+category = "cache"
+tier = "safe"
+match = [
+  '%SystemRoot%\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization',
+  '%SystemRoot%\SoftwareDistribution\DeliveryOptimization',
+]
+what = "传递优化缓存：Windows 更新和商店应用的下载缓存"
+why = "Windows 可以把下载过的更新分享给局域网里的其他电脑，所以先存一份"
+lose = "不丢数据，只是这些更新不能再分享给别的电脑；需要时会重新下载。"
+how = "builtin_tool"
+how_detail = "“设置 > 系统 > 存储 > 临时文件”勾选“传递优化文件”；或管理员 PowerShell 运行 Delete-DeliveryOptimizationCache。"
+refs = ["https://learn.microsoft.com/en-us/powershell/module/deliveryoptimization/delete-deliveryoptimizationcache"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-old"
+owner = "Windows"
+category = "installer"
+tier = "review"
+match = ['%SystemDrive%\Windows.old']
+what = "升级前的旧 Windows"
+why = "大版本升级后保留旧系统，方便你退回去"
+lose = "删了就不能回退到升级前的 Windows 版本；旧系统里如果还留着没迁移的个人文件也会一起没。Windows 一般会在升级后 10 天左右自动删除。"
+how = "builtin_tool"
+how_detail = "“设置 > 系统 > 存储 > 临时文件”勾选“以前的 Windows 安装”；或“磁盘清理 > 清理系统文件”。不要手动删，权限很复杂。"
+refs = ["https://support.microsoft.com/en-us/windows/delete-your-previous-version-of-windows-f8b26680-e083-c710-b757-7567d69dbb74"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "hiberfil"
+owner = "Windows"
+category = "system"
+tier = "review"
+kind = "file"
+match = ['%SystemDrive%\hiberfil.sys']
+what = "休眠文件：电脑休眠时把内存内容存到这里"
+why = "休眠和“快速启动”功能要用，大小大约是内存的四成到七成多"
+lose = "关掉休眠后这个文件会消失，但电脑就不能休眠了，“快速启动”也会一起关掉（开机可能慢几秒）。睡眠不受影响。"
+how = "builtin_tool"
+how_detail = "以管理员身份运行 powercfg /h off 关闭休眠（文件自动删除）；想恢复就运行 powercfg /h on。不能手动删这个文件。"
+refs = ["https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/disable-and-re-enable-hibernation"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "pagefile"
+owner = "Windows"
+category = "system"
+tier = "keep"
+kind = "file"
+match = ['%SystemDrive%\pagefile.sys']
+what = "页面文件（虚拟内存）"
+why = "内存不够用时，Windows 把暂时不用的数据放到这里"
+lose = "不能删：内存吃紧时程序会崩溃，系统出错时也没法保存诊断信息。可以把它挪到别的盘或调整大小。"
+how = "migrate"
+how_detail = "“系统属性 > 高级 > 性能 设置 > 高级 > 虚拟内存 更改”：给别的盘设置页面文件，再把 C 盘改成“无分页文件”或较小的固定大小，重启生效。内存不大（16 GB 以下）不建议完全去掉。"
+refs = ["https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/introduction-to-the-page-file"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "swapfile"
+owner = "Windows"
+category = "system"
+tier = "keep"
+kind = "file"
+match = ['%SystemDrive%\swapfile.sys']
+what = "给商店应用用的交换文件"
+why = "Windows 挂起商店应用时临时存放它们的内存"
+lose = "不能删，通常也不大。它跟着页面文件设置走。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "recycle-bin"
+owner = "Windows"
+category = "trash"
+tier = "review"
+match = ['%SystemDrive%\$Recycle.Bin']
+what = "回收站：你删掉的文件其实还在这里"
+why = "删除文件默认先进回收站，给你反悔的机会；每个账户一个子文件夹"
+lose = "清空后这些文件就找不回来了（除非用专业恢复工具）。清空前先打开回收站看看有没有要还原的。"
+how = "builtin_tool"
+how_detail = "打开桌面上的“回收站”，确认没有要还原的文件后点“清空回收站”；也可以在“设置 > 系统 > 存储 > 临时文件”里勾选“回收站”。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "system-volume-information"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemDrive%\System Volume Information']
+what = "系统还原点和卷影副本"
+why = "“系统还原”和文件的“以前的版本”靠它把电脑恢复到过去某个时间点"
+lose = "不能手动删（也没权限）。删掉还原点后就不能用系统还原回到那些时间点。"
+how = "builtin_tool"
+how_detail = "“控制面板 > 系统 > 系统保护 > 配置”：可以调小最大使用量，或点“删除”清掉所有还原点；“磁盘清理 > 清理系统文件 > 其他选项”可以只删旧还原点、保留最新一个。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "recovery-partition-dir"
+owner = "Windows"
+category = "system"
+tier = "keep"
+match = ['%SystemDrive%\Recovery', '%SystemDrive%\$WinREAgent']
+what = "Windows 恢复环境相关文件"
+why = "系统出问题时进入“恢复模式”要用；$WinREAgent 是更新恢复环境时的临时文件"
+lose = "不能删，删了可能导致系统坏了之后无法自救。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "thumbnail-cache"
+owner = "Windows 资源管理器"
+category = "cache"
+tier = "safe"
+match = [
+  '%LOCALAPPDATA%\Microsoft\Windows\Explorer',
+  '%LOCALAPPDATA%\Microsoft\Windows\Explorer\thumbcache_*.db',
+  '%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db',
+]
+what = "缩略图和图标缓存"
+why = "资源管理器把图片、视频的缩略图存下来，打开文件夹时不用每次重新生成"
+lose = "不丢数据；删掉后第一次打开图片多的文件夹会慢一点，缩略图重新生成。"
+how = ["builtin_tool", "delete"]
+how_detail = "用“磁盘清理”勾选“缩略图”最省事（这些文件被资源管理器占用，手动删常常删不掉）。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "inetcache"
+owner = "Windows / IE 内核"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\Microsoft\Windows\INetCache']
+what = "旧版 IE 内核的网页缓存"
+why = "用到老式网页控件的程序会把网页文件缓存到这里"
+lose = "不丢数据，网页下次重新下载。"
+how = ["builtin_tool", "delete"]
+how_detail = "“磁盘清理”勾选“Internet 临时文件”，或直接删里面的内容。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "directx-shader-cache"
+owner = "DirectX"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\D3DSCache']
+what = "DirectX 着色器缓存"
+why = "游戏和图形程序编译好的着色器存在这里，下次加载更快"
+lose = "不丢数据；删掉后游戏头几次加载可能慢一点或短暂卡顿，缓存会重新生成。"
+how = ["builtin_tool", "delete"]
+how_detail = "“磁盘清理”勾选“DirectX 着色器缓存”，或关掉游戏后直接删。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-error-reports"
+owner = "Windows 错误报告"
+category = "log"
+tier = "safe"
+match = ['%ProgramData%\Microsoft\Windows\WER', '%LOCALAPPDATA%\Microsoft\Windows\WER', '%LOCALAPPDATA%\CrashDumps']
+what = "程序崩溃时生成的错误报告和转储"
+why = "程序崩溃后 Windows 保存现场，准备发给微软或开发者分析"
+lose = "只是丢掉以前崩溃的诊断记录，不影响任何程序使用。"
+how = ["builtin_tool", "delete"]
+how_detail = "“设置 > 系统 > 存储 > 临时文件”里勾选“Windows 错误报告”，或直接删除。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "memory-dumps"
+owner = "Windows"
+category = "log"
+tier = "safe"
+match = ['%SystemRoot%\MEMORY.DMP', '%SystemRoot%\Minidump', '%SystemRoot%\LiveKernelReports']
+what = "蓝屏或系统严重错误时的内存转储"
+why = "系统崩溃时把内存内容存下来，用于排查原因"
+lose = "只是丢掉排查蓝屏的线索；如果你正在找人分析蓝屏原因，先别删。"
+how = ["builtin_tool", "delete"]
+how_detail = "“磁盘清理 > 清理系统文件”勾选“系统错误内存转储文件”；手动删需要管理员权限。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-logs"
+owner = "Windows"
+category = "log"
+tier = "review"
+match = ['%SystemRoot%\Logs']
+what = "Windows 自己的日志（更新、组件、安装等）"
+why = "系统记录更新和组件安装过程，出问题时用来排查"
+lose = "一般不影响使用，但以后排查更新失败会少线索。正在写入的日志删不掉。"
+how = "delete"
+how_detail = "只建议删 CBS 子文件夹里的旧 .cab / .log；需要管理员权限。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "dotnet-assembly"
+owner = ".NET Framework"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\assembly', '%SystemRoot%\Microsoft.NET']
+what = ".NET Framework 的程序库和预编译缓存"
+why = "用 .NET 写的程序运行时要用；NativeImages 是提前编译好的版本，让程序启动更快"
+lose = "不能手动删，会导致很多软件打不开。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-apps"
+owner = "Microsoft Store"
+category = "app"
+tier = "keep"
+match = ['%ProgramFiles%\WindowsApps']
+what = "商店应用（Microsoft Store 应用）的程序本体"
+why = "从商店或通过 MSIX 安装的软件都装在这里"
+lose = "不能手动删（也没权限）。不用的应用请卸载；也可以让新应用装到别的盘。"
+how = "builtin_tool"
+how_detail = "“设置 > 应用 > 已安装的应用”里卸载；很多商店应用在“高级选项”里可以“移动”到别的盘；“设置 > 系统 > 存储 > 高级存储设置 > 新内容的保存位置”可以让以后的应用装到别的盘。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "package-cache"
+owner = "各类安装程序（Visual Studio、.NET、VC++ 运行库等）"
+category = "installer"
+tier = "review"
+match = ['%ProgramData%\Package Cache']
+what = "安装程序保存的安装包副本"
+why = "WiX / Burn 类安装程序（VC++ 运行库、.NET SDK、Visual Studio 组件等）把安装包留一份，卸载、修复、升级时要用"
+lose = "删了以后对应软件可能卸载不掉、修复失败或升级报错，需要找到原安装包才能修好。空间实在紧张再考虑，删前确认那些软件你不打算卸载或修复。"
+how = "manual"
+how_detail = "不建议手动删。先卸载不用的开发工具和运行库，它们的缓存会跟着删掉。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "store-apps-data"
+owner = "Microsoft Store 应用"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%LOCALAPPDATA%\Packages']
+what = "商店应用（MSIX 包）的数据，每个应用一个文件夹"
+why = "商店应用不能随便往别处写，它们的设置、缓存、下载内容都放在自己的文件夹里"
+lose = "不能整个删。请点进去看是哪个应用大；有的应用可以在“设置 > 应用 > 高级选项”里“重置”来清空数据。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "store-app-package"
+owner = "Microsoft Store 应用"
+category = "userdata"
+tier = "review"
+owner_from_path = true
+match = ['%LOCALAPPDATA%\Packages\*']
+what = "某个商店应用自己的数据（设置、缓存和它下载的内容）"
+why = "每个商店应用在这里有一个独立文件夹，文件夹名前半截是应用名"
+lose = "整个删会让这个应用丢掉设置和登录状态，里面也可能有它保存的你的内容。建议用系统的“重置”功能而不是直接删。"
+how = "builtin_tool"
+how_detail = "“设置 > 应用 > 已安装的应用”找到这个应用 → 高级选项 → “重置”（清空数据）或“卸载”。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "store-app-temp"
+owner = "Microsoft Store 应用"
+category = "cache"
+tier = "safe"
+owner_from_path = true
+match = ['%LOCALAPPDATA%\Packages\*\TempState', '%LOCALAPPDATA%\Packages\*\AC\INetCache', '%LOCALAPPDATA%\Packages\*\AC\Temp']
+what = "商店应用的临时文件和网页缓存"
+why = "应用运行时放临时文件或网页缓存的地方"
+lose = "不丢数据；应用正在运行时部分文件删不掉。"
+how = "delete"
+how_detail = "关掉对应应用后删除里面的内容。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "search-index"
+owner = "Windows 搜索"
+category = "cache"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Search\Data']
+what = "Windows 搜索索引"
+why = "让开始菜单和资源管理器的搜索秒出结果"
+lose = "不要手动删；索引太大可以在系统里重建或减少索引范围。"
+how = "builtin_tool"
+how_detail = "“控制面板 > 索引选项 > 高级 > 重建”，或在“修改”里去掉不需要搜索的文件夹。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "windows-defender"
+owner = "Microsoft Defender"
+category = "system"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Windows Defender']
+what = "Microsoft Defender 杀毒软件的病毒库和隔离区"
+why = "杀毒软件运行需要病毒定义文件"
+lose = "不能删，会影响电脑安全防护。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "microsoft-local"
+owner = "微软的各类软件"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%LOCALAPPDATA%\Microsoft', '%APPDATA%\Microsoft']
+what = "微软各种软件（Windows 组件、Office、Edge、OneDrive、Teams 等）的数据"
+why = "微软家的软件都把数据放在这个文件夹下"
+lose = "不能整个删，里面有 Edge 浏览器资料、Office 设置、输入法词库等。请点进去逐项看。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "winget-packages"
+owner = "WinGet（Windows 程序包管理器）"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Microsoft\WinGet\Packages']
+what = "用 winget 装的免安装（便携版）软件"
+why = "winget 安装便携版软件时把程序解压到这里（比如 FFmpeg）"
+lose = "直接删了这些命令行工具就用不了，winget 也会以为它们还装着。"
+how = "manual"
+how_detail = "用 winget list 查看，winget uninstall <软件ID> 卸载。"
+refs = ["https://learn.microsoft.com/en-us/windows/package-manager/winget/"]
+verified_on = "2026-09-23"

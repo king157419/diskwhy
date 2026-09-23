@@ -2,12 +2,13 @@
 
 DiskWhy 是一个 Windows 磁盘空间分析工具：不只告诉你 C 盘哪里大，还要把已用空间的每一块都讲清楚——扫到的、没权限读的、系统保留的、云端占位的、说不清的，全部单独列出来，不悄悄少算。后续阶段会给每个目录加上“这是什么、属于哪个软件、删了会失去什么、怎么安全腾出来”的大白话说明，以及带护栏、可撤销的清理动作（见 [PLAN.md](PLAN.md)）。
 
-当前进度：**阶段 A**（扫描引擎 + 归属统计 + 可用的桌面壳），验证记录见 [docs/PHASE_A.md](docs/PHASE_A.md)。
+当前进度：**阶段 B**（解释引擎：179 条规则 + 启发式 + 可选的 AI 推测；只解释，不删除）。验证记录见 [docs/PHASE_A.md](docs/PHASE_A.md)、[docs/PHASE_B.md](docs/PHASE_B.md)，本机覆盖率见 [docs/coverage.md](docs/coverage.md)。
 
 ## 目录结构
 
 ```
-crates/diskwhy-core   扫描、归属统计（纯 Rust 库，不依赖 Tauri，带测试）
+crates/diskwhy-core   扫描、归属统计、解释引擎（纯 Rust 库，不依赖 Tauri，带测试）
+rules                 规则库 TOML（编译期嵌入；另可放 %LOCALAPPDATA%\DiskWhy\rules\*.toml）
 crates/diskwhy-cli    命令行 diskwhy-cli
 src-tauri             Tauri 2 桌面壳（只做 IPC 转发）
 src                   Vue 3 + TypeScript 前端
@@ -38,6 +39,8 @@ npm run tauri dev
 # 桌面程序（发布版，产物在 target\release\diskwhy.exe）
 npm run tauri build -- --no-bundle
 ```
+
+命令行解释：`diskwhy-cli explain C:\ --top 50 [--json out.json] [--md coverage.md]`，逐个输出前 N 大目录的档位、来源和“这是什么”，并统计规则 / 启发式 / 未知各多少。
 
 命令行其他参数：`--json-depth N`（JSON 里目录树保留几层，默认 3）、`--mode exact|fast`（默认 exact，每个文件都查实际占用）、`--threads N`、`--keep-files N`（每个目录保留前 N 大文件，默认 50）、`--quiet`。
 

@@ -1,0 +1,400 @@
+//! 规则库：`rules/*.toml`，编译期嵌入，运行时可再加载 `%LOCALAPPDATA%\DiskWhy\rules\*.toml`。
+//!
+//! 每条规则：
+//! ```toml
+//! [[rule]]
+//! id = "npm-cache"
+//! owner = "npm"
+//! category = "cache"      # cache | log | installer | build | model | userdata | system | vm | trash | app
+//! tier = "safe"           # safe | review | keep
+//! match = ["%LOCALAPPDATA%\\npm-cache"]   # %ENV%、* 和 ** 通配；大小写不敏感
+//! what = "..."  why = "..."  lose = "..."
+//! how = "delete"          # 或数组：delete | builtin_tool | migrate | manual | none
+//! how_detail = ""
+//! refs = ["https://..."]
+//! verified_on = "2026-09-23"
+//! # 可选：
+//! scope = "tree"          # tree（默认，子孙也按它说明）| self（只说明这一层，比如 AppData 这种“容器”）
+//! kind = "any"            # any（默认）| dir | file
+//! when_child = ["Cache_Data"]   # 目录里必须有其中之一（名字，大小写不敏感）才算命中
+//! owner_from_path = false # true 时用注册表 / 文件夹名推断具体是哪个软件
+//! ```
+//!
+//! 校验（[`validate`]）：字段齐全、枚举合法、id 唯一、模式以白名单环境变量开头、
+//! `safe` 不许落在桌面/文档/图片/视频/音乐/下载/OneDrive 之下、`keep` 不许 `how = delete`、
+//! `builtin_tool`/`migrate` 必须写 `how_detail`、`verified_on` 是 YYYY-MM-DD。
+
+use super::env::{self, EnvMap};
+use super::pattern::{split_lower, Pattern};
+use super::{Category, How, Tier};
+use crate::model::{Node, NodeKind};
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::path::Path;
+
+/// 编译期嵌入的规则文件（文件名即分组名）。
+pub const EMBEDDED: &[(&str, &str)] = &[
+    ("windows-system", include_str!("../../../../rules/windows-system.toml")),
+    ("browsers", include_str!("../../../../rules/browsers.toml")),
+    ("dev-caches", include_str!("../../../../rules/dev-caches.toml")),
+    ("ai-models", include_str!("../../../../rules/ai-models.toml")),
+    ("cn-apps", include_str!("../../../../rules/cn-apps.toml")),
+    ("misc", include_str!("../../../../rules/misc.toml")),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    #[default]
+    Tree,
+    #[serde(rename = "self")]
+    SelfOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KindFilter {
+    #[default]
+    Any,
+    Dir,
+    File,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(How),
+    Many(Vec<How>),
+}
+
+/// TOML 里的一条规则（原样）。所有必填字段没有默认值，缺了反序列化就失败。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleDef {
+    pub id: String,
+    pub owner: String,
+    pub category: Category,
+    pub tier: Tier,
+    #[serde(rename = "match")]
+    pub patterns: Vec<String>,
+    pub what: String,
+    pub why: String,
+    pub lose: String,
+    how: OneOrMany,
+    pub how_detail: String,
+    pub refs: Vec<String>,
+    pub verified_on: String,
+    #[serde(default)]
+    pub scope: Scope,
+    #[serde(default)]
+    pub kind: KindFilter,
+    #[serde(default)]
+    pub when_child: Vec<String>,
+    #[serde(default)]
+    pub owner_from_path: bool,
+}
+
+impl RuleDef {
+    pub fn how(&self) -> Vec<How> {
+        match &self.how {
+            OneOrMany::One(h) => vec![*h],
+            OneOrMany::Many(v) => v.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleFile {
+    rule: Vec<RuleDef>,
+}
+
+/// 加载后的规则。
+#[derive(Debug, Clone)]
+pub struct Rule {
+    pub id: String,
+    pub group: String,
+    pub owner: String,
+    pub category: Category,
+    pub tier: Tier,
+    pub raw_patterns: Vec<String>,
+    pub what: String,
+    pub why: String,
+    pub lose: String,
+    pub how: Vec<How>,
+    pub how_detail: String,
+    pub refs: Vec<String>,
+    pub verified_on: String,
+    pub scope: Scope,
+    pub kind: KindFilter,
+    pub when_child: Vec<String>,
+    pub owner_from_path: bool,
+}
+
+/// 规则集合 + 展平的已编译模式表。
+#[derive(Debug, Clone, Default)]
+pub struct RuleSet {
+    pub rules: Vec<Rule>,
+    /// (规则下标, 模式)。只包含当前机器上环境变量都存在的模式。
+    pub patterns: Vec<(usize, Pattern)>,
+}
+
+/// 继承命中：上层某个文件夹命中了 `scope = tree` 的规则。
+#[derive(Debug, Clone)]
+pub struct InheritedHit {
+    pub rule: usize,
+    pub from_path: String,
+}
+
+const PROTECTED_UNDER_PROFILE: &[&str] = &["desktop", "documents", "pictures", "videos", "music", "downloads"];
+
+/// 某个 safe 模式是否会落到个人文件夹里（按原始模式静态判断）。
+fn safe_pattern_hits_personal(raw: &str) -> bool {
+    let segs = split_lower(raw);
+    let Some(first) = segs.first() else { return true };
+    let base_is_profile = first == "%userprofile%";
+    let base_is_public = first == "%public%";
+    if !base_is_profile && !base_is_public {
+        return false;
+    }
+    match segs.get(1) {
+        None => true, // 整个用户目录
+        Some(s) => {
+            s.contains('*')
+                || s.contains('?')
+                || PROTECTED_UNDER_PROFILE.contains(&s.as_str())
+                || s.starts_with("onedrive")
+        }
+    }
+}
+
+fn valid_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        && (1..=12).contains(&s[5..7].parse::<u32>().unwrap_or(0))
+        && (1..=31).contains(&s[8..10].parse::<u32>().unwrap_or(0))
+}
+
+/// 校验一条规则，返回所有问题（空 = 通过）。`seen_ids` 用于查重。
+pub fn validate(def: &RuleDef, seen_ids: &mut HashSet<String>) -> Vec<String> {
+    let mut e = Vec::new();
+    let id = def.id.trim();
+    if id.is_empty() {
+        e.push("id 为空".into());
+    } else if !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        e.push(format!("id `{id}` 只能用小写字母、数字和 -"));
+    } else if !seen_ids.insert(id.to_string()) {
+        e.push(format!("id `{id}` 重复"));
+    }
+    for (name, v) in [("owner", &def.owner), ("what", &def.what), ("why", &def.why), ("lose", &def.lose)] {
+        if v.trim().is_empty() {
+            e.push(format!("{name} 为空"));
+        }
+    }
+    if def.category == Category::Unknown {
+        e.push("category 不能是 unknown".into());
+    }
+    if def.patterns.is_empty() {
+        e.push("match 为空".into());
+    }
+    let how = def.how();
+    if how.is_empty() {
+        e.push("how 为空".into());
+    }
+    if def.tier == Tier::Keep && how.contains(&How::Delete) {
+        e.push("keep 档的 how 不能包含 delete".into());
+    }
+    if (how.contains(&How::BuiltinTool) || how.contains(&How::Migrate)) && def.how_detail.trim().is_empty() {
+        e.push("how 含 builtin_tool / migrate 时必须写 how_detail".into());
+    }
+    if !valid_date(def.verified_on.trim()) {
+        e.push(format!("verified_on `{}` 不是 YYYY-MM-DD", def.verified_on));
+    }
+    for r in &def.refs {
+        if !(r.starts_with("https://") || r.starts_with("http://")) {
+            e.push(format!("refs 里 `{r}` 不是网址"));
+        }
+    }
+    if !def.when_child.is_empty() && def.kind == KindFilter::File {
+        e.push("when_child 只能用于目录规则".into());
+    }
+    for p in &def.patterns {
+        if p.contains("..") {
+            e.push(format!("模式 `{p}` 不能含 .."));
+        }
+        match env::leading_var(p) {
+            None => e.push(format!("模式 `{p}` 必须以 %变量% 开头（允许的根见 env::ALLOWED_VARS）")),
+            Some(v) if !env::is_allowed_var(v) => e.push(format!("模式 `{p}` 的根变量 %{v}% 不在允许列表")),
+            _ => {}
+        }
+        for v in env::vars_in(p) {
+            if !env::is_allowed_var(v) {
+                e.push(format!("模式 `{p}` 用了不允许的变量 %{v}%"));
+            }
+        }
+        if def.tier == Tier::Safe && safe_pattern_hits_personal(p) {
+            e.push(format!("safe 档的模式 `{p}` 落在了桌面/文档/图片/视频/音乐/下载/OneDrive 等个人文件夹下"));
+        }
+    }
+    e
+}
+
+impl RuleSet {
+    /// 从若干 (分组名, TOML 文本) 加载。校验不过的规则不加载，错误全部返回。
+    pub fn from_sources(sources: &[(&str, &str)], env: &EnvMap) -> (RuleSet, Vec<String>) {
+        let mut rs = RuleSet::default();
+        let mut seen = HashSet::new();
+        let errors = rs.add_sources(sources, env, &mut seen);
+        (rs, errors)
+    }
+
+    /// 内置规则。
+    pub fn embedded(env: &EnvMap) -> (RuleSet, Vec<String>) {
+        Self::from_sources(EMBEDDED, env)
+    }
+
+    fn add_sources(&mut self, sources: &[(&str, &str)], env: &EnvMap, seen: &mut HashSet<String>) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (group, text) in sources {
+            let file: RuleFile = match toml::from_str(text) {
+                Ok(f) => f,
+                Err(err) => {
+                    errors.push(format!("[{group}] TOML 解析失败：{err}"));
+                    continue;
+                }
+            };
+            for def in file.rule {
+                let errs = validate(&def, seen);
+                if !errs.is_empty() {
+                    for x in errs {
+                        errors.push(format!("[{group}] 规则 `{}`：{x}", def.id));
+                    }
+                    continue;
+                }
+                self.push(def, group, env);
+            }
+        }
+        errors
+    }
+
+    fn push(&mut self, def: RuleDef, group: &str, env: &EnvMap) {
+        let idx = self.rules.len();
+        let how = def.how();
+        let rule = Rule {
+            id: def.id.trim().to_string(),
+            group: group.to_string(),
+            owner: def.owner,
+            category: def.category,
+            tier: def.tier,
+            raw_patterns: def.patterns.clone(),
+            what: def.what,
+            why: def.why,
+            lose: def.lose,
+            how,
+            how_detail: def.how_detail,
+            refs: def.refs,
+            verified_on: def.verified_on,
+            scope: def.scope,
+            kind: def.kind,
+            when_child: def.when_child,
+            owner_from_path: def.owner_from_path,
+        };
+        // 环境变量在本机不存在的模式直接跳过（比如 32 位系统没有 ProgramFiles(x86)）。
+        for raw in &rule.raw_patterns {
+            if let Ok(expanded) = env.expand(raw) {
+                self.patterns.push((idx, Pattern::compile(&expanded)));
+            }
+        }
+        self.rules.push(rule);
+    }
+
+    /// 加载用户自定义规则目录（`*.toml`）。不存在就什么都不做。返回警告。
+    pub fn load_user_dir(&mut self, dir: &Path, env: &EnvMap) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else { return warnings };
+        let mut seen: HashSet<String> = self.rules.iter().map(|r| r.id.clone()).collect();
+        let mut files: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("toml"))).collect();
+        files.sort();
+        for f in files {
+            match std::fs::read_to_string(&f) {
+                Ok(text) => {
+                    let group = format!("user:{}", f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+                    let errs = self.add_sources(&[(group.as_str(), text.as_str())], env, &mut seen);
+                    warnings.extend(errs);
+                }
+                Err(e) => warnings.push(format!("读取 {} 失败：{e}", f.display())),
+            }
+        }
+        warnings
+    }
+
+    fn rule_accepts(&self, idx: usize, node: Option<&Node>) -> bool {
+        let r = &self.rules[idx];
+        let Some(n) = node else { return r.kind == KindFilter::Any && r.when_child.is_empty() };
+        match r.kind {
+            KindFilter::Dir if n.kind != NodeKind::Dir => return false,
+            KindFilter::File if n.kind != NodeKind::File => return false,
+            _ => {}
+        }
+        if !r.when_child.is_empty() {
+            if n.kind != NodeKind::Dir {
+                return false;
+            }
+            return n.children.iter().any(|c| r.when_child.iter().any(|w| w.eq_ignore_ascii_case(&c.name)));
+        }
+        true
+    }
+
+    /// 精确命中（所有模式里挑最具体的）。
+    pub fn best_exact(&self, segs: &[String], node: Option<&Node>) -> Option<usize> {
+        let mut best: Option<(u32, usize)> = None;
+        for (ri, p) in &self.patterns {
+            if (best.is_none() || p.specificity > best.unwrap().0) && p.matches(segs) && self.rule_accepts(*ri, node) {
+                best = Some((p.specificity, *ri));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// 同上，但只看 `active` 里的模式下标（遍历剪枝用）。
+    pub fn best_exact_among(&self, active: &[u32], segs: &[String], node: Option<&Node>) -> Option<usize> {
+        let mut best: Option<(u32, usize)> = None;
+        for &i in active {
+            let (ri, p) = &self.patterns[i as usize];
+            if (best.is_none() || p.specificity > best.unwrap().0) && p.matches(segs) && self.rule_accepts(*ri, node) {
+                best = Some((p.specificity, *ri));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// 沿祖先链从近到远找第一个命中 `scope = tree` 规则的文件夹。
+    pub fn best_inherited(&self, ancestors: &[&Node]) -> Option<InheritedHit> {
+        for a in ancestors.iter().rev() {
+            if a.path.is_empty() {
+                continue;
+            }
+            let segs = split_lower(&a.path);
+            let mut best: Option<(u32, usize)> = None;
+            for (ri, p) in &self.patterns {
+                if self.rules[*ri].scope != Scope::Tree {
+                    continue;
+                }
+                if (best.is_none() || p.specificity > best.unwrap().0) && p.matches(&segs) && self.rule_accepts(*ri, Some(a)) {
+                    best = Some((p.specificity, *ri));
+                }
+            }
+            if let Some((_, ri)) = best {
+                return Some(InheritedHit { rule: ri, from_path: a.path.clone() });
+            }
+        }
+        None
+    }
+
+    pub fn by_id(&self, id: &str) -> Option<&Rule> {
+        self.rules.iter().find(|r| r.id == id)
+    }
+}

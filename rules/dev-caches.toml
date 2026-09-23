@@ -1,0 +1,621 @@
+# 开发工具的缓存、依赖和虚拟磁盘。文案均为 DiskWhy 自己撰写（MIT）。
+
+# ───────── JavaScript ─────────
+
+[[rule]]
+id = "npm-cache"
+owner = "npm"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\npm-cache', '%APPDATA%\npm-cache']
+what = "npm 下载过的包缓存"
+why = "让下次安装同一个包不用重新下载；npx 临时运行的工具也放在这里（_npx）"
+lose = "删除后下次 npm install 会重新下载，慢一些，不丢数据。"
+how = ["delete", "builtin_tool"]
+how_detail = "npm cache clean --force （或直接删这个文件夹）。"
+refs = ["https://docs.npmjs.com/cli/v10/commands/npm-cache"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "npm-global"
+owner = "npm"
+category = "app"
+tier = "review"
+match = ['%APPDATA%\npm']
+what = "用 npm install -g 全局安装的命令行工具"
+why = "你（或安装脚本）全局装的 Node 命令行工具都放在这里，比如各种 AI 编程助手、构建工具"
+lose = "删了这些命令就用不了，要重新 npm install -g 安装；工具自己的配置一般在别处，不会丢。"
+how = "manual"
+how_detail = "用 npm ls -g --depth=0 看装了哪些，npm uninstall -g <包名> 卸掉不用的。"
+refs = ["https://docs.npmjs.com/cli/v10/commands/npm-uninstall"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "pnpm-store"
+owner = "pnpm"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\pnpm\store', '%LOCALAPPDATA%\pnpm-store', '%USERPROFILE%\.pnpm-store']
+what = "pnpm 的全局包仓库"
+why = "pnpm 把所有项目用到的包只存一份，项目里用硬链接指过来"
+lose = "用 prune 只删没有项目在用的包，不影响现有项目；整个删掉后项目需要重新 pnpm install。"
+how = "builtin_tool"
+how_detail = "pnpm store prune"
+refs = ["https://pnpm.io/cli/store"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "yarn-cache"
+owner = "Yarn"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\Yarn\Cache', '%LOCALAPPDATA%\Yarn\Berry\cache']
+what = "Yarn 下载过的包缓存"
+why = "让下次安装同一个包不用重新下载"
+lose = "删除后下次安装会重新下载，不丢数据。"
+how = ["delete", "builtin_tool"]
+how_detail = "yarn cache clean"
+refs = ["https://classic.yarnpkg.com/en/docs/cli/cache"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "bun-cache"
+owner = "Bun"
+category = "cache"
+tier = "safe"
+match = ['%USERPROFILE%\.bun\install\cache']
+what = "Bun 下载过的包缓存"
+why = "让下次安装同一个包不用重新下载"
+lose = "删除后下次安装会重新下载，不丢数据。"
+how = ["delete", "builtin_tool"]
+how_detail = "bun pm cache rm"
+refs = ["https://bun.sh/docs/install/cache"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "playwright-browsers"
+owner = "Playwright"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\ms-playwright']
+what = "Playwright 自动化测试下载的浏览器"
+why = "Playwright 跑网页自动化时用自己下载的 Chromium / Firefox / WebKit"
+lose = "不丢数据；再跑 Playwright 时要重新执行 npx playwright install 下载（几百 MB）。"
+how = "delete"
+how_detail = "直接删，或 npx playwright uninstall --all。"
+refs = ["https://playwright.dev/docs/browsers"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "electron-download-cache"
+owner = "Electron / node-gyp"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\electron\Cache', '%LOCALAPPDATA%\electron-builder\Cache', '%LOCALAPPDATA%\node-gyp\Cache']
+what = "Electron 和原生模块编译工具下载的文件缓存"
+why = "开发 Electron 应用或装需要编译的 npm 包时下载的运行时和头文件"
+lose = "不丢数据；下次用到时重新下载。"
+how = "delete"
+how_detail = "直接删除。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── Python ─────────
+
+[[rule]]
+id = "pip-cache"
+owner = "pip"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\pip\cache', '%LOCALAPPDATA%\pip\Cache']
+what = "pip 下载过的 Python 包缓存"
+why = "让下次安装同一个包不用重新下载"
+lose = "删除后下次 pip install 会重新下载，不丢数据。"
+how = ["delete", "builtin_tool"]
+how_detail = "pip cache purge"
+refs = ["https://pip.pypa.io/en/stable/cli/pip_cache/"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "uv-cache"
+owner = "uv"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\uv\cache']
+what = "uv 下载和解压过的 Python 包缓存"
+why = "uv 把包缓存起来，建虚拟环境时直接链接过去，所以特别快"
+lose = "不丢数据；已经建好的虚拟环境不受影响，下次安装新环境会重新下载。"
+how = ["builtin_tool", "delete"]
+how_detail = "uv cache clean （只清没用到的：uv cache prune）。"
+refs = ["https://docs.astral.sh/uv/concepts/cache/"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "uv-root"
+owner = "uv"
+category = "cache"
+tier = "review"
+scope = "self"
+match = ['%LOCALAPPDATA%\uv']
+what = "uv（Python 包管理器）的本机数据，主要是下载缓存"
+why = "cache 子文件夹是包缓存，其余是安装记录"
+lose = "请点进去看：cache 可以放心清；其余小文件是 uv 自己的记录。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "uv-python-tools"
+owner = "uv"
+category = "app"
+tier = "review"
+match = ['%APPDATA%\uv\python', '%APPDATA%\uv\tools']
+what = "uv 装的 Python 解释器和命令行工具"
+why = "uv python install / uv tool install 装的东西放在这里"
+lose = "删了用到它们的项目和命令要重新安装；不丢你的代码。"
+how = "manual"
+how_detail = "uv python list 查看，uv python uninstall <版本>；工具用 uv tool uninstall <名字>。"
+refs = ["https://docs.astral.sh/uv/concepts/python-versions/"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "conda-pkgs"
+owner = "conda（Anaconda / Miniconda）"
+category = "cache"
+tier = "safe"
+match = [
+  '%USERPROFILE%\miniconda3\pkgs', '%USERPROFILE%\anaconda3\pkgs', '%USERPROFILE%\miniforge3\pkgs',
+  '%ProgramData%\miniconda3\pkgs', '%ProgramData%\anaconda3\pkgs',
+  '%USERPROFILE%\.conda\pkgs', '%LOCALAPPDATA%\conda\conda\pkgs',
+]
+what = "conda 下载过的安装包缓存"
+why = "conda 装包时先下载解压到这里，再链接到各个环境"
+lose = "用 conda clean 清理不会影响已经建好的环境；以后装同样的包会重新下载。"
+how = "builtin_tool"
+how_detail = "conda clean --all （先加 --dry-run 看看会删什么）。不建议手动删文件夹。"
+refs = ["https://docs.conda.io/projects/conda/en/latest/commands/clean.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "conda-envs"
+owner = "conda（Anaconda / Miniconda）"
+category = "userdata"
+tier = "keep"
+match = [
+  '%USERPROFILE%\miniconda3\envs', '%USERPROFILE%\anaconda3\envs', '%USERPROFILE%\miniforge3\envs',
+  '%ProgramData%\miniconda3\envs', '%ProgramData%\anaconda3\envs',
+  '%USERPROFILE%\.conda\envs',
+]
+what = "你建的 conda 环境（每个子文件夹是一套独立的 Python 和库）"
+why = "给不同项目准备的运行环境"
+lose = "删了环境里的库和配置都没了，项目跑不起来，要照原样重建（可能很费时，版本还不一定装得回来）。"
+how = "migrate"
+how_detail = "迁到 D 盘：先 conda env export -n 环境名 > env.yml 备份；在 .condarc 里加 envs_dirs: [D:\\conda\\envs]；再 conda env create -f env.yml 在新位置重建，确认能用后 conda env remove -n 旧环境。不用的环境直接 conda env remove -n 环境名。"
+refs = ["https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "conda-base"
+owner = "conda（Anaconda / Miniconda）"
+category = "app"
+tier = "keep"
+match = ['%USERPROFILE%\miniconda3', '%USERPROFILE%\anaconda3', '%USERPROFILE%\miniforge3', '%ProgramData%\miniconda3', '%ProgramData%\anaconda3']
+what = "conda 本体（base 环境）"
+why = "安装 Anaconda / Miniconda 时放的 Python 和 conda 程序"
+lose = "直接删会让 conda 和所有环境都不能用。不用了请正常卸载。"
+how = "manual"
+how_detail = "先用 conda clean --all 清缓存；不用了在“设置 > 应用”里卸载。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── Rust / Go / JVM / .NET ─────────
+
+[[rule]]
+id = "cargo-registry"
+owner = "Rust（cargo）"
+category = "cache"
+tier = "safe"
+match = ['%USERPROFILE%\.cargo\registry', '%USERPROFILE%\.cargo\git']
+what = "cargo 下载的依赖源码和压缩包"
+why = "编译 Rust 项目时下载的第三方库"
+lose = "不丢数据；下次编译会重新下载依赖。"
+how = "delete"
+how_detail = "直接删；想只清旧的可以装 cargo-cache 工具。"
+refs = ["https://doc.rust-lang.org/cargo/guide/cargo-home.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "cargo-home"
+owner = "Rust（cargo）"
+category = "app"
+tier = "review"
+match = ['%USERPROFILE%\.cargo']
+what = "cargo 的主目录（装的命令行工具和配置）"
+why = "bin 里是 cargo、rustup 以及你 cargo install 装的工具"
+lose = "bin 被删后 cargo 命令会失效，要重装 Rust。registry 和 git 子文件夹是可清的缓存。"
+how = "manual"
+how_detail = "只清 registry / git；不要删 bin。"
+refs = ["https://doc.rust-lang.org/cargo/guide/cargo-home.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "rustup-toolchains"
+owner = "Rust（rustup）"
+category = "app"
+tier = "review"
+match = ['%USERPROFILE%\.rustup']
+what = "rustup 装的 Rust 编译器工具链"
+why = "每个 Rust 版本（stable、nightly 等）一套"
+lose = "删了就不能编译 Rust；不用的旧工具链可以卸载。"
+how = "manual"
+how_detail = "rustup toolchain list 查看，rustup toolchain uninstall <名字>。"
+refs = ["https://rust-lang.github.io/rustup/concepts/toolchains.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "go-cache"
+owner = "Go"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\go-build', '%USERPROFILE%\go\pkg\mod']
+what = "Go 的编译缓存和下载的模块"
+why = "加快编译、避免重复下载依赖"
+lose = "不丢数据；下次编译更慢、要重新下载模块。"
+how = "builtin_tool"
+how_detail = "go clean -cache （编译缓存）和 go clean -modcache （模块缓存，里面文件是只读的，手动删会报权限错误）。"
+refs = ["https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "gradle-cache"
+owner = "Gradle"
+category = "cache"
+tier = "safe"
+match = ['%USERPROFILE%\.gradle\caches', '%USERPROFILE%\.gradle\wrapper\dists']
+what = "Gradle 的依赖缓存和下载的 Gradle 版本"
+why = "Android / Java 项目构建时下载的库和构建工具"
+lose = "不丢代码；下次构建会重新下载，可能要很久。"
+how = "delete"
+how_detail = "关掉 Android Studio / IDE 和 Gradle 守护进程（gradle --stop）后删除。"
+refs = ["https://docs.gradle.org/current/userguide/directory_layout.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "maven-repo"
+owner = "Maven"
+category = "cache"
+tier = "review"
+match = ['%USERPROFILE%\.m2\repository']
+what = "Maven 本地仓库（下载的 Java 依赖）"
+why = "Java 项目构建时下载的库"
+lose = "大部分能重新下载；但如果你用 mvn install 装过自己的包或公司内部包，那些删了就要重新构建，可能找不回来。"
+how = "delete"
+how_detail = "确认没有只在本机的包后删除，下次构建自动重新下载。"
+refs = ["https://maven.apache.org/guides/introduction/introduction-to-repositories.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "nuget-cache"
+owner = "NuGet（.NET）"
+category = "cache"
+tier = "safe"
+match = ['%USERPROFILE%\.nuget\packages', '%LOCALAPPDATA%\NuGet\v3-cache', '%LOCALAPPDATA%\NuGet\plugins-cache', '%LOCALAPPDATA%\NuGet\Cache']
+what = "NuGet 下载的 .NET 包缓存"
+why = ".NET 项目还原依赖时下载的包"
+lose = "不丢代码；下次构建会重新下载。"
+how = ["builtin_tool", "delete"]
+how_detail = "dotnet nuget locals all --clear"
+refs = ["https://learn.microsoft.com/en-us/nuget/consume-packages/managing-the-global-packages-and-cache-folders"]
+verified_on = "2026-09-23"
+
+# ───────── Docker / WSL ─────────
+
+[[rule]]
+id = "docker-data-vhdx"
+owner = "Docker Desktop"
+category = "vm"
+tier = "keep"
+match = [
+  '%LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx',
+  '%LOCALAPPDATA%\Docker\wsl\disk',
+  '%LOCALAPPDATA%\Docker\wsl\data\ext4.vhdx',
+  '%LOCALAPPDATA%\Docker\wsl\data',
+]
+what = "Docker Desktop 的数据盘：所有镜像、容器、数据卷都在这一个虚拟磁盘文件里"
+why = "Docker Desktop 用 WSL 2 跑一个 Linux，镜像和容器存在这个 .vhdx 里；它只会变大不会自动变小"
+lose = "删了等于删掉全部镜像、容器和数据卷（包括数据库容器里的数据），无法恢复。"
+how = ["migrate", "builtin_tool"]
+how_detail = "迁移：Docker Desktop → Settings → Resources → Advanced → Disk image location，改到 D 盘，点 Apply，Docker 会自己搬过去。清理：docker system prune -a（删掉没在用的镜像和容器）和 docker builder prune（删构建缓存）；清完文件不会自动缩小，需要再压缩虚拟磁盘。不要直接删这个文件。"
+refs = ["https://docs.docker.com/desktop/settings-and-maintenance/settings/", "https://docs.docker.com/reference/cli/docker/system/prune/"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "docker-wsl"
+owner = "Docker Desktop"
+category = "vm"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Docker\wsl']
+what = "Docker Desktop 的 WSL 虚拟磁盘文件夹"
+why = "main 里是 Docker 自己的小 Linux 系统，disk 里是你的镜像和容器数据"
+lose = "删了 Docker Desktop 会坏掉，镜像和容器全部丢失。"
+how = "migrate"
+how_detail = "Docker Desktop → Settings → Resources → Advanced → Disk image location 改到别的盘。"
+refs = ["https://docs.docker.com/desktop/settings-and-maintenance/settings/"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "docker-local"
+owner = "Docker Desktop"
+category = "vm"
+tier = "review"
+scope = "self"
+match = ['%LOCALAPPDATA%\Docker']
+what = "Docker Desktop 的本机数据（虚拟磁盘、日志、安装记录）"
+why = "wsl 子文件夹是最大的部分（镜像和容器），log 是日志"
+lose = "不能整个删，wsl 里是你的镜像和容器。请点进去看：log 可以清。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "docker-logs"
+owner = "Docker Desktop"
+category = "log"
+tier = "safe"
+match = ['%LOCALAPPDATA%\Docker\log']
+what = "Docker Desktop 的运行日志"
+why = "记录 Docker Desktop 运行情况，出问题时排查用"
+lose = "只是丢掉旧日志，不影响镜像和容器。"
+how = "delete"
+how_detail = "退出 Docker Desktop 后删除。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "docker-program"
+owner = "Docker Desktop"
+category = "app"
+tier = "keep"
+match = ['%ProgramFiles%\Docker']
+what = "Docker Desktop 的程序本体"
+why = "安装 Docker Desktop 时放的程序文件"
+lose = "直接删 Docker 就用不了。不用了请正常卸载。"
+how = "manual"
+how_detail = "“设置 > 应用”里卸载 Docker Desktop（卸载前如有需要，先导出重要的镜像和数据卷）。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "wsl-distro-vhdx"
+owner = "WSL（适用于 Linux 的 Windows 子系统）"
+category = "vm"
+tier = "keep"
+match = [
+  '%LOCALAPPDATA%\wsl\*\ext4.vhdx',
+  '%LOCALAPPDATA%\wsl\*',
+  '%LOCALAPPDATA%\Packages\*\LocalState\ext4.vhdx',
+]
+what = "WSL 里某个 Linux 发行版的整块硬盘（ext4.vhdx）"
+why = "你装的 Ubuntu 等 Linux 发行版，系统和你在里面的所有文件都存在这个虚拟磁盘文件里；它只会变大不会自动变小"
+lose = "删了等于把这个 Linux 连同里面所有文件一起删掉，无法恢复。"
+how = "migrate"
+how_detail = "迁到 D 盘（先 wsl --shutdown）：新版 WSL 可直接 wsl --manage <发行版名> --move D:\\WSL\\<发行版名>；旧版用 wsl --export <发行版名> D:\\backup.tar → wsl --unregister <发行版名> → wsl --import <发行版名> D:\\WSL\\<发行版名> D:\\backup.tar。发行版名用 wsl -l -v 查看。不用的发行版用 wsl --unregister 删除。"
+refs = ["https://learn.microsoft.com/en-us/windows/wsl/basic-commands", "https://learn.microsoft.com/en-us/windows/wsl/disk-space"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "wsl-root"
+owner = "WSL"
+category = "vm"
+tier = "keep"
+scope = "self"
+match = ['%LOCALAPPDATA%\wsl']
+what = "新版 WSL 存放 Linux 发行版虚拟磁盘的文件夹"
+why = "每个子文件夹（一串 GUID）是一个发行版"
+lose = "不能删，里面是你的 Linux 系统和文件。"
+how = "migrate"
+how_detail = "用 wsl --manage <发行版名> --move <新位置> 或 export/import 迁移，见子文件夹说明。"
+refs = ["https://learn.microsoft.com/en-us/windows/wsl/basic-commands"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "wsl-program"
+owner = "WSL"
+category = "app"
+tier = "keep"
+match = ['%ProgramFiles%\WSL']
+what = "WSL 的程序本体"
+why = "新版 WSL 作为独立程序安装在这里"
+lose = "删了 WSL 和 Docker Desktop 都用不了。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── IDE ─────────
+
+[[rule]]
+id = "vscode-family-cached"
+owner = "VS Code 系编辑器"
+category = "cache"
+tier = "safe"
+owner_from_path = true
+match = [
+  '%APPDATA%\Code\CachedData', '%APPDATA%\Code\CachedExtensionVSIXs', '%APPDATA%\Code\logs', '%APPDATA%\Code\CachedProfilesData',
+  '%APPDATA%\Code - Insiders\CachedData', '%APPDATA%\Code - Insiders\CachedExtensionVSIXs', '%APPDATA%\Code - Insiders\logs',
+  '%APPDATA%\Cursor\CachedData', '%APPDATA%\Cursor\CachedExtensionVSIXs', '%APPDATA%\Cursor\logs',
+  '%APPDATA%\Trae\CachedData', '%APPDATA%\Trae\CachedExtensionVSIXs', '%APPDATA%\Trae\logs',
+  '%APPDATA%\Windsurf\CachedData', '%APPDATA%\Windsurf\CachedExtensionVSIXs', '%APPDATA%\Windsurf\logs',
+  '%APPDATA%\Antigravity\CachedData', '%APPDATA%\Antigravity\CachedExtensionVSIXs', '%APPDATA%\Antigravity\logs',
+  '%APPDATA%\VSCodium\CachedData', '%APPDATA%\VSCodium\CachedExtensionVSIXs', '%APPDATA%\VSCodium\logs',
+]
+what = "编辑器的缓存和日志（旧版本的编译缓存、扩展安装包副本、运行日志）"
+why = "VS Code 及其衍生版（Cursor、Trae、Windsurf 等）每次升级、装扩展都会留一份"
+lose = "不丢设置、扩展和代码；编辑器下次启动稍慢，重装扩展时会重新下载。"
+how = "delete"
+how_detail = "退出编辑器后删除。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "vscode-family-user"
+owner = "VS Code 系编辑器"
+category = "userdata"
+tier = "keep"
+owner_from_path = true
+match = ['%APPDATA%\Code\User', '%APPDATA%\Code - Insiders\User', '%APPDATA%\Cursor\User', '%APPDATA%\Trae\User', '%APPDATA%\Windsurf\User', '%APPDATA%\Antigravity\User', '%APPDATA%\VSCodium\User']
+what = "编辑器的个人设置、快捷键、代码片段和工作区记录"
+why = "你在编辑器里改过的所有设置都在这里"
+lose = "删了设置、快捷键、代码片段会丢（开了设置同步的可以同步回来）。里面的 workspaceStorage / History 比较大时可以单独考虑。"
+how = "none"
+how_detail = ""
+refs = ["https://code.visualstudio.com/docs/configure/settings"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "vscode-family-root"
+owner = "VS Code 系编辑器"
+category = "userdata"
+tier = "review"
+owner_from_path = true
+match = ['%APPDATA%\Code', '%APPDATA%\Code - Insiders', '%APPDATA%\Cursor', '%APPDATA%\Trae', '%APPDATA%\Windsurf', '%APPDATA%\Antigravity', '%APPDATA%\VSCodium']
+what = "编辑器的数据文件夹（设置、扩展数据、缓存混在一起）"
+why = "VS Code 系编辑器把设置、扩展存的数据（globalStorage）、内置浏览器缓存都放在这里"
+lose = "整个删会丢设置和扩展数据。里面的 CachedData、CachedExtensionVSIXs、logs、Cache 类子文件夹可以清（会标成绿色）。"
+how = "manual"
+how_detail = "点进去只清缓存类子文件夹。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "vscode-family-extensions"
+owner = "VS Code 系编辑器"
+category = "app"
+tier = "review"
+owner_from_path = true
+match = [
+  '%USERPROFILE%\.vscode\extensions', '%USERPROFILE%\.vscode-insiders\extensions', '%USERPROFILE%\.cursor\extensions',
+  '%USERPROFILE%\.trae\extensions', '%USERPROFILE%\.windsurf\extensions', '%USERPROFILE%\.antigravity\extensions',
+  '%USERPROFILE%\.vscode-oss\extensions',
+]
+what = "编辑器装的扩展（插件）本体"
+why = "你在编辑器里安装的每个扩展都放在这里；旧版本有时不会被及时清掉"
+lose = "删了扩展就没了，要重新安装，扩展的设置一般还在。"
+how = "manual"
+how_detail = "在编辑器的扩展面板里卸载不用的扩展；同一扩展有多个版本号文件夹时，旧版本通常可删（编辑器重启后也会自己清）。"
+refs = ["https://code.visualstudio.com/docs/configure/extensions/extension-marketplace"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "vscode-program"
+owner = "Visual Studio Code"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Programs\Microsoft VS Code', '%ProgramFiles%\Microsoft VS Code', '%LOCALAPPDATA%\Programs\cursor', '%LOCALAPPDATA%\Programs\Trae']
+what = "编辑器的程序本体"
+why = "安装编辑器时放程序文件的地方"
+lose = "直接删编辑器就打不开了。不用了请正常卸载。"
+how = "manual"
+how_detail = "“设置 > 应用”里卸载。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "jetbrains-caches"
+owner = "JetBrains IDE"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\JetBrains\*\caches', '%LOCALAPPDATA%\JetBrains\*\index', '%LOCALAPPDATA%\JetBrains\*\log', '%LOCALAPPDATA%\JetBrains\*\tmp']
+what = "JetBrains IDE（IntelliJ、PyCharm 等）的索引、缓存和日志"
+why = "IDE 为了代码提示和搜索建的索引"
+lose = "不丢设置和代码；下次打开项目要重新建索引，头几分钟会比较慢。"
+how = ["builtin_tool", "delete"]
+how_detail = "IDE 里 File > Invalidate Caches；或关掉 IDE 后删除。旧版本 IDE 的整个文件夹（版本号更低的那些）也可以删。"
+refs = ["https://www.jetbrains.com/help/idea/invalidate-caches.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "jetbrains-local"
+owner = "JetBrains IDE"
+category = "cache"
+tier = "review"
+match = ['%LOCALAPPDATA%\JetBrains']
+what = "JetBrains IDE 的本机数据（每个 IDE 版本一个文件夹）"
+why = "索引、缓存、日志、插件缓存按 IDE 版本分开放"
+lose = "你已经升级掉的旧版本文件夹可以删；当前版本的只清 caches / index / log。"
+how = "manual"
+how_detail = "JetBrains Toolbox 或 IDE 启动时会提示清理旧版本数据；也可以手动删旧版本号文件夹。"
+refs = ["https://www.jetbrains.com/help/idea/directories-used-by-the-ide-to-store-settings-caches-plugins-and-logs.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "jetbrains-settings"
+owner = "JetBrains IDE"
+category = "userdata"
+tier = "keep"
+match = ['%APPDATA%\JetBrains']
+what = "JetBrains IDE 的设置和插件"
+why = "你的 IDE 配置、快捷键、装的插件"
+lose = "删了设置和插件会丢。"
+how = "none"
+how_detail = ""
+refs = ["https://www.jetbrains.com/help/idea/directories-used-by-the-ide-to-store-settings-caches-plugins-and-logs.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "visual-studio-cache"
+owner = "Visual Studio"
+category = "cache"
+tier = "review"
+match = ['%LOCALAPPDATA%\Microsoft\VisualStudio']
+what = "Visual Studio 的本机缓存和设置"
+why = "组件缓存、扩展、每个版本的配置"
+lose = "ComponentModelCache 这类缓存能删（VS 会重建）；其余有设置和扩展，整个删会丢。"
+how = "manual"
+how_detail = "关掉 VS 后只删各版本下的 ComponentModelCache。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "visual-studio-package-cache"
+owner = "Visual Studio Installer"
+category = "installer"
+tier = "review"
+match = ['%ProgramData%\Microsoft\VisualStudio\Packages']
+what = "Visual Studio 安装程序缓存的安装包"
+why = "安装、修改、修复 Visual Studio 时用"
+lose = "删了以后修改/修复 VS 时需要重新下载。"
+how = "builtin_tool"
+how_detail = "用 Visual Studio Installer 的“禁用或移动包缓存”方法（官方文档），不要在 VS 安装进行中手动删。"
+refs = ["https://learn.microsoft.com/en-us/visualstudio/install/disable-or-move-the-package-cache"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "android-sdk"
+owner = "Android SDK"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Android\Sdk']
+what = "Android 开发工具包（SDK、模拟器镜像等）"
+why = "Android Studio 下载的编译工具和系统镜像"
+lose = "删了就不能编译和运行 Android 项目；不用的旧版本可以在 SDK Manager 里卸载。"
+how = "manual"
+how_detail = "Android Studio → Settings → Android SDK 里取消勾选不用的版本；也可以把 SDK 目录改到别的盘。"
+refs = ["https://developer.android.com/tools/sdkmanager"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "android-avd"
+owner = "Android 模拟器"
+category = "vm"
+tier = "keep"
+match = ['%USERPROFILE%\.android\avd']
+what = "Android 模拟器的虚拟手机"
+why = "每个模拟器一份完整的手机数据"
+lose = "删了模拟器里装的应用和数据都没了。"
+how = "migrate"
+how_detail = "不用的模拟器在 Android Studio 的 Device Manager 里删除；要迁移可以设置环境变量 ANDROID_AVD_HOME 指向别的盘再把文件夹搬过去。"
+refs = ["https://developer.android.com/studio/command-line/variables"]
+verified_on = "2026-09-23"

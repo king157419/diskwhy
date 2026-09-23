@@ -1,0 +1,346 @@
+# 浏览器与 Chromium / Electron 系缓存。文案均为 DiskWhy 自己撰写（MIT）。
+#
+# Chromium 内核的程序（Chrome、Edge、Brave、Vivaldi、Opera，以及 VS Code、Cursor、Claude、Discord、
+# 飞书、QQ 等 Electron 应用）缓存目录名都一样：Cache、Code Cache、GPUCache、DawnCache、
+# Service Worker\CacheStorage……所以除了各浏览器的专用规则，最后还有几条通配规则统一处理。
+# 通配规则用 when_child 要求目录里有 Chromium 缓存特有的文件，避免误伤同名的普通文件夹。
+
+# ───────── Google Chrome ─────────
+
+[[rule]]
+id = "chrome-profile"
+owner = "Google Chrome"
+category = "userdata"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Google\Chrome\User Data']
+what = "Chrome 的用户资料：书签、密码、历史记录、扩展、登录状态"
+why = "Chrome 把每个用户（Profile）的所有个人数据放在这里"
+lose = "不能整个删：没开同步的话，书签、保存的密码、扩展和设置会全部丢失。里面的缓存子文件夹可以清（会单独标成绿色）。"
+how = "builtin_tool"
+how_detail = "想腾空间请在 Chrome 里：设置 > 隐私和安全 > 删除浏览数据，勾选“缓存的图片和文件”。"
+refs = ["https://support.google.com/chrome/answer/2392709"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "chrome-cache"
+owner = "Google Chrome"
+category = "cache"
+tier = "safe"
+match = [
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Cache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Code Cache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\GPUCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnGraphiteCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnWebGPUCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Service Worker\CacheStorage',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Service Worker\ScriptCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\ShaderCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\GrShaderCache',
+  '%LOCALAPPDATA%\Google\Chrome\User Data\GraphiteDawnCache',
+]
+what = "Chrome 的网页缓存（图片、脚本、显卡着色器等）"
+why = "打开过的网页先存一份，下次打开更快"
+lose = "不丢书签、密码和历史；删掉后网页第一次打开会慢一点。个别网站离线缓存的内容会重新下载。"
+how = ["delete", "builtin_tool"]
+how_detail = "关掉 Chrome 后删除；或在 Chrome 的“删除浏览数据”里勾选“缓存的图片和文件”。"
+refs = ["https://support.google.com/chrome/answer/2392709"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "chrome-on-device-model"
+owner = "Google Chrome"
+category = "model"
+tier = "review"
+match = ['%LOCALAPPDATA%\Google\Chrome\User Data\OptGuideOnDeviceModel']
+what = "Chrome 下载到本机的 AI 模型（给浏览器内置的 AI 功能用）"
+why = "Chrome 的一些 AI 功能（比如帮你写字、总结网页）在本机运行，需要先下载一个几 GB 的模型"
+lose = "删了这些本机 AI 功能暂时不能用；只要功能还开着，Chrome 以后很可能会自动重新下载，空间又会被占回去。不影响书签、密码和正常上网。"
+how = ["delete", "manual"]
+how_detail = "关掉 Chrome 后可以删。想让它不再下载，需要在 Chrome 设置里关掉用到本机 AI 的功能；不同版本开关位置不一样，我不确定具体叫什么。"
+refs = ["https://developer.chrome.com/docs/ai/built-in"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "google-local"
+owner = "Google"
+category = "userdata"
+tier = "keep"
+scope = "self"
+match = ['%LOCALAPPDATA%\Google', '%LOCALAPPDATA%\Google\Chrome']
+what = "Google 家软件（主要是 Chrome）的本机数据"
+why = "Chrome、Google 更新程序等都放在这个文件夹下"
+lose = "不能整个删，Chrome 的书签和密码在里面。请点进去看具体是哪块大。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "chrome-program"
+owner = "Google Chrome"
+category = "app"
+tier = "keep"
+match = ['%ProgramFiles%\Google\Chrome', '%ProgramFiles(x86)%\Google\Chrome', '%LOCALAPPDATA%\Google\Chrome\Application']
+what = "Chrome 浏览器的程序本体"
+why = "安装 Chrome 时放程序文件的地方；刚更新完时可能同时有新旧两个版本号文件夹，重启 Chrome 后旧的会自动清掉"
+lose = "直接删 Chrome 就打不开了。不用 Chrome 的话请正常卸载。"
+how = "manual"
+how_detail = "“设置 > 应用 > 已安装的应用”里卸载 Google Chrome。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── Microsoft Edge ─────────
+
+[[rule]]
+id = "edge-profile"
+owner = "Microsoft Edge"
+category = "userdata"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Microsoft\Edge\User Data']
+what = "Edge 的用户资料：收藏夹、密码、历史记录、扩展"
+why = "Edge 把每个用户的个人数据放在这里"
+lose = "不能整个删：没开同步的话收藏夹、密码、扩展会丢。里面的缓存可以清（单独标绿）。"
+how = "builtin_tool"
+how_detail = "Edge 里：设置 > 隐私、搜索和服务 > 清除浏览数据，勾选“缓存的图像和文件”。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "edge-cache"
+owner = "Microsoft Edge"
+category = "cache"
+tier = "safe"
+match = [
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Cache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Code Cache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\GPUCache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnCache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnGraphiteCache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnWebGPUCache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Service Worker\CacheStorage',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Service Worker\ScriptCache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\ShaderCache',
+  '%LOCALAPPDATA%\Microsoft\Edge\User Data\GrShaderCache',
+]
+what = "Edge 的网页缓存"
+why = "打开过的网页先存一份，下次打开更快"
+lose = "不丢收藏夹、密码和历史；网页第一次打开会慢一点。"
+how = ["delete", "builtin_tool"]
+how_detail = "关掉 Edge（包括后台运行）后删除；或用 Edge 的“清除浏览数据”。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "edge-program"
+owner = "Microsoft Edge / WebView2"
+category = "app"
+tier = "keep"
+match = [
+  '%ProgramFiles(x86)%\Microsoft\Edge',
+  '%ProgramFiles(x86)%\Microsoft\EdgeCore',
+  '%ProgramFiles(x86)%\Microsoft\EdgeUpdate',
+  '%ProgramFiles(x86)%\Microsoft\EdgeWebView',
+]
+what = "Edge 浏览器和 WebView2 运行库的程序本体"
+why = "Edge 是系统自带浏览器；EdgeWebView（WebView2）是很多软件（包括本软件）显示界面要用的组件"
+lose = "不能删：WebView2 被删后，大量软件的界面会打不开。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/microsoft-edge/webview2/"]
+verified_on = "2026-09-23"
+
+# ───────── Brave / Vivaldi / Opera ─────────
+
+[[rule]]
+id = "brave-profile"
+owner = "Brave"
+category = "userdata"
+tier = "keep"
+match = ['%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data']
+what = "Brave 浏览器的用户资料：书签、密码、历史、扩展"
+why = "Brave 把个人数据放在这里"
+lose = "不能整个删，书签和密码会丢。里面的缓存可以清。"
+how = "builtin_tool"
+how_detail = "Brave 里：设置 > 隐私和安全 > 清除浏览数据。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "vivaldi-profile"
+owner = "Vivaldi"
+category = "userdata"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Vivaldi\User Data']
+what = "Vivaldi 浏览器的用户资料：书签、密码、笔记、邮件"
+why = "Vivaldi 把个人数据放在这里"
+lose = "不能整个删，书签、密码、笔记会丢。里面的缓存可以清。"
+how = "builtin_tool"
+how_detail = "Vivaldi 里：设置 > 隐私和安全 > 删除浏览数据。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "chromium-browsers-cache"
+owner = "Brave / Vivaldi / Opera"
+category = "cache"
+tier = "safe"
+match = [
+  '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Cache',
+  '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Code Cache',
+  '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\GPUCache',
+  '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Service Worker\CacheStorage',
+  '%LOCALAPPDATA%\Vivaldi\User Data\*\Cache',
+  '%LOCALAPPDATA%\Vivaldi\User Data\*\Code Cache',
+  '%LOCALAPPDATA%\Vivaldi\User Data\*\GPUCache',
+  '%LOCALAPPDATA%\Vivaldi\User Data\*\Service Worker\CacheStorage',
+  '%LOCALAPPDATA%\Opera Software\Opera Stable\Cache',
+  '%LOCALAPPDATA%\Opera Software\Opera GX Stable\Cache',
+]
+what = "浏览器的网页缓存"
+why = "打开过的网页先存一份，下次打开更快"
+lose = "不丢书签和密码；网页第一次打开会慢一点。"
+how = "delete"
+how_detail = "关掉浏览器后删除，或用浏览器自带的“清除浏览数据”。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "opera-profile"
+owner = "Opera"
+category = "userdata"
+tier = "keep"
+match = ['%APPDATA%\Opera Software\Opera Stable', '%APPDATA%\Opera Software\Opera GX Stable']
+what = "Opera 浏览器的用户资料：书签、密码、历史"
+why = "Opera 把个人数据放在 Roaming 里"
+lose = "不能整个删，书签和密码会丢。"
+how = "builtin_tool"
+how_detail = "Opera 里：设置 > 隐私和安全 > 清除浏览数据。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── Firefox ─────────
+
+[[rule]]
+id = "firefox-profile"
+owner = "Mozilla Firefox"
+category = "userdata"
+tier = "keep"
+match = ['%APPDATA%\Mozilla\Firefox\Profiles', '%APPDATA%\Mozilla\Firefox']
+what = "Firefox 的用户资料：书签、密码、历史、扩展"
+why = "Firefox 把个人数据放在 Roaming 下的配置文件夹里"
+lose = "不能删，书签、密码和扩展会丢。"
+how = "builtin_tool"
+how_detail = "Firefox 里：设置 > 隐私与安全 > Cookie 和网站数据 > 清除数据。"
+refs = ["https://support.mozilla.org/en-US/kb/profiles-where-firefox-stores-user-data"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "firefox-cache"
+owner = "Mozilla Firefox"
+category = "cache"
+tier = "safe"
+match = [
+  '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\cache2',
+  '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\startupCache',
+  '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\thumbnails',
+  '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\jumpListCache',
+]
+what = "Firefox 的网页缓存和缩略图"
+why = "Firefox 把缓存放在 Local 下，和个人资料分开"
+lose = "不丢书签和密码；网页第一次打开会慢一点。"
+how = ["delete", "builtin_tool"]
+how_detail = "关掉 Firefox 后删除，或在设置里“清除数据”勾选“缓存的网页内容”。"
+refs = ["https://support.mozilla.org/en-US/kb/how-clear-firefox-cache"]
+verified_on = "2026-09-23"
+
+# ───────── Chromium / Electron 通配 ─────────
+
+[[rule]]
+id = "chromium-generic-cache"
+owner = "Chromium / Electron 程序"
+category = "cache"
+tier = "safe"
+owner_from_path = true
+match = ['%APPDATA%\**\Cache', '%LOCALAPPDATA%\**\Cache']
+when_child = ["Cache_Data", "data_0", "data_1"]
+what = "网页缓存（Chromium 内核程序通用格式）"
+why = "浏览器或 Electron 应用（VS Code、Cursor、Claude、Discord、飞书、QQ 等）显示界面、打开网页时把图片和脚本存一份，下次更快"
+lose = "不丢聊天记录、文档和设置；删掉后程序第一次打开某些页面会慢一点，需要重新加载。"
+how = "delete"
+how_detail = "先完全退出对应程序（包括托盘图标），再删除；程序下次启动自动重建。"
+refs = ["https://www.chromium.org/developers/design-documents/network-stack/disk-cache/"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "chromium-generic-code-cache"
+owner = "Chromium / Electron 程序"
+category = "cache"
+tier = "safe"
+owner_from_path = true
+match = ['%APPDATA%\**\Code Cache', '%LOCALAPPDATA%\**\Code Cache', '%APPDATA%\**\CodeCache']
+when_child = ["js", "wasm"]
+what = "脚本编译缓存（Chromium 内核程序通用）"
+why = "把网页和界面里的 JavaScript 编译结果存下来，启动更快"
+lose = "不丢数据；删掉后程序头一两次启动稍慢。"
+how = "delete"
+how_detail = "退出对应程序后删除。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "chromium-generic-gpu-cache"
+owner = "Chromium / Electron 程序"
+category = "cache"
+tier = "safe"
+owner_from_path = true
+match = [
+  '%APPDATA%\**\GPUCache', '%LOCALAPPDATA%\**\GPUCache',
+  '%APPDATA%\**\DawnCache', '%LOCALAPPDATA%\**\DawnCache',
+  '%APPDATA%\**\DawnGraphiteCache', '%LOCALAPPDATA%\**\DawnGraphiteCache',
+  '%APPDATA%\**\DawnWebGPUCache', '%LOCALAPPDATA%\**\DawnWebGPUCache',
+  '%APPDATA%\**\GrShaderCache', '%LOCALAPPDATA%\**\GrShaderCache',
+  '%APPDATA%\**\GraphiteDawnCache', '%LOCALAPPDATA%\**\GraphiteDawnCache',
+  '%APPDATA%\**\ShaderCache', '%LOCALAPPDATA%\**\ShaderCache',
+]
+when_child = ["index", "data_0"]
+what = "显卡着色器缓存（Chromium 内核程序通用）"
+why = "程序用显卡画界面时把编译好的着色器存下来"
+lose = "不丢数据；删掉后界面头一次打开可能短暂卡一下。"
+how = "delete"
+how_detail = "退出对应程序后删除。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "chromium-generic-sw-cache"
+owner = "Chromium / Electron 程序"
+category = "cache"
+tier = "safe"
+owner_from_path = true
+match = [
+  '%APPDATA%\**\Service Worker\CacheStorage', '%LOCALAPPDATA%\**\Service Worker\CacheStorage',
+  '%APPDATA%\**\Service Worker\ScriptCache', '%LOCALAPPDATA%\**\Service Worker\ScriptCache',
+]
+what = "网页离线缓存（Service Worker 缓存）"
+why = "网页应用（比如在线文档、网页版工具，以及飞书等 Electron 应用的内置网页）把资源存到本地，下次秒开，有的还能离线用"
+lose = "不丢账号数据（服务器上有）；删掉后这些网页应用第一次打开会重新下载资源，离线状态下暂时打不开。"
+how = "delete"
+how_detail = "退出对应程序后删除；程序会按需重新缓存。"
+refs = ["https://developer.mozilla.org/en-US/docs/Web/API/CacheStorage"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "crashpad-reports"
+owner = "Chromium / Electron 程序"
+category = "log"
+tier = "safe"
+owner_from_path = true
+match = ['%APPDATA%\**\Crashpad', '%LOCALAPPDATA%\**\Crashpad', '%LOCALAPPDATA%\**\Crash Reports']
+what = "程序崩溃报告"
+why = "程序崩溃时记录现场，准备上传给开发者"
+lose = "只是丢掉以前的崩溃记录，不影响使用。"
+how = "delete"
+how_detail = "直接删除即可。"
+refs = []
+verified_on = "2026-09-23"

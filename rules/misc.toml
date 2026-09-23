@@ -1,0 +1,393 @@
+# 其他常见软件和工具。文案均为 DiskWhy 自己撰写（MIT）。
+
+# ───────── Claude 桌面版 / 命令行 AI 工具 ─────────
+
+[[rule]]
+id = "claude-desktop-vm"
+owner = "Claude 桌面版（Anthropic）"
+category = "vm"
+tier = "review"
+match = [
+  '%APPDATA%\Claude\vm_bundles',
+  '%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\vm_bundles',
+]
+what = "Claude 桌面版下载的本地 Linux 虚拟机镜像"
+why = "从文件名看（rootfs.vhdx、vmlinuz、initrd、sessiondata.vhdx），这是 Claude 桌面版在本机隔离环境里执行任务用的小型虚拟机。注意：商店版 Claude 的数据会同时出现在 AppData\\Roaming\\Claude 和 Packages\\Claude_…\\LocalCache\\Roaming\\Claude 两处，其实是同一份，别算两遍"
+lose = "我不确定删了之后具体哪些功能受影响：用到它的功能可能要重新下载镜像（几 GB）；sessiondata.vhdx 看名字可能存有会话数据，删了可能丢失之前的工作记录。"
+how = "manual"
+how_detail = "建议先在 Claude 桌面版的设置里找相关功能的开关或清理选项；确实不用那项功能再考虑删除（先完全退出 Claude）。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "claude-desktop-data"
+owner = "Claude 桌面版（Anthropic）"
+category = "userdata"
+tier = "review"
+match = ['%APPDATA%\Claude', '%LOCALAPPDATA%\Packages\Claude_*']
+what = "Claude 桌面版的本地数据：登录信息、设置、界面缓存，以及虚拟机镜像"
+why = "Claude 桌面版是 Electron 程序，数据放在这里；商店版会通过应用包映射同时出现在 Packages\\Claude_… 下（同一份数据，看起来像两份）"
+lose = "整个删要重新登录、丢本地设置；Cache、Code Cache、GPUCache 等界面缓存可以放心清（单独标绿），vm_bundles 见它自己的说明。"
+how = "manual"
+how_detail = "点进去只清标绿的缓存子文件夹；不用了就在“设置 > 应用”里卸载 Claude。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "claude-code-data"
+owner = "Claude Code（Anthropic 命令行工具）"
+category = "userdata"
+tier = "review"
+match = ['%USERPROFILE%\.claude']
+what = "Claude Code 的配置、会话记录和插件"
+why = "Claude Code 把设置、每个项目的对话记录（projects）、安装的技能和插件放在这里"
+lose = "删了会丢设置、插件和所有历史对话（没法再继续以前的会话）。projects 子文件夹是对话记录，最占地方。"
+how = "manual"
+how_detail = "只想腾空间的话，可以删 projects 里你确定不再需要的旧项目对话记录；settings.json、CLAUDE.md、skills 等配置不要删。"
+refs = ["https://docs.anthropic.com/en/docs/claude-code/settings"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "codex-cli-data"
+owner = "Codex CLI（OpenAI 命令行工具）"
+category = "userdata"
+tier = "review"
+match = ['%USERPROFILE%\.codex']
+what = "Codex 命令行工具的配置、登录信息和会话记录"
+why = "sessions 子文件夹按日期存每次对话的记录，时间长了会很大"
+lose = "删 sessions 里的旧记录只会丢那些历史对话；auth.json、config.toml 是登录和配置，删了要重新登录和配置。"
+how = "manual"
+how_detail = "只删 sessions 里你不需要的旧日期文件夹。"
+refs = ["https://github.com/openai/codex"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "dot-cache-root"
+owner = "各类命令行工具"
+category = "cache"
+tier = "review"
+scope = "self"
+match = ['%USERPROFILE%\.cache']
+what = "命令行工具放缓存的通用文件夹（.cache）"
+why = "很多从 Linux 移植来的工具（Python 库、AI 工具等）习惯把缓存放在 ~/.cache"
+lose = "不能一概而论：里面多数是缓存，但有的工具把模型或重要数据也放这里。请点进去逐项看。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── OneDrive / Office ─────────
+
+[[rule]]
+id = "onedrive-folder"
+owner = "OneDrive"
+category = "userdata"
+tier = "keep"
+match = ['%USERPROFILE%\OneDrive', '%USERPROFILE%\OneDrive - *']
+what = "OneDrive 同步文件夹"
+why = "你的云盘文件在本机的副本"
+lose = "在这里删文件，云上也会跟着删掉！想腾本地空间应该用“释放空间”，而不是删除。"
+how = "builtin_tool"
+how_detail = "在资源管理器里右键文件夹 → “释放空间”（Free up space），文件变成只在云端，本地几乎不占地方；打开时自动下载。"
+refs = ["https://support.microsoft.com/en-us/office/save-disk-space-with-onedrive-files-on-demand-for-windows-0e6860d3-d9f3-4971-b321-7092438fb38e"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "onedrive-app"
+owner = "OneDrive"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Microsoft\OneDrive']
+what = "OneDrive 客户端程序和它的同步记录"
+why = "OneDrive 默认只给当前账户安装，程序和同步数据库放在这里"
+lose = "删了 OneDrive 会坏掉，可能需要重新同步全部文件。"
+how = "manual"
+how_detail = "不用 OneDrive 的话在“设置 > 应用”里卸载 Microsoft OneDrive。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "office-program"
+owner = "Microsoft Office"
+category = "app"
+tier = "keep"
+match = ['%ProgramFiles%\Microsoft Office', '%ProgramFiles(x86)%\Microsoft Office', '%ProgramFiles%\Common Files\microsoft shared\ClickToRun']
+what = "Microsoft Office（Word、Excel、PowerPoint 等）的程序本体"
+why = "安装 Office 时放程序文件的地方；root\\vfs 是即点即用版本的虚拟化文件"
+lose = "直接删 Office 就用不了，还可能留下无法卸载的残留。"
+how = "manual"
+how_detail = "“设置 > 应用”里卸载或“修改”去掉不用的组件。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "office-file-cache"
+owner = "Microsoft Office"
+category = "cache"
+tier = "review"
+match = ['%LOCALAPPDATA%\Microsoft\Office\16.0\OfficeFileCache']
+what = "Office 上传中心的文件缓存"
+why = "打开 OneDrive / SharePoint 上的文档时 Office 在本机缓存一份"
+lose = "一般能重新下载；但如果有还没上传成功的改动，删了就丢。"
+how = "builtin_tool"
+how_detail = "打开 Office 上传中心（或 Word → 文件 → 选项 → 保存 → 缓存设置）点“删除缓存的文件”。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "outlook-ost"
+owner = "Microsoft Outlook"
+category = "cache"
+tier = "review"
+kind = "file"
+match = ['%LOCALAPPDATA%\Microsoft\Outlook\*.ost']
+what = "Outlook 的离线邮件缓存（.ost）"
+why = "Exchange / Microsoft 365 / IMAP 邮箱在本机的副本，没网也能看邮件"
+lose = "邮件在服务器上还有，删了会重新下载（可能很久）；但还没同步上去的草稿等会丢。"
+how = "manual"
+how_detail = "关掉 Outlook 后可以删，或在账户设置里把“脱机保留邮件”的时间调短。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "outlook-pst"
+owner = "Microsoft Outlook"
+category = "userdata"
+tier = "keep"
+kind = "file"
+match = ['%LOCALAPPDATA%\Microsoft\Outlook\*.pst', '%USERPROFILE%\Documents\Outlook Files\*.pst']
+what = "Outlook 数据文件（.pst）：存档或本地邮箱"
+why = "POP 邮箱和邮件存档都存在这种文件里"
+lose = "这很可能是只在本机的邮件，删了就没了。"
+how = "migrate"
+how_detail = "关掉 Outlook，把 .pst 文件搬到别的盘，再在 Outlook“账户设置 > 数据文件”里重新打开它。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── 显卡驱动 ─────────
+
+[[rule]]
+id = "gpu-shader-cache"
+owner = "显卡驱动（NVIDIA / AMD / Intel）"
+category = "cache"
+tier = "safe"
+match = [
+  '%LOCALAPPDATA%\NVIDIA\DXCache', '%LOCALAPPDATA%\NVIDIA\GLCache', '%APPDATA%\NVIDIA\ComputeCache',
+  '%LOCALAPPDATA%\AMD\DxCache', '%LOCALAPPDATA%\AMD\DxcCache', '%LOCALAPPDATA%\AMD\GLCache', '%LOCALAPPDATA%\AMD\VkCache',
+  '%LOCALAPPDATA%\Intel\ShaderCache',
+]
+what = "显卡驱动的着色器缓存"
+why = "游戏和图形程序第一次运行时编译的着色器存在这里，下次加载更快、更少卡顿"
+lose = "不丢数据；删掉后游戏头几次加载会慢一点、可能短暂卡顿，缓存会重新生成。"
+how = ["delete", "builtin_tool"]
+how_detail = "关掉游戏后直接删；NVIDIA 控制面板“着色器缓存大小”可以限制上限。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "nvidia-local"
+owner = "NVIDIA 显卡驱动"
+category = "cache"
+tier = "review"
+scope = "self"
+match = ['%LOCALAPPDATA%\NVIDIA', '%LOCALAPPDATA%\AMD']
+what = "显卡驱动在本机的缓存文件夹"
+why = "主要是着色器缓存（DXCache / GLCache 等）"
+lose = "请点进去看：着色器缓存可以放心清（标绿）。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "nvidia-app-updates"
+owner = "NVIDIA App"
+category = "installer"
+tier = "review"
+match = ['%ProgramData%\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts', '%ProgramData%\NVIDIA Corporation\Downloader']
+what = "NVIDIA App（或旧的 GeForce Experience）下载的驱动和程序更新包"
+why = "NVIDIA 软件在后台下载新驱动和新版本，解压后装好"
+lose = "装好的驱动不受影响；以后回滚或重装驱动时需要重新下载。我不确定 NVIDIA App 会不会在下次检查更新时把它们重新下回来。"
+how = "delete"
+how_detail = "需要管理员权限。先退出 NVIDIA App 再删；或在 NVIDIA App 设置里关掉自动下载驱动。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "nvidia-app-data"
+owner = "NVIDIA App"
+category = "app"
+tier = "review"
+match = ['%ProgramData%\NVIDIA Corporation\NVIDIA App']
+what = "NVIDIA App 的公共数据（设置、日志，大头通常是下载的更新包）"
+why = "NVIDIA App 管理驱动和显卡设置，数据放在这里"
+lose = "整个删会让 NVIDIA App 出问题、需要重装；里面的 UpdateFramework\\ota-artifacts 是更新包，单独说明。"
+how = "manual"
+how_detail = "点进去看 ota-artifacts；其余不建议手动删。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "nvidia-programdata"
+owner = "NVIDIA"
+category = "system"
+tier = "keep"
+scope = "self"
+match = ['%ProgramData%\NVIDIA Corporation', '%ProgramData%\NVIDIA']
+what = "NVIDIA 驱动和软件的公共数据"
+why = "驱动配置、NVIDIA App 数据、更新包、AI 功能模型等"
+lose = "不能整个删，驱动配置在里面。请点进去看具体哪块大。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "nvidia-program"
+owner = "NVIDIA"
+category = "app"
+tier = "keep"
+match = ['%ProgramFiles%\NVIDIA Corporation', '%ProgramFiles%\NVIDIA GPU Computing Toolkit']
+what = "NVIDIA 驱动组件和开发工具（CUDA、Nsight 等）"
+why = "显卡驱动、NVIDIA App、CUDA 工具包等装在这里"
+lose = "直接删会让驱动或开发工具坏掉。不用的开发工具（Nsight、旧版 CUDA）请在“设置 > 应用”里卸载。"
+how = "manual"
+how_detail = "“设置 > 应用”里卸载不用的 NVIDIA 组件，不要手动删。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── 游戏 / 外设 ─────────
+
+[[rule]]
+id = "steam-library"
+owner = "Steam"
+category = "userdata"
+tier = "keep"
+match = ['%ProgramFiles(x86)%\Steam\steamapps\common', '%ProgramFiles(x86)%\Steam\steamapps']
+what = "Steam 里装的游戏"
+why = "Steam 默认把游戏装在这里"
+lose = "直接删文件夹 Steam 会认为游戏损坏；想腾空间请卸载或移到别的盘（存档多数在云端或文档里，但不是全部）。"
+how = ["migrate", "manual"]
+how_detail = "Steam → 设置 → 存储空间：添加 D 盘库，然后选中游戏“移动”过去；不玩的在库里右键“卸载”。"
+refs = ["https://help.steampowered.com/en/faqs/view/4BD4-4528-6B2E-8327"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "steam-caches"
+owner = "Steam"
+category = "cache"
+tier = "safe"
+match = [
+  '%ProgramFiles(x86)%\Steam\steamapps\shadercache',
+  '%ProgramFiles(x86)%\Steam\appcache',
+  '%ProgramFiles(x86)%\Steam\logs',
+  '%ProgramFiles(x86)%\Steam\dumps',
+  '%ProgramFiles(x86)%\Steam\depotcache',
+]
+what = "Steam 的着色器缓存、界面缓存、日志和崩溃记录"
+why = "Steam 运行和下载时产生的缓存"
+lose = "不丢游戏和存档；删掉后 Steam 首次启动稍慢，游戏着色器会重新编译。"
+how = "delete"
+how_detail = "完全退出 Steam 后删除；着色器缓存也可以在 Steam 设置 → 下载 里清理。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "logitech-ghub"
+owner = "罗技 G HUB"
+category = "app"
+tier = "review"
+match = ['%ProgramData%\LGHUB']
+what = "罗技 G HUB（外设驱动软件）的公共数据和下载的组件"
+why = "G HUB 下载的设备支持包、固件、更新都放在这里"
+lose = "我不确定其中哪些能删：depots 看起来是下载的组件包，cache 看起来是缓存；删了 G HUB 可能要重新下载，或设备配置不能用。"
+how = "manual"
+how_detail = "不建议手动删；G HUB 本身占地方的话可以卸载后重装。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "raspberry-pi-imager-cache"
+owner = "Raspberry Pi Imager"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\Raspberry Pi\Raspberry Pi Imager\cache']
+what = "树莓派烧录工具下载的系统镜像缓存"
+why = "烧录 SD 卡时下载的系统镜像留一份，下次再烧同一个系统不用重新下载"
+lose = "不丢数据；下次烧录要重新下载镜像。"
+how = "delete"
+how_detail = "关掉 Raspberry Pi Imager 后删除。"
+refs = []
+verified_on = "2026-09-23"
+
+# ───────── 其他 ─────────
+
+[[rule]]
+id = "adobe-media-cache"
+owner = "Adobe（Premiere / After Effects 等）"
+category = "cache"
+tier = "safe"
+match = ['%APPDATA%\Adobe\Common\Media Cache Files', '%APPDATA%\Adobe\Common\Media Cache', '%APPDATA%\Adobe\Common\Peak Files']
+what = "Adobe 视频软件的媒体缓存（音频波形、解码缓存）"
+why = "导入素材时生成，让预览和剪辑更流畅"
+lose = "不丢工程文件；再打开工程时会重新生成缓存，稍慢。"
+how = ["builtin_tool", "delete"]
+how_detail = "Premiere → 首选项 → 媒体缓存 → 删除；或关掉 Adobe 软件后直接删。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "squirrel-temp"
+owner = "Squirrel 安装器（Discord、Teams 等使用）"
+category = "installer"
+tier = "safe"
+match = ['%LOCALAPPDATA%\SquirrelTemp']
+what = "某些软件安装和更新时留下的临时安装文件"
+why = "Discord 等软件用 Squirrel 安装器，安装过程的临时文件放这里"
+lose = "不丢数据。"
+how = "delete"
+how_detail = "直接删除。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "python-install"
+owner = "Python"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Programs\Python']
+what = "Python 解释器（只给当前账户装的版本）"
+why = "从 python.org 安装的 Python 默认放这里，每个版本一个文件夹，装的第三方库也在里面"
+lose = "直接删 Python 和装好的库就没了，依赖它的脚本和软件跑不起来。不用的旧版本请正常卸载。"
+how = "manual"
+how_detail = "“设置 > 应用”里卸载不用的 Python 版本。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "discord-app"
+owner = "Discord"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Discord']
+what = "Discord 的程序本体"
+why = "Discord 装在这里，每次更新一个 app-版本号 文件夹，旧版本会自动清"
+lose = "直接删 Discord 就打不开了。"
+how = "manual"
+how_detail = "“设置 > 应用”里卸载。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "discord-data"
+owner = "Discord"
+category = "userdata"
+tier = "review"
+match = ['%APPDATA%\discord']
+what = "Discord 的登录信息、设置和界面缓存"
+why = "Discord 是 Electron 程序，数据放在这里"
+lose = "整个删要重新登录；Cache 类子文件夹可以放心清（单独标绿）。聊天记录在服务器上，不会丢。"
+how = "manual"
+how_detail = "只清标绿的缓存子文件夹。"
+refs = []
+verified_on = "2026-09-23"

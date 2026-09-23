@@ -1,0 +1,185 @@
+# AI 模型缓存。文案均为 DiskWhy 自己撰写（MIT）。
+# 共同点：都能重新下载，但文件很大、下载很慢（有的还要翻墙或登录），所以一律 review，
+# 办法同时给“迁到别的盘”和“删掉”。
+
+[[rule]]
+id = "huggingface-hub"
+owner = "Hugging Face（transformers / diffusers 等）"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.cache\huggingface\hub', '%USERPROFILE%\.cache\huggingface\transformers', '%USERPROFILE%\.cache\huggingface']
+what = "从 Hugging Face 下载的 AI 模型"
+why = "用 Python 跑 AI 模型（transformers、diffusers、sentence-transformers 等）时自动下载到这里"
+lose = "删了可以重新下载，但模型往往几 GB 到几十 GB、下载很慢；删后第一次运行相关程序会卡在下载上。"
+how = ["migrate", "delete"]
+how_detail = "迁移：设置用户环境变量 HF_HOME=D:\\hf（或只设 HF_HUB_CACHE），把整个文件夹搬过去。挑着删：pip install huggingface_hub 后运行 hf cache scan 查看、hf cache delete 选择要删的模型（旧版命令是 huggingface-cli scan-cache / delete-cache）。"
+refs = ["https://huggingface.co/docs/huggingface_hub/guides/manage-cache"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "huggingface-datasets"
+owner = "Hugging Face datasets"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.cache\huggingface\datasets']
+what = "从 Hugging Face 下载的数据集缓存"
+why = "用 datasets 库加载数据集时下载和处理后的文件"
+lose = "删了可以重新下载处理，但可能很慢；如果是你自己处理后保存的数据要先确认。"
+how = ["migrate", "delete"]
+how_detail = "设置环境变量 HF_DATASETS_CACHE 或 HF_HOME 指到别的盘；不用的直接删。"
+refs = ["https://huggingface.co/docs/datasets/cache"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "ollama-models"
+owner = "Ollama"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.ollama\models', '%USERPROFILE%\.ollama']
+what = "Ollama 下载的本地大模型"
+why = "你用 ollama pull / ollama run 拉过的每个模型都存在这里"
+lose = "删了可以重新 ollama pull，但一个模型动辄几 GB 到几十 GB，重新下载很慢。"
+how = ["migrate", "delete"]
+how_detail = "迁移：退出 Ollama（托盘图标右键退出），设置用户环境变量 OLLAMA_MODELS=D:\\ollama\\models，把 models 文件夹整个搬过去，再启动 Ollama。删除：ollama list 查看，ollama rm <模型名> 删掉不用的。"
+refs = ["https://docs.ollama.com/faq"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "ollama-program"
+owner = "Ollama"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\Programs\Ollama']
+what = "Ollama 的程序本体（包括显卡加速库）"
+why = "lib 里是 CUDA / ROCm 等显卡加速组件，所以比较大"
+lose = "直接删 Ollama 就用不了。不用了请正常卸载（模型在另一个文件夹，卸载不一定会删）。"
+how = "manual"
+how_detail = "“设置 > 应用”里卸载 Ollama；模型文件夹 %USERPROFILE%\\.ollama 需要另外处理。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "ollama-local-data"
+owner = "Ollama"
+category = "log"
+tier = "review"
+match = ['%LOCALAPPDATA%\Ollama']
+what = "Ollama 的日志和下载的更新包"
+why = "Ollama 运行日志（app.log、server.log）和自动更新时下载的安装包"
+lose = "只是丢掉日志和已下载的更新包，不影响已装的模型。"
+how = "delete"
+how_detail = "退出 Ollama 后删除里面的 .log 和 updates。"
+refs = ["https://docs.ollama.com/troubleshooting"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "torch-hub"
+owner = "PyTorch"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.cache\torch']
+what = "PyTorch 下载的预训练模型"
+why = "torch.hub、torchvision 等加载预训练模型时自动下载到这里"
+lose = "删了可以重新下载，但大模型下载慢；删后第一次运行相关程序要等下载。"
+how = ["migrate", "delete"]
+how_detail = "设置环境变量 TORCH_HOME=D:\\torch，把文件夹搬过去；不用的直接删。"
+refs = ["https://pytorch.org/docs/stable/hub.html"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "modelscope-cache"
+owner = "ModelScope（魔搭）"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.cache\modelscope']
+what = "从魔搭社区（ModelScope）下载的 AI 模型"
+why = "用 modelscope 库加载模型时自动下载到这里"
+lose = "删了可以重新下载，但模型大、下载慢。"
+how = ["migrate", "delete"]
+how_detail = "设置环境变量 MODELSCOPE_CACHE=D:\\modelscope，把文件夹搬过去；不用的模型直接删对应子文件夹。"
+refs = ["https://modelscope.cn/docs/models/download"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "insightface-models"
+owner = "InsightFace"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.insightface']
+what = "InsightFace 人脸识别模型"
+why = "换脸、人脸识别类工具（很多 AI 绘画插件也会用）第一次运行时下载"
+lose = "删了可以重新下载，但有的模型下载地址不稳定，可能下不回来；用到它的工具在重新下载前会报错。"
+how = ["migrate", "delete"]
+how_detail = "我不确定它有没有统一的环境变量能改位置。通用迁移办法：先关掉相关程序，把文件夹搬到 D 盘，再在原位置建目录链接：mklink /J %USERPROFILE%\\.insightface D:\\models\\.insightface。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "paddle-models"
+owner = "飞桨 PaddlePaddle（PaddleX / PaddleOCR / PaddleNLP）"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.paddlex', '%USERPROFILE%\.paddleocr', '%USERPROFILE%\.paddlenlp', '%USERPROFILE%\.paddlehub']
+what = "飞桨（Paddle）系列工具下载的模型"
+why = "OCR 文字识别、版面分析、NLP 等工具第一次运行时下载的模型文件"
+lose = "删了可以重新下载，但比较慢；用到它的程序下次运行要等下载。"
+how = ["migrate", "delete"]
+how_detail = "我不确定每个工具的环境变量名是否统一。通用迁移办法：关掉相关程序，把文件夹搬到 D 盘，再建目录链接：mklink /J %USERPROFILE%\\.paddlex D:\\models\\.paddlex。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "lm-studio-models"
+owner = "LM Studio"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.lmstudio\models', '%USERPROFILE%\.cache\lm-studio\models', '%USERPROFILE%\.lmstudio']
+what = "LM Studio 下载的本地大模型"
+why = "在 LM Studio 里下载的每个模型都存在这里"
+lose = "删了可以在 LM Studio 里重新下载，但模型很大、很慢。"
+how = ["migrate", "delete"]
+how_detail = "在 LM Studio 的“我的模型（My Models）”页面可以修改模型文件夹位置，改到 D 盘后把文件搬过去；不同版本界面略有差别。不用的模型在同一页面删除。"
+refs = ["https://lmstudio.ai/docs/app"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "whisper-models"
+owner = "OpenAI Whisper"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.cache\whisper']
+what = "Whisper 语音识别模型"
+why = "用 whisper 做语音转文字时下载的模型"
+lose = "删了可以重新下载，大模型有几个 GB。"
+how = ["migrate", "delete"]
+how_detail = "whisper 命令支持 --model_dir 指定位置；或者搬到 D 盘后用 mklink /J 链接回来。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "keras-models"
+owner = "Keras / TensorFlow"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.keras']
+what = "Keras 下载的预训练模型和数据集"
+why = "加载 Keras 自带的预训练模型或示例数据集时下载"
+lose = "删了可以重新下载；如果你把自己训练的模型也存在这里，先确认。"
+how = ["migrate", "delete"]
+how_detail = "设置环境变量 KERAS_HOME 指向别的盘；不用的直接删。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "nvidia-ngx-models"
+owner = "NVIDIA 显卡驱动"
+category = "model"
+tier = "review"
+match = ['%ProgramData%\NVIDIA\NGX\models', '%ProgramData%\NVIDIA\NGX']
+what = "NVIDIA 显卡的 AI 功能模型（DLSS 等）"
+why = "显卡驱动或 NVIDIA App 为游戏里的 AI 画质增强等功能下载的模型"
+lose = "我不确定删了之后哪些功能会马上受影响；一般驱动会在需要时重新下载。空间不紧张就别动。"
+how = "delete"
+how_detail = "需要管理员权限；建议先保留，确实紧张再删。"
+refs = []
+verified_on = "2026-09-23"

@@ -10,6 +10,7 @@ import {
   type DirListing,
   type DriveInfo,
   type EnvInfo,
+  type LlmSettings,
   type NodeView,
   type ScanProgress,
   type ScanSummary,
@@ -19,6 +20,8 @@ import AttributionBar from "./components/AttributionBar.vue";
 import ScanProgressPanel from "./components/ScanProgressPanel.vue";
 import DirList from "./components/DirList.vue";
 import DetailPanel from "./components/DetailPanel.vue";
+import TierSummaryCard from "./components/TierSummaryCard.vue";
+import SettingsDialog from "./components/SettingsDialog.vue";
 
 type Phase = "idle" | "scanning" | "done";
 
@@ -34,6 +37,12 @@ const selectedKey = ref<string | null>(null);
 const message = ref("");
 const cancelling = ref(false);
 const relaunching = ref(false);
+const showSettings = ref(false);
+const llmReady = computed(() => env.value?.llm_ready ?? false);
+
+function onSettingsSaved(s: LlmSettings) {
+  if (env.value) env.value.llm_ready = s.enabled && !!s.base_url && !!s.model;
+}
 
 const detailNode = computed(() => selected.value ?? listing.value?.node ?? null);
 
@@ -130,6 +139,12 @@ async function doRelaunch() {
       <div class="meta" v-if="summary">
         用时 {{ fmtDuration(summary.duration_ms) }} · {{ fmtInt(summary.files) }} 个文件 · {{ fmtInt(summary.dirs) }} 个文件夹
       </div>
+      <div class="meta-right">
+        <span v-if="env" class="muted small" :title="env.rule_warnings.join('；')">
+          规则库 {{ env.rules_total }} 条{{ env.rule_warnings.length ? `（${env.rule_warnings.length} 条警告）` : "" }}
+        </span>
+        <button class="btn" @click="showSettings = true">设置</button>
+      </div>
     </header>
 
     <div v-if="env && !env.elevated" class="admin-banner">
@@ -163,12 +178,16 @@ async function doRelaunch() {
       />
 
       <template v-if="phase === 'done' && summary">
-        <AttributionBar :summary="summary" />
+        <div class="summary-row">
+          <AttributionBar :summary="summary" />
+          <TierSummaryCard :tiers="summary.tiers" :used-bytes="summary.used_bytes" />
+        </div>
         <div class="split">
           <DirList v-if="listing" :listing="listing" :selected-path="selectedKey" @open="open" @select="select" />
-          <DetailPanel :node="detailNode" />
+          <DetailPanel :node="detailNode" :llm-ready="llmReady" @open-settings="showSettings = true" />
         </div>
       </template>
     </main>
+    <SettingsDialog v-if="showSettings" @close="showSettings = false" @saved="onSettingsSaved" />
   </div>
 </template>

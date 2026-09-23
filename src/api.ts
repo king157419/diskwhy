@@ -14,6 +14,73 @@ export interface DriveInfo {
 export interface EnvInfo {
   elevated: boolean;
   version: string;
+  rules_total: number;
+  rule_warnings: string[];
+  registry_apps: number;
+  llm_ready: boolean;
+}
+
+// ───── 阶段 B：解释 ─────
+export type Tier = "safe" | "review" | "keep";
+/** 界面上的四种颜色：未知单独算灰色（后端 tier 仍是 review） */
+export type TierKey = Tier | "unknown";
+export type How = "delete" | "builtin_tool" | "migrate" | "manual" | "none";
+export type Source =
+  | { kind: "rule"; id: string; group: string; inherited_from: string | null }
+  | { kind: "heuristic"; name: string }
+  | { kind: "llm"; model: string }
+  | { kind: "unknown" };
+
+export interface Explanation {
+  tier: Tier;
+  owner: string | null;
+  category: string;
+  what: string;
+  why: string;
+  lose: string;
+  how: How[];
+  how_detail: string;
+  gain_bytes: number;
+  gain_note: string;
+  source: Source;
+  confidence: number;
+  refs: string[];
+  verified_on: string | null;
+  notes: string[];
+  clues: string[];
+}
+
+export interface RuleBytes {
+  id: string;
+  owner: string;
+  what: string;
+  tier: Tier;
+  bytes: number;
+}
+
+export interface TierSummary {
+  safe_bytes: number;
+  review_bytes: number;
+  keep_bytes: number;
+  uncovered_bytes: number;
+  rules_hit: number;
+  rules_total: number;
+  top_safe: RuleBytes[];
+  top_review: RuleBytes[];
+  top_keep: RuleBytes[];
+  duration_ms: number;
+}
+
+export interface LlmSettings {
+  enabled: boolean;
+  base_url: string;
+  model: string;
+  api_key: string;
+}
+
+export function tierKey(e: Explanation | null | undefined): TierKey {
+  if (!e) return "unknown";
+  return e.source.kind === "unknown" ? "unknown" : e.tier;
 }
 
 export interface ScanProgress {
@@ -63,6 +130,7 @@ export interface ScanSummary {
   inaccessible_sample: InaccessibleDir[];
   size_mode: "Exact" | "Fast";
   top_files_per_dir: number;
+  tiers: TierSummary;
 }
 
 export interface NodeView {
@@ -84,6 +152,7 @@ export interface NodeView {
   child_count: number;
   percent_of_parent: number;
   type_label: string;
+  explanation?: Explanation;
 }
 
 export interface Crumb {
@@ -103,6 +172,10 @@ export const listDrives = () => invoke<DriveInfo[]>("list_drives");
 export const cancelScan = () => invoke<void>("cancel_scan");
 export const listDir = (path: string, limit = 1000) => invoke<DirListing>("list_dir", { path, limit });
 export const relaunchAsAdmin = () => invoke<void>("relaunch_as_admin");
+export const getSettings = () => invoke<LlmSettings>("get_settings");
+export const saveSettings = (settings: LlmSettings) => invoke<string>("save_settings", { settings });
+export const testLlm = (settings: LlmSettings) => invoke<string>("test_llm", { settings });
+export const askAi = (path: string) => invoke<Explanation>("ask_ai", { path });
 
 export function startScan(root: string, onProgress: (p: ScanProgress) => void): Promise<ScanSummary> {
   const ch = new Channel<ScanProgress>();

@@ -1,4 +1,4 @@
-//! DiskWhy 核心库：扫描引擎 + 归属统计（阶段 A）。
+//! DiskWhy 核心库：扫描引擎 + 归属统计（阶段 A）+ 解释引擎（阶段 B，见 [`explain`]）。
 //!
 //! 主要入口：
 //! - [`scan::scan`]：扫描真实盘符 / 目录，返回 [`model::ScanResult`]（含完整目录树 `tree`）；
@@ -10,6 +10,7 @@
 //! 本库不依赖 Tauri。
 
 pub mod attribution;
+pub mod explain;
 pub mod fs;
 pub mod model;
 pub mod scan;

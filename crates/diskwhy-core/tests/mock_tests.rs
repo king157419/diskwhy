@@ -291,7 +291,7 @@ fn view_listing_and_top_dirs() {
     let fs = sample_volume();
     let r = scan_with(&fs, r"M:\", volume(1_000_000), false, &ScanOptions::default(), &AtomicBool::new(false), |_| {})
         .unwrap();
-    let l = view::listing(&r, r"m:\users", 100).unwrap();
+    let l = view::listing(&r, r"m:\users", 100, None).unwrap();
     assert_eq!(l.node.path, r"M:\Users");
     assert_eq!(l.breadcrumb.len(), 2);
     let a = l.children.iter().find(|c| c.name == "a.bin").unwrap();
@@ -300,7 +300,7 @@ fn view_listing_and_top_dirs() {
     assert!((pct - 100.0).abs() < 1e-6);
     let top = view::top_dirs(&r.tree, 3);
     assert_eq!(top[0].name, "Users");
-    assert!(view::listing(&r, r"M:\nope", 10).is_none());
+    assert!(view::listing(&r, r"M:\nope", 10, None).is_none());
     // JSON 可序列化
     let _ = serde_json::to_string(&view::truncate_tree(&r.tree, 2)).unwrap();
 }

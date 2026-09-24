@@ -97,7 +97,7 @@ why = "开发 Electron 应用或装需要编译的 npm 包时下载的运行时�
 lose = "不丢数据；下次用到时重新下载。"
 how = "delete"
 how_detail = "直接删除。"
-refs = []
+refs = ["https://www.electronjs.org/docs/latest/tutorial/installation", "https://github.com/nodejs/node-gyp"]
 verified_on = "2026-09-23"
 
 # ───────── Python ─────────
@@ -303,9 +303,9 @@ tier = "safe"
 match = ['%USERPROFILE%\.nuget\packages', '%LOCALAPPDATA%\NuGet\v3-cache', '%LOCALAPPDATA%\NuGet\plugins-cache', '%LOCALAPPDATA%\NuGet\Cache']
 what = "NuGet 下载的 .NET 包缓存"
 why = ".NET 项目还原依赖时下载的包"
-lose = "不丢代码；下次构建会重新下载。"
+lose = "不丢代码；下次构建会重新下载。清完以后 Visual Studio 里打开的项目可能报“找不到包”，右键解决方案点“还原 NuGet 包”（或运行 dotnet restore）就好。"
 how = ["builtin_tool", "delete"]
-how_detail = "dotnet nuget locals all --clear"
+how_detail = "先关掉 Visual Studio，再运行 dotnet nuget locals all --clear；之后第一次构建前 restore 一次。"
 refs = ["https://learn.microsoft.com/en-us/nuget/consume-packages/managing-the-global-packages-and-cache-folders"]
 verified_on = "2026-09-23"
 
@@ -371,6 +371,7 @@ lose = "只是丢掉旧日志，不影响镜像和容器。"
 how = "delete"
 how_detail = "退出 Docker Desktop 后删除。"
 refs = []
+observed_only = true
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -401,8 +402,8 @@ what = "WSL 里某个 Linux 发行版的整块硬盘（ext4.vhdx）"
 why = "你装的 Ubuntu 等 Linux 发行版，系统和你在里面的所有文件都存在这个虚拟磁盘文件里；它只会变大不会自动变小"
 lose = "删了等于把这个 Linux 连同里面所有文件一起删掉，无法恢复。"
 how = "migrate"
-how_detail = "迁到 D 盘（先 wsl --shutdown）：新版 WSL 可直接 wsl --manage <发行版名> --move D:\\WSL\\<发行版名>；旧版用 wsl --export <发行版名> D:\\backup.tar → wsl --unregister <发行版名> → wsl --import <发行版名> D:\\WSL\\<发行版名> D:\\backup.tar。发行版名用 wsl -l -v 查看。不用的发行版用 wsl --unregister 删除。"
-refs = ["https://learn.microsoft.com/en-us/windows/wsl/basic-commands", "https://learn.microsoft.com/en-us/windows/wsl/disk-space"]
+how_detail = "迁到别的盘，先看目标盘剩余空间够不够装下它（大小见上面的“占用”），再 wsl --shutdown。发行版名用 wsl -l -v 查看，WSL 版本用 wsl --version 查看。WSL 2.3.11 及以上：wsl --manage <发行版名> --move D:\\WSL\\<发行版名> 一步搬完。更旧的版本分四步，不要跳：1）wsl --export <发行版名> D:\\backup.tar；2）确认 backup.tar 生成了、大小和发行版差不多；3）wsl --unregister <发行版名>（这一步会删掉 C 盘上的这个发行版，只有第 2 步确认过才做）；4）wsl --import <发行版名> D:\\WSL\\<发行版名> D:\\backup.tar，进去看文件都在，再删 backup.tar。不用的发行版才直接 wsl --unregister。"
+refs = ["https://learn.microsoft.com/en-us/windows/wsl/basic-commands", "https://learn.microsoft.com/en-us/windows/wsl/disk-space", "https://github.com/microsoft/WSL/releases/tag/2.3.11"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -416,7 +417,7 @@ what = "新版 WSL 存放 Linux 发行版虚拟磁盘的文件夹"
 why = "每个子文件夹（一串 GUID）是一个发行版"
 lose = "不能删，里面是你的 Linux 系统和文件。"
 how = "migrate"
-how_detail = "用 wsl --manage <发行版名> --move <新位置> 或 export/import 迁移，见子文件夹说明。"
+how_detail = "WSL 2.3.11 及以上（wsl --version 查看）用 wsl --manage <发行版名> --move <新位置>；更旧的用 export / import 分步迁移，见子文件夹说明。"
 refs = ["https://learn.microsoft.com/en-us/windows/wsl/basic-commands"]
 verified_on = "2026-09-23"
 
@@ -457,6 +458,7 @@ lose = "不丢设置、扩展和代码；编辑器下次启动稍慢，重装扩
 how = "delete"
 how_detail = "退出编辑器后删除。"
 refs = []
+observed_only = true
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -527,12 +529,29 @@ id = "jetbrains-caches"
 owner = "JetBrains IDE"
 category = "cache"
 tier = "safe"
-match = ['%LOCALAPPDATA%\JetBrains\*\caches', '%LOCALAPPDATA%\JetBrains\*\index', '%LOCALAPPDATA%\JetBrains\*\log', '%LOCALAPPDATA%\JetBrains\*\tmp']
-what = "JetBrains IDE（IntelliJ、PyCharm 等）的索引、缓存和日志"
-why = "IDE 为了代码提示和搜索建的索引"
+match = ['%LOCALAPPDATA%\JetBrains\*\index', '%LOCALAPPDATA%\JetBrains\*\log', '%LOCALAPPDATA%\JetBrains\*\tmp']
+what = "JetBrains IDE（IntelliJ、PyCharm 等）的索引、日志和临时文件"
+why = "IDE 为了代码提示和搜索建的索引，以及运行日志"
 lose = "不丢设置和代码；下次打开项目要重新建索引，头几分钟会比较慢。"
 how = ["builtin_tool", "delete"]
-how_detail = "IDE 里 File > Invalidate Caches；或关掉 IDE 后删除。旧版本 IDE 的整个文件夹（版本号更低的那些）也可以删。"
+how_detail = "IDE 里 File > Invalidate Caches（弹出的选项里别勾“Clear file system cache and Local History”）；或关掉 IDE 后删除。旧版本 IDE 的整个文件夹（版本号更低的那些）也可以删。"
+refs = ["https://www.jetbrains.com/help/idea/invalidate-caches.html"]
+verified_on = "2026-09-23"
+
+# 第 1 轮安全评审第 6 条：caches 里有文件系统缓存（VFS）。JetBrains 官方把“清文件系统缓存”和“清 Local History”
+# 放在同一个选项里（Clear file system cache and Local History），手动删整个 caches 很可能连没提交改动的本地历史一起丢。
+# 这是根据官方页面的推断，没有实测，所以标“需要你判断”。
+[[rule]]
+id = "jetbrains-caches-dir"
+owner = "JetBrains IDE"
+category = "cache"
+tier = "review"
+match = ['%LOCALAPPDATA%\JetBrains\*\caches']
+what = "JetBrains IDE 的缓存（包括文件系统缓存）"
+why = "IDE 记录项目文件状态、加快打开和搜索的缓存"
+lose = "删了下次打开项目要重建缓存；而且 JetBrains 官方把“清文件系统缓存”和“清 Local History（没提交的改动历史）”放在同一个选项里，手动删整个 caches 可能连 Local History 一起丢。"
+how = ["builtin_tool", "delete"]
+how_detail = "优先在 IDE 里 File > Invalidate Caches，弹出的选项里不要勾“Clear file system cache and Local History”；确定不需要本地历史了，再关掉 IDE 手动删。"
 refs = ["https://www.jetbrains.com/help/idea/invalidate-caches.html"]
 verified_on = "2026-09-23"
 

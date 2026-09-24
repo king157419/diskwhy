@@ -182,6 +182,7 @@ lose = "不丢数据；删掉后游戏头几次加载会慢一点、可能短暂
 how = ["delete", "builtin_tool"]
 how_detail = "关掉游戏后直接删；NVIDIA 控制面板“着色器缓存大小”可以限制上限。"
 refs = []
+observed_only = true
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -290,6 +291,7 @@ lose = "不丢游戏和存档；删掉后 Steam 首次启动稍慢，游戏着�
 how = "delete"
 how_detail = "完全退出 Steam 后删除；着色器缓存也可以在 Steam 设置 → 下载 里清理。"
 refs = []
+observed_only = true
 verified_on = "2026-09-23"
 
 # B-2（S22）：游戏平台缓存第二批。
@@ -355,13 +357,13 @@ id = "raspberry-pi-imager-cache"
 owner = "Raspberry Pi Imager"
 category = "cache"
 tier = "safe"
-match = ['%LOCALAPPDATA%\Raspberry Pi\Raspberry Pi Imager\cache']
+match = ['%LOCALAPPDATA%\Raspberry Pi\Raspberry Pi Imager\cache', '%LOCALAPPDATA%\Raspberry Pi\Imager\cache']
 what = "树莓派烧录工具下载的系统镜像缓存"
-why = "烧录 SD 卡时下载的系统镜像留一份，下次再烧同一个系统不用重新下载"
+why = "烧录 SD 卡时下载的系统镜像留一份，下次再烧同一个系统不用重新下载（新版文件夹叫 Raspberry Pi Imager，旧版叫 Imager；新版路径在本机核实过，旧版路径没有在本机见过）"
 lose = "不丢数据；下次烧录要重新下载镜像。"
 how = "delete"
 how_detail = "关掉 Raspberry Pi Imager 后删除。"
-refs = []
+refs = ["https://github.com/raspberrypi/rpi-imager/issues/209"]
 verified_on = "2026-09-23"
 
 # ───────── 其他 ─────────
@@ -377,7 +379,7 @@ why = "导入素材时生成，让预览和剪辑更流畅"
 lose = "不丢工程文件；再打开工程时会重新生成缓存，稍慢。"
 how = ["builtin_tool", "delete"]
 how_detail = "Premiere → 首选项 → 媒体缓存 → 删除；或关掉 Adobe 软件后直接删。"
-refs = []
+refs = ["https://helpx.adobe.com/after-effects/using/memory-storage1.html"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -387,11 +389,12 @@ category = "installer"
 tier = "safe"
 match = ['%LOCALAPPDATA%\SquirrelTemp']
 what = "某些软件安装和更新时留下的临时安装文件"
-why = "Discord 等软件用 Squirrel 安装器，安装过程的临时文件放这里"
-lose = "不丢数据。"
+why = "Discord 等软件用 Squirrel 安装器：安装或更新时先把安装包解到这里，再装到 AppData\\Local\\软件名 下面；装完这里的东西就用不上了"
+lose = "不丢聊天记录、设置这类数据（它们在软件自己的文件夹里）；只是丢掉安装时的中间文件。如果某个软件正在安装或更新，先等它装完再删。"
 how = "delete"
-how_detail = "直接删除。"
+how_detail = "确认没有软件正在安装或更新，然后直接删除。"
 refs = []
+observed_only = true
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -542,4 +545,69 @@ lose = "删了 pandoc 命令就没了：依赖它的工具（文档转换脚本�
 how = "manual"
 how_detail = "还用就留着；不用了先看“设置 > 应用”里有没有 Pandoc 可以卸载，没有再手动删。子文件夹 pandoc-3.1.11 像是另一份单独解压的版本，我不确定是谁放的。"
 refs = ["https://pandoc.org/installing.html"]
+verified_on = "2026-09-23"
+
+# ───────── 第 1 轮评审后补 ─────────
+
+# 显卡 / 芯片组驱动安装包默认解压到盘根的这几个文件夹。厂商官方文档里没找到“能不能删”的说法
+# （查了 AMD、NVIDIA 的支持页面），社区普遍说装完重启后可以删，所以只标“需要你判断”。
+[[rule]]
+id = "driver-extract-dirs"
+owner = "显卡 / 芯片组驱动安装程序（AMD / NVIDIA / Intel）"
+category = "installer"
+tier = "review"
+kind = "dir"
+match = ['%SystemDrive%\AMD', '%SystemDrive%\NVIDIA', '%SystemDrive%\Intel']
+what = "驱动安装包解压出来的文件"
+why = "AMD、NVIDIA 等驱动安装程序会先把安装包解压到 C 盘根目录的这个文件夹，再开始安装；装完以后通常不会自己删"
+lose = "已经装好的驱动不受影响（驱动本体在 Windows 文件夹里）；删了以后想用同一个包修复或重装驱动，要重新下载。正在安装驱动时别删。"
+how = "delete"
+how_detail = "确认驱动已经装好并重启过，然后删掉整个文件夹。不确定的话先留着，它通常只有几百 MB 到几 GB。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "diskwhy-own-data"
+owner = "DiskWhy"
+category = "app"
+tier = "keep"
+match = ['%LOCALAPPDATA%\DiskWhy']
+what = "DiskWhy 自己的设置和自定义规则"
+why = "DiskWhy 把 AI 推测的设置（settings.json）和你自己写的规则（rules 文件夹）放在这里"
+lose = "删了 AI 推测的设置和自定义规则会丢；不影响其他任何东西。通常只有几 KB。"
+how = "none"
+how_detail = "不用管；卸载 DiskWhy 后可以删。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "diskwhy-webview-data"
+owner = "DiskWhy"
+category = "cache"
+tier = "review"
+match = ['%LOCALAPPDATA%\com.diskwhy.desktop', '%LOCALAPPDATA%\com.diskwhy.app']
+what = "DiskWhy 界面（WebView2）的缓存和本地存储"
+why = "DiskWhy 的界面是用 WebView2 显示的，WebView2 会在这里放网页缓存和界面偏好（比如你选的视图）"
+lose = "删了只会忘掉界面偏好，缓存会重新生成；DiskWhy 开着时删不掉。"
+how = "delete"
+how_detail = "关掉 DiskWhy 后删除。"
+refs = ["https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/user-data-folder"]
+verified_on = "2026-09-23"
+
+# Tauri 等框架的桌面程序把 WebView2 的“用户数据文件夹”放在 %LOCALAPPDATA%\<程序标识>\EBWebView（本机观察：
+# clash-verge、cc-switch 等都是这样）。里面有网页缓存，也有登录状态和本地存储。
+[[rule]]
+id = "webview2-user-data"
+owner = "用 WebView2 做界面的软件"
+category = "userdata"
+tier = "review"
+kind = "dir"
+owner_from_path = true
+match = ['%LOCALAPPDATA%\*\EBWebView']
+what = "某个软件界面（WebView2）的网页数据：缓存、登录状态、本地存储"
+why = "这个软件用 WebView2（Edge 内核）显示界面，WebView2 把网页缓存、Cookie 和网页自己存的数据都放在这里"
+lose = "缓存部分删了会自己长回来；但登录状态、界面设置、网页自己存的数据也在这里，删了这个软件可能要重新登录或丢掉一些界面设置。"
+how = "manual"
+how_detail = "关掉对应软件后，只删里面的缓存子文件夹（EBWebView\\Default\\Cache、Code Cache、GPUCache，单独标绿）；整个删之前先确认不怕重新登录。"
+refs = ["https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/user-data-folder"]
 verified_on = "2026-09-23"

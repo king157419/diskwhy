@@ -209,7 +209,7 @@ why = "y"
 lose = "l"
 how = "delete"
 how_detail = ""
-refs = []
+refs = ["https://example.com/doc"]
 verified_on = "2026-09-23"
 "#;
 
@@ -231,6 +231,16 @@ fn validation_rejects_bad_rules() {
         ("日期格式错", "verified_on = \"2026-09-23\"", "verified_on = \"2026/9/23\""),
         ("what 为空", "what = \"w\"", "what = \"  \""),
         ("id 非法", "id = \"x\"", "id = \"X Y\""),
+        // 第 1 轮安全评审后新增的 safe 限制
+        ("safe 没有出处也没标本机观察", "refs = [\"https://example.com/doc\"]", "refs = []"),
+        ("safe 指向 .ssh", r"match = ['%LOCALAPPDATA%\x']", r"match = ['%USERPROFILE%\.ssh']"),
+        ("safe 指向代码仓库目录", r"match = ['%LOCALAPPDATA%\x']", r"match = ['%USERPROFILE%\source\repos']"),
+        ("safe 只有变量", r"match = ['%LOCALAPPDATA%\x']", r"match = ['%LOCALAPPDATA%']"),
+        ("safe 只有通配段", r"match = ['%LOCALAPPDATA%\x']", r"match = ['%APPDATA%\*']"),
+        ("safe 的 ** 最后一段不是缓存名", r"match = ['%LOCALAPPDATA%\x']", r"match = ['%APPDATA%\**\Data']"),
+        ("safe 指向聊天数据", r"match = ['%LOCALAPPDATA%\x']", r"match = ['%APPDATA%\Tencent\xwechat_files\cache']"),
+        ("safe 指向网页存储", r"match = ['%LOCALAPPDATA%\x']", r"match = ['%LOCALAPPDATA%\App\Local Storage']"),
+        ("verify 写错", "how = \"delete\"", "how = \"delete\"\nverify = \"whatever\""),
     ];
     for (name, from, to) in cases {
         let t = GOOD.replace(from, to);
@@ -248,7 +258,8 @@ fn validation_rejects_bad_rules() {
     let (rs, errs) = RuleSet::from_sources(&[("t", &missing)], &fake_env());
     assert!(rs.rules.is_empty() && !errs.is_empty(), "缺 lose 字段应加载失败");
     // 未知字段
-    let extra = GOOD.replace("refs = []", "refs = []\nfoo = 1");
+    let extra = GOOD.replace("verified_on = ", "foo = 1\nverified_on = ");
+    assert_ne!(extra, GOOD);
     let (rs, errs) = RuleSet::from_sources(&[("t", &extra)], &fake_env());
     assert!(rs.rules.is_empty() && !errs.is_empty(), "未知字段应加载失败");
 }
@@ -283,7 +294,7 @@ fn required_items_from_plan_are_covered() {
     assert!(r("wsl-distro-vhdx").how_detail.contains("wsl --export") && r("wsl-distro-vhdx").how_detail.contains("wsl --import"));
     check("wechat-files", Tier::Keep, &[How::Migrate]);
     check("qq-files", Tier::Keep, &[How::Migrate]);
-    check("wechat-render-cache", Tier::Safe, &[]);
+    check("wechat-render-cache", Tier::Review, &[]);
     check("wechat-logs", Tier::Safe, &[]);
     check("feishu-update", Tier::Safe, &[]);
     check("feishu-larkshell", Tier::Review, &[]);
@@ -302,7 +313,8 @@ fn required_items_from_plan_are_covered() {
     check("chrome-profile", Tier::Keep, &[]);
     check("edge-profile", Tier::Keep, &[]);
     check("chromium-generic-cache", Tier::Safe, &[]);
-    check("chromium-generic-sw-cache", Tier::Safe, &[]);
+    check("chromium-sw-storage", Tier::Review, &[]);
+    check("jetbrains-caches-dir", Tier::Review, &[How::BuiltinTool]);
     // 开发缓存全家
     for id in ["npm-cache", "pnpm-store", "yarn-cache", "pip-cache", "uv-cache", "cargo-registry", "go-cache", "gradle-cache", "nuget-cache"] {
         assert_eq!(r(id).tier, Tier::Safe, "{id} 应为 safe");
@@ -358,9 +370,9 @@ fn env_expansion_case_and_wildcards() {
     assert!(d.how.contains(&How::Migrate) && d.gain_bytes == 0);
     let w = ex(&t, r"C:\Users\bob\AppData\Local\wsl\{d1f9e0f8-2451-4607-a4db-2cfc50dc641c}\ext4.vhdx", &ctx);
     assert_eq!((rule_id(&w), w.tier), (Some("wsl-distro-vhdx"), Tier::Keep));
-    // ** 通配 + 具体规则优先于上层继承：飞书里的 CacheStorage 是 safe，其余 review
+    // ** 通配 + 具体规则优先于上层继承：飞书里的 CacheStorage 命中通配规则（第 1 轮评审后是 review：网页应用自己存的离线内容）
     let sw = ex(&t, r"C:\Users\bob\AppData\Roaming\LarkShell\aha\users\51af\profile_explorer\Service Worker\CacheStorage", &ctx);
-    assert_eq!((rule_id(&sw), sw.tier), (Some("chromium-generic-sw-cache"), Tier::Safe));
+    assert_eq!((rule_id(&sw), sw.tier), (Some("chromium-sw-storage"), Tier::Review));
     assert!(sw.owner.as_deref().unwrap_or("").contains("LarkShell"), "owner_from_path 应推断出 LarkShell：{:?}", sw.owner);
     let sdk = ex(&t, r"C:\Users\bob\AppData\Roaming\LarkShell\sdk_storage", &ctx);
     assert_eq!((rule_id(&sdk), sdk.tier), (Some("feishu-larkshell"), Tier::Review));
@@ -944,7 +956,7 @@ fn former_unknowns_now_have_rules() {
 fn rule_toml(id: &str, matches: &str, extra: &str) -> String {
     format!(
         "[[rule]]\nid = \"{id}\"\nowner = \"o\"\ncategory = \"cache\"\ntier = \"safe\"\nmatch = [{matches}]\n\
-         what = \"w\"\nwhy = \"y\"\nlose = \"l\"\nhow = \"delete\"\nhow_detail = \"\"\nrefs = []\nverified_on = \"2026-09-23\"\n{extra}\n"
+         what = \"w\"\nwhy = \"y\"\nlose = \"l\"\nhow = \"delete\"\nhow_detail = \"\"\nrefs = []\nobserved_only = true\nverified_on = \"2026-09-23\"\n{extra}\n"
     )
 }
 
@@ -983,7 +995,7 @@ why = "y"
 lose = "l"
 how = "delete"
 how_detail = ""
-refs = []
+refs = ["https://example.com/a"]
 verified_on = "2026-09-23"
 "#),
         ("keep + builtin_tool + 各种根变量", r#"
@@ -1014,6 +1026,7 @@ lose = "l"
 how = "delete"
 how_detail = ""
 refs = []
+observed_only = true
 verified_on = "2026-09-23"
 "#),
     ];
@@ -1199,9 +1212,9 @@ fn b1_listed_items_real_paths() {
         (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Default\Cache", "chrome-cache", Tier::Safe),
         (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Profile 1\Code Cache", "chrome-cache", Tier::Safe),
         (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Default\GPUCache", "chrome-cache", Tier::Safe),
-        (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage", "chrome-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage", "chromium-sw-storage", Tier::Review),
         (r"C:\Users\bob\AppData\Local\Microsoft\Edge\User Data\Default\Cache", "edge-cache", Tier::Safe),
-        (r"C:\Users\bob\AppData\Local\Microsoft\Edge\User Data\Default\Service Worker\ScriptCache", "edge-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Microsoft\Edge\User Data\Default\Service Worker\ScriptCache", "chromium-sw-storage", Tier::Review),
         (r"C:\Users\bob\AppData\Local\Mozilla\Firefox\Profiles\ab12cd.default-release\cache2", "firefox-cache", Tier::Safe),
         (r"C:\Users\bob\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Cache", "chromium-browsers-cache", Tier::Safe),
         (r"C:\Users\bob\AppData\Roaming\SomeApp\GPUCache", "chromium-generic-gpu-cache", Tier::Safe),
@@ -1220,7 +1233,8 @@ fn b1_listed_items_real_paths() {
         (r"C:\Users\bob\AppData\Local\Docker\wsl\disk\docker_data.vhdx", "docker-data-vhdx", Tier::Keep),
         (r"C:\Users\bob\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu_79rhkp1fndgsc\LocalState\ext4.vhdx", "wsl-distro-vhdx", Tier::Keep),
         (r"C:\Users\bob\AppData\Local\Microsoft\VisualStudio", "visual-studio-cache", Tier::Review),
-        (r"C:\Users\bob\AppData\Local\JetBrains\PyCharm2025.2\caches", "jetbrains-caches", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\JetBrains\PyCharm2025.2\caches", "jetbrains-caches-dir", Tier::Review),
+        (r"C:\Users\bob\AppData\Local\JetBrains\PyCharm2025.2\index", "jetbrains-caches", Tier::Safe),
         (r"C:\Users\bob\AppData\Roaming\Code\CachedData", "vscode-family-cached", Tier::Safe),
         (r"C:\Users\bob\AppData\Roaming\Cursor\CachedData", "vscode-family-cached", Tier::Safe),
         (r"C:\Users\bob\AppData\Roaming\Cursor\User", "vscode-family-user", Tier::Keep),
@@ -1229,8 +1243,10 @@ fn b1_listed_items_real_paths() {
     let is_file = |p: &str| [".sys", ".db", ".vhdx"].iter().any(|x| p.ends_with(x));
     // 通用 Chromium 缓存规则要求里面有 index / data_0（when_child），按真实长相放 data_0
     let inner = |p: &str| if p.ends_with("GPUCache") { "data_0" } else { "f.bin" };
-    let entries: Vec<String> =
+    let mut entries: Vec<String> =
         cases.iter().map(|(p, _, _)| if is_file(p) { p.to_string() } else { format!("{p}\\{}", inner(p)) }).collect();
+    // 通配 GPUCache 规则命中后还要过严格核验（第 1 轮评审）：真实的 GPUCache 里 index 和 data_N 都有。
+    entries.push(r"C:\Users\bob\AppData\Roaming\SomeApp\GPUCache\index".to_string());
     let t = tree(&entries.iter().map(|p| (p.as_str(), 1u64)).collect::<Vec<_>>());
     for (p, id, tier) in cases {
         let e = ex(&t, p, &ctx);
@@ -1242,7 +1258,8 @@ fn b1_listed_items_real_paths() {
             assert!(!e.how.contains(&How::Delete) && e.gain_bytes == 0, "{p}");
         }
         if *tier == Tier::Safe {
-            assert_eq!(e.gain_bytes, 1, "{p}");
+            let size = diskwhy_core::view::find_node(&t, p).map(|(_, n)| n.allocated).unwrap();
+            assert_eq!(e.gain_bytes, size, "{p}");
         }
     }
     let q = ctx.rules.by_id("defender-quarantine").unwrap();

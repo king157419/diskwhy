@@ -33,15 +33,13 @@ match = [
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnGraphiteCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnWebGPUCache',
-  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Service Worker\CacheStorage',
-  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Service Worker\ScriptCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\ShaderCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\GrShaderCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\GraphiteDawnCache',
 ]
 what = "Chrome 的网页缓存（图片、脚本、显卡着色器等）"
 why = "打开过的网页先存一份，下次打开更快"
-lose = "不丢书签、密码和历史；删掉后网页第一次打开会慢一点。个别网站离线缓存的内容会重新下载。"
+lose = "不丢书签、密码和历史；删掉后网页第一次打开会慢一点。（网页应用自己存的离线内容在 Service Worker 里，单独列成“需要你判断”，不在这一条里。）"
 how = ["delete", "builtin_tool"]
 how_detail = "关掉 Chrome 后删除；或在 Chrome 的“删除浏览数据”里勾选“缓存的图片和文件”。"
 refs = ["https://support.google.com/chrome/answer/2392709"]
@@ -118,8 +116,6 @@ match = [
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnGraphiteCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnWebGPUCache',
-  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Service Worker\CacheStorage',
-  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Service Worker\ScriptCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\ShaderCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\GrShaderCache',
 ]
@@ -127,8 +123,8 @@ what = "Edge 的网页缓存"
 why = "打开过的网页先存一份，下次打开更快"
 lose = "不丢收藏夹、密码和历史；网页第一次打开会慢一点。"
 how = ["delete", "builtin_tool"]
-how_detail = "关掉 Edge（包括后台运行）后删除；或用 Edge 的“清除浏览数据”。"
-refs = []
+how_detail = "关掉 Edge（包括后台运行）后删除；或用 Edge 的“清除浏览数据”，勾选“缓存的图像和文件”。"
+refs = ["https://support.microsoft.com/en-us/microsoft-edge/view-and-delete-browser-history-in-microsoft-edge-00cf7943-a9e1-975a-a33d-ac10ce454ca4", "https://www.chromium.org/developers/design-documents/network-stack/disk-cache/"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -189,11 +185,9 @@ match = [
   '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Cache',
   '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Code Cache',
   '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\GPUCache',
-  '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Service Worker\CacheStorage',
   '%LOCALAPPDATA%\Vivaldi\User Data\*\Cache',
   '%LOCALAPPDATA%\Vivaldi\User Data\*\Code Cache',
   '%LOCALAPPDATA%\Vivaldi\User Data\*\GPUCache',
-  '%LOCALAPPDATA%\Vivaldi\User Data\*\Service Worker\CacheStorage',
   '%LOCALAPPDATA%\Opera Software\Opera Stable\Cache',
   '%LOCALAPPDATA%\Opera Software\Opera GX Stable\Cache',
 ]
@@ -202,7 +196,7 @@ why = "打开过的网页先存一份，下次打开更快"
 lose = "不丢书签和密码；网页第一次打开会慢一点。"
 how = "delete"
 how_detail = "关掉浏览器后删除，或用浏览器自带的“清除浏览数据”。"
-refs = []
+refs = ["https://www.chromium.org/developers/design-documents/network-stack/disk-cache/"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -264,6 +258,7 @@ tier = "safe"
 owner_from_path = true
 match = ['%APPDATA%\**\Cache', '%LOCALAPPDATA%\**\Cache']
 when_child = ["Cache_Data", "data_0", "data_1"]
+verify = "chromium-disk-cache"
 what = "网页缓存（Chromium 内核程序通用格式）"
 why = "浏览器或 Electron 应用（VS Code、Cursor、Claude、Discord、飞书、QQ 等）显示界面、打开网页时把图片和脚本存一份，下次更快"
 lose = "不丢聊天记录、文档和设置；删掉后程序第一次打开某些页面会慢一点，需要重新加载。"
@@ -280,12 +275,13 @@ tier = "safe"
 owner_from_path = true
 match = ['%APPDATA%\**\Code Cache', '%LOCALAPPDATA%\**\Code Cache', '%APPDATA%\**\CodeCache']
 when_child = ["js", "wasm"]
+verify = "chromium-disk-cache"
 what = "脚本编译缓存（Chromium 内核程序通用）"
 why = "把网页和界面里的 JavaScript 编译结果存下来，启动更快"
 lose = "不丢数据；删掉后程序头一两次启动稍慢。"
 how = "delete"
 how_detail = "退出对应程序后删除。"
-refs = []
+refs = ["https://www.chromium.org/developers/design-documents/network-stack/disk-cache/"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -304,29 +300,32 @@ match = [
   '%APPDATA%\**\ShaderCache', '%LOCALAPPDATA%\**\ShaderCache',
 ]
 when_child = ["index", "data_0"]
+verify = "chromium-disk-cache"
 what = "显卡着色器缓存（Chromium 内核程序通用）"
 why = "程序用显卡画界面时把编译好的着色器存下来"
 lose = "不丢数据；删掉后界面头一次打开可能短暂卡一下。"
 how = "delete"
 how_detail = "退出对应程序后删除。"
-refs = []
+refs = ["https://www.chromium.org/developers/design-documents/network-stack/disk-cache/"]
 verified_on = "2026-09-23"
 
+# 第 1 轮评审后从 safe 拆出来：CacheStorage（Cache API）是网页应用自己管理的存储，不是浏览器的 HTTP 缓存；
+# 离线打开过的网页应用、PWA 和 Electron 应用离线保存的内容都在这里。ScriptCache 是这些网页应用的脚本。
 [[rule]]
-id = "chromium-generic-sw-cache"
-owner = "Chromium / Electron 程序"
+id = "chromium-sw-storage"
+owner = "浏览器 / Chromium 内核程序"
 category = "cache"
-tier = "safe"
+tier = "review"
 owner_from_path = true
 match = [
   '%APPDATA%\**\Service Worker\CacheStorage', '%LOCALAPPDATA%\**\Service Worker\CacheStorage',
   '%APPDATA%\**\Service Worker\ScriptCache', '%LOCALAPPDATA%\**\Service Worker\ScriptCache',
 ]
-what = "网页离线缓存（Service Worker 缓存）"
-why = "网页应用（比如在线文档、网页版工具，以及飞书等 Electron 应用的内置网页）把资源存到本地，下次秒开，有的还能离线用"
-lose = "不丢账号数据（服务器上有）；删掉后这些网页应用第一次打开会重新下载资源，离线状态下暂时打不开。"
+what = "网页应用自己存的离线内容（Service Worker 的 CacheStorage / ScriptCache）"
+why = "网页应用（在线文档、网页版工具、PWA，以及飞书等 Electron 应用里的网页）用 Cache API 把页面、脚本、有时还有离线文章或音频存到本地，下次秒开、没网也能用"
+lose = "账号数据在服务器上的不会丢；但离线打开过的网页应用要联网重新下载，网页应用只存在本机的离线内容（比如离线保存的文章、音频）会丢。"
 how = "delete"
-how_detail = "退出对应程序后删除；程序会按需重新缓存。"
+how_detail = "关掉对应程序后删。"
 refs = ["https://developer.mozilla.org/en-US/docs/Web/API/CacheStorage"]
 verified_on = "2026-09-23"
 
@@ -342,5 +341,5 @@ why = "程序崩溃时记录现场，准备上传给开发者"
 lose = "只是丢掉以前的崩溃记录，不影响使用。"
 how = "delete"
 how_detail = "直接删除即可。"
-refs = []
+refs = ["https://chromium.googlesource.com/crashpad/crashpad/+/HEAD/doc/overview_design.md"]
 verified_on = "2026-09-23"

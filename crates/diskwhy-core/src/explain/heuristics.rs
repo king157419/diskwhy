@@ -40,6 +40,8 @@ const MODEL_MIN_FILE: u64 = 100 * 1024 * 1024;
 
 const MODEL_EXTS: &[&str] = &["safetensors", "gguf", "onnx", "pt", "pth", "bin", "ckpt"];
 const VDISK_EXTS: &[&str] = &["vhdx", "vhd", "vmdk", "qcow2", "avhdx", "vdi"];
+/// 虚拟磁盘扩展名（给汇总里的护栏用）。
+pub const VDISK_EXTS_PUB: &[&str] = VDISK_EXTS;
 const LOG_EXTS: &[&str] = &["log", "etl", "dmp", "mdmp", "hdmp"];
 const INSTALLER_EXTS: &[&str] = &["iso", "msi", "exe", "msix", "msixbundle", "appx"];
 const MEDIA_EXTS: &[&str] = &[
@@ -272,8 +274,40 @@ fn is_chromium_cache_file(name: &str) -> bool {
 }
 
 /// 目录里每一项都是 Chromium 磁盘缓存的标准文件（可以有 `index-dir\the-real-index`），并且有 index 和至少一个数据文件。
-/// 被合并进“其余小文件”的看不到名字——看得到的最大 50 个都合格就算合格；index 被合并掉时去文件系统确认它存在。
+/// 有小文件被合并进“其余小文件”（看不到名字）时，回磁盘把这个文件夹的**全部文件名**读一遍再核
+/// （只读名字，不读内容；读不到就不算合格）。
 fn is_chromium_disk_cache(n: &Node) -> bool {
+    if n.children.iter().any(|c| c.kind == NodeKind::Rest) {
+        return !n.path.is_empty() && disk_names_all_chromium_cache(&n.path);
+    }
+    is_chromium_disk_cache_in_tree(n)
+}
+
+/// 直接读目录核对全部名字：文件都是缓存标准文件名、子文件夹只允许 index-dir，并且有 index 和数据文件。
+fn disk_names_all_chromium_cache(path: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(path) else { return false };
+    let (mut has_index, mut has_data) = (false, false);
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Ok(ft) = e.file_type() else { return false };
+        if ft.is_dir() {
+            if !name.eq_ignore_ascii_case("index-dir") {
+                return false;
+            }
+        } else if is_chromium_cache_file(&name) {
+            if name.eq_ignore_ascii_case("index") {
+                has_index = true;
+            } else {
+                has_data = true;
+            }
+        } else {
+            return false;
+        }
+    }
+    has_index && has_data
+}
+
+fn is_chromium_disk_cache_in_tree(n: &Node) -> bool {
     let (mut has_index, mut has_data, mut has_rest) = (false, false, false);
     for c in &n.children {
         match c.kind {
@@ -303,9 +337,18 @@ fn is_chromium_disk_cache(n: &Node) -> bool {
     has_index && has_data
 }
 
+/// 规则的 `verify = "chromium-disk-cache"`：`**` 通配的 Chromium 缓存规则命中后，用和启发式同样严格的标准再核一遍
+/// （第 1 轮安全评审第 4 条：规则不能比启发式宽松）。
+pub fn verify_chromium_disk_cache(node: &Node, parent: Option<&Node>) -> bool {
+    node.kind == NodeKind::Dir && strict_chromium_cache_node(node, parent).is_some()
+}
+
 /// 签名严格的 Chromium 缓存：返回线索；不够严格返回 None。
 fn strict_chromium_cache(t: &Target) -> Option<String> {
-    let n = t.node;
+    strict_chromium_cache_node(t.node, t.parent)
+}
+
+fn strict_chromium_cache_node(n: &Node, parent: Option<&Node>) -> Option<String> {
     let name = n.name.to_lowercase();
     let real = |c: &&Node| c.kind != NodeKind::Rest;
     if CHROMIUM_CACHE_DIRS.contains(&name.as_str()) && is_chromium_disk_cache(n) {
@@ -346,7 +389,7 @@ fn strict_chromium_cache(t: &Target) -> Option<String> {
         return None;
     }
     if ["js", "wasm", "webui_js"].contains(&name.as_str())
-        && t.parent.is_some_and(|p| p.name.eq_ignore_ascii_case("Code Cache"))
+        && parent.is_some_and(|p| p.name.eq_ignore_ascii_case("Code Cache"))
         && is_chromium_disk_cache(n)
     {
         return Some(format!("在 Code Cache 里，文件夹叫 {}，里面全是 Chromium 磁盘缓存的标准文件", n.name));
@@ -1173,6 +1216,200 @@ fn registry_owner(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
         owner: Some(label),
         clues: vec![format!("文件夹名和注册表里已安装软件的{}对得上", if g.via == "发布者" { "发布者" } else { "名字" })],
     })
+}
+
+// ───────────────────────── 用户数据陷阱（第 1 轮安全评审第 1 条） ─────────────────────────
+//
+// safe 规则大多是“整棵子树都按它说明”（%TEMP%、INetCache……）。以前继承命中后就不再看内容，
+// 于是放在 Temp 里的微信聊天、git 仓库、conda 环境、虚拟磁盘、从压缩包里打开的文档都被标成了可放心清理。
+// 现在 safe 规则覆盖的地方先过一遍下面这些内容签名：命中就不按规则的 safe 算。
+// review 规则只查 keep 级的虚拟磁盘（比如商店版 WSL 的 LocalState，规则给的办法“重置”会清空整个发行版）。
+
+/// Office / WPS / PDF 等文档：出现在缓存 / 临时文件夹里时，可能是用户从压缩包或邮件里直接打开、改过还没另存的副本。
+pub const DOC_EXTS: &[&str] =
+    &["doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx", "pdf", "wps", "et", "dps", "odt", "ods", "odp", "rtf", "pages", "numbers", "key"];
+/// 版本库标记：有它就是一个代码仓库，可能有没提交的改动。
+const VCS_MARKERS: &[&str] = &[".git", ".svn", ".hg"];
+/// 往下找陷阱时最多看多少个节点。
+const TRAP_VISIT: usize = 30_000;
+
+/// 一处看起来是用户数据的地方。
+#[derive(Debug, Clone)]
+pub struct Trap {
+    /// chat-data / conda-env / virtual-disk / source-repo / user-document
+    pub name: &'static str,
+    pub tier: Tier,
+    pub path: String,
+    pub bytes: u64,
+}
+
+fn in_program_files(path: &str, ctx: &ExplainCtx) -> bool {
+    let lower = split_lower(path);
+    ["ProgramFiles", "ProgramFiles(x86)"].iter().any(|v| ctx.env.get(v).is_some_and(|base| under(&lower, &split_lower(base)) || lower == split_lower(base)))
+}
+
+fn path_has_chat_dir(path: &str, ctx: &ExplainCtx) -> bool {
+    segments(path).iter().any(|s| {
+        let l = s.to_lowercase();
+        CHAT_DATA_DIRS.iter().any(|(d, _)| *d == l)
+    }) && !in_program_files(path, ctx)
+}
+
+/// 只看这一项本身（不往下找）是不是用户数据。`rule_tier` 是覆盖它的规则的档位：
+/// safe 查全部；review 只查虚拟磁盘文件；keep 不查。
+pub fn trap_here(path: &str, node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> Option<Trap> {
+    let mk = |name, tier| Some(Trap { name, tier, path: path.trim_end_matches('\\').to_string(), bytes: node.allocated });
+    match rule_tier {
+        Tier::Keep => None,
+        Tier::Review => match node.kind {
+            NodeKind::File if VDISK_EXTS.contains(&ext_of(&node.name).as_str()) => mk("virtual-disk", Tier::Keep),
+            _ => None,
+        },
+        Tier::Safe => match node.kind {
+            NodeKind::Rest => None,
+            _ if path_has_chat_dir(path, ctx) => mk("chat-data", Tier::Keep),
+            NodeKind::File => {
+                let e = ext_of(&node.name);
+                if VDISK_EXTS.contains(&e.as_str()) {
+                    mk("virtual-disk", Tier::Keep)
+                } else if DOC_EXTS.contains(&e.as_str()) {
+                    mk("user-document", Tier::Review)
+                } else {
+                    None
+                }
+            }
+            NodeKind::Dir => {
+                if has_child(node, "conda-meta") {
+                    mk("conda-env", Tier::Keep)
+                } else if VCS_MARKERS.iter().any(|m| has_child(node, m)) {
+                    mk("source-repo", Tier::Review)
+                } else {
+                    None
+                }
+            }
+        },
+    }
+}
+
+/// 往下找（不含自己）所有陷阱。找到的文件夹陷阱不再往里走。返回 (陷阱列表, 是否只看了一部分)。
+pub fn traps_below(node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> (Vec<Trap>, bool) {
+    let mut out = Vec::new();
+    if rule_tier == Tier::Keep || node.kind != NodeKind::Dir {
+        return (out, false);
+    }
+    let mut visited = 0usize;
+    let mut stack: Vec<&Node> = vec![node];
+    while let Some(d) = stack.pop() {
+        for c in &d.children {
+            visited += 1;
+            if visited > TRAP_VISIT {
+                return (out, true);
+            }
+            let p = if c.kind == NodeKind::Dir && !c.path.is_empty() {
+                c.path.clone()
+            } else {
+                format!("{}\\{}", d.path.trim_end_matches('\\'), c.name)
+            };
+            if let Some(t) = trap_here(&p, c, rule_tier, ctx) {
+                out.push(t);
+            } else if c.kind == NodeKind::Dir {
+                stack.push(c);
+            }
+        }
+    }
+    (out, false)
+}
+
+fn trap_hint(tr: &Trap, ctx: &ExplainCtx, rule_what: &str) -> Hint {
+    let clue = format!("上层按规则是“{rule_what}”，但这里看起来是你的数据，所以不按那条规则算");
+    match tr.name {
+        "chat-data" => {
+            let app = segments(&tr.path)
+                .iter()
+                .find_map(|s| {
+                    let l = s.to_lowercase();
+                    CHAT_DATA_DIRS.iter().find(|(d, _)| *d == l).map(|(_, a)| *a)
+                })
+                .unwrap_or("聊天软件");
+            Hint {
+                name: "chat-data",
+                tier: Tier::Keep,
+                category: Category::Userdata,
+                what: format!("{app}的聊天数据（放在了缓存 / 临时文件夹里）"),
+                why: format!("{app}的数据文件夹被放到了这里（可能是改过存储位置，或者是别的工具解压 / 备份到这里的）"),
+                lose: "删了聊天记录和收到的文件都会丢，手机上没有、也没有漫游的就再也找不回来。".into(),
+                how: vec![How::Migrate],
+                how_detail: format!("先在{app}里确认它现在用的存储位置是不是这里；要搬就在{app}的“设置 → 存储空间 / 文件管理”里改位置，别在资源管理器里直接删。"),
+                confidence: 0.7,
+                owner: Some(app.to_string()),
+                clues: vec![clue, format!("路径里有聊天软件的数据文件夹名（{}）", tr.path)],
+            }
+        }
+        "conda-env" => Hint {
+            name: "conda-env",
+            tier: Tier::Keep,
+            category: Category::Userdata,
+            what: "一个 conda 环境（放在了缓存 / 临时文件夹里）".into(),
+            why: "有人（或某个工具）在这里建了 conda 环境；里面有 conda-meta，说明是一套完整的环境".into(),
+            lose: "删了环境里的库和配置都没了，用它的项目跑不起来，要照原样重建。".into(),
+            how: vec![How::Manual],
+            how_detail: "先确认有没有项目在用它（conda env list 看路径）；不用了用 conda env remove -p 这个路径 删掉，要留着就搬到正式的位置。".into(),
+            confidence: 0.7,
+            owner: Some("conda（Anaconda / Miniconda）".into()),
+            clues: vec![clue, "里面有 conda-meta（conda 环境的标志）".into()],
+        },
+        "virtual-disk" => Hint {
+            name: "virtual-disk",
+            tier: Tier::Keep,
+            category: Category::Vm,
+            what: "虚拟磁盘文件（一整台虚拟机或 Linux 子系统的“硬盘”）".into(),
+            why: "虚拟机、WSL、Docker 等把整个系统和里面的数据装在这种文件里".into(),
+            lose: "删了等于把那台虚拟机 / 子系统连同里面所有文件一起删掉，无法恢复。".into(),
+            how: vec![How::Migrate],
+            how_detail: "在对应软件里把它迁到别的盘（WSL 用 wsl --export / --import，Docker Desktop 在设置里改磁盘位置，Hyper-V 用“移动”向导）；不用了就在对应软件里删除那台虚拟机。商店版 Linux 发行版不要用“重置”，重置会清空整个发行版。".into(),
+            confidence: 0.7,
+            owner: None,
+            clues: vec![clue, format!("虚拟磁盘文件：{}", tr.path)],
+        },
+        "source-repo" => Hint {
+            name: "source-repo",
+            tier: Tier::Review,
+            category: Category::Userdata,
+            what: "一个代码仓库（里面有 .git / .svn / .hg）".into(),
+            why: "有人把项目克隆或解压到了这里；也可能是某个安装工具临时下载的源码".into(),
+            lose: "如果里面有没提交、没推送的改动，删了就找不回来；如果只是工具临时下载的源码，删了没影响。".into(),
+            how: vec![How::Manual],
+            how_detail: "先在里面运行 git status 看有没有没提交的改动，确认没用了再删。".into(),
+            confidence: 0.6,
+            owner: None,
+            clues: vec![clue, "里面有版本库标记（.git / .svn / .hg）".into()],
+        },
+        _ => {
+            let name = tr.path.rsplit('\\').next().unwrap_or(&tr.path).to_string();
+            let _ = ctx;
+            Hint {
+                name: "user-document",
+                tier: Tier::Review,
+                category: Category::Userdata,
+                what: format!("一份文档「{name}」（在缓存 / 临时文件夹里）"),
+                why: "从压缩包、邮件或聊天里直接打开文档时，程序会先把它放到临时文件夹里".into(),
+                lose: "如果你打开后改过、还没另存到别处，改过的这一份只在这里，删了就没了。".into(),
+                how: vec![How::Manual],
+                how_detail: "打开看一眼：是你要的就另存到“文档”里；确认没用了再删。".into(),
+                confidence: 0.5,
+                owner: None,
+                clues: vec![clue],
+            }
+        }
+    }
+}
+
+/// 把一处陷阱变成解释（启发式来源，不是 safe）。
+pub fn trap_explanation(tr: &Trap, t: &Target, rule_what: &str, ctx: &ExplainCtx) -> Explanation {
+    let h = trap_hint(tr, ctx, rule_what);
+    let mut e = finish(h, t, &SubtreeStats::default(), ctx);
+    e.notes.insert(0, format!("上层按规则是可以清理的地方（{rule_what}），但 DiskWhy 看了一眼内容，这里像是你的数据，所以没有按那条规则标成可清理。"));
+    e
 }
 
 // ───────────────────────── 未知 ─────────────────────────

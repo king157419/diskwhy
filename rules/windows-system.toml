@@ -262,10 +262,31 @@ tier = "safe"
 match = ['%TEMP%', '%LOCALAPPDATA%\Temp']
 what = "你账户下的临时文件"
 why = "软件运行、解压、安装时放中间文件的地方，本该用完就删，但很多软件会遗留"
-lose = "一般不丢数据；正在运行的程序可能还在用其中一部分（会删不掉，跳过即可）。刚下载还没安装完的安装包也可能在这里。"
+lose = "一般不丢数据；正在运行的程序可能还在用其中一部分（会删不掉，跳过即可）。刚下载还没安装完的安装包也可能在这里。例外：从压缩包、邮件里直接打开并改过的文档也在这里，DiskWhy 会把这类东西单独标出来，别跟着一起删。"
 how = ["delete", "builtin_tool"]
 how_detail = "关掉不用的程序后删除里面的内容；或用“设置 > 系统 > 存储 > 临时文件”。"
 refs = ["https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32"]
+verified_on = "2026-09-23"
+
+# 第 1 轮安全评审第 3 条：Temp 里“从压缩包 / 聊天里直接打开的文件”可能是改过还没另存的唯一副本。
+# 这几种文件夹名是解压工具打开文件时建的（Rar$EX / Rar$DI：WinRAR；7zO：7-Zip；Temp1_xxx.zip：Windows 自带的压缩文件夹）。
+# 名字规律来自本机和常见解压工具的行为，没找到官方文档写明，所以只标“需要你判断”。
+[[rule]]
+id = "temp-opened-from-archive"
+owner = "解压软件（WinRAR / 7-Zip / Windows 压缩文件夹）"
+category = "userdata"
+tier = "review"
+match = [
+  '%TEMP%\Rar$EX*', '%TEMP%\Rar$DI*', '%TEMP%\7zO*', '%TEMP%\Temp?_*',
+  '%LOCALAPPDATA%\Temp\Rar$EX*', '%LOCALAPPDATA%\Temp\Rar$DI*', '%LOCALAPPDATA%\Temp\7zO*', '%LOCALAPPDATA%\Temp\Temp?_*',
+]
+kind = "dir"
+what = "从压缩包里直接打开的文件（解压软件临时放在这里）"
+why = "在压缩包里双击打开文档、图片时，解压软件先把它解到临时文件夹再打开"
+lose = "如果你打开后改过、保存时存在了原地，改过的这一份只在这里，删了就没了；没改过的删了没影响（压缩包里还有）。"
+how = "manual"
+how_detail = "点进去看看：有你改过的文档就先另存到“文档”里，其余的可以删。"
+refs = []
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -429,7 +450,7 @@ why = "资源管理器把图片、视频的缩略图存下来，打开文件夹�
 lose = "不丢数据；删掉后第一次打开图片多的文件夹会慢一点，缩略图重新生成。"
 how = ["builtin_tool", "delete"]
 how_detail = "用“磁盘清理”勾选“缩略图”最省事（这些文件被资源管理器占用，手动删常常删不掉）。"
-refs = []
+refs = ["https://support.microsoft.com/en-us/windows/disk-cleanup-in-windows-8a96ff42-5751-39ad-23d6-434b4d5b9a68"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -440,9 +461,23 @@ tier = "safe"
 match = ['%LOCALAPPDATA%\Microsoft\Windows\INetCache']
 what = "旧版 IE 内核的网页缓存"
 why = "用到老式网页控件的程序会把网页文件缓存到这里"
-lose = "不丢数据，网页下次重新下载。"
+lose = "网页缓存删了不丢数据，下次重新下载。例外：Outlook 打开附件时放在 Content.Outlook 里的副本单独列成“需要你判断”。"
 how = ["builtin_tool", "delete"]
 how_detail = "“磁盘清理”勾选“Internet 临时文件”，或直接删里面的内容。"
+refs = ["https://support.microsoft.com/en-us/windows/disk-cleanup-in-windows-8a96ff42-5751-39ad-23d6-434b4d5b9a68"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "outlook-attachment-temp"
+owner = "Outlook（经典版）"
+category = "userdata"
+tier = "review"
+match = ['%LOCALAPPDATA%\Microsoft\Windows\INetCache\Content.Outlook']
+what = "Outlook 打开邮件附件时放的临时副本"
+why = "在经典版 Outlook 里双击打开附件，Outlook 先把附件存到这个隐藏文件夹再打开"
+lose = "如果你打开附件后改过、直接点了保存，改过的那一份只在这里（邮件里的还是原样），删了就没了；没改过的删了没影响。"
+how = "manual"
+how_detail = "先关掉 Outlook，点进去看看有没有你改过的文档，有就另存到“文档”里，其余的可以删。"
 refs = []
 verified_on = "2026-09-23"
 
@@ -458,6 +493,7 @@ lose = "不丢数据；删掉后游戏头几次加载可能慢一点或短暂卡
 how = ["builtin_tool", "delete"]
 how_detail = "“磁盘清理”勾选“DirectX 着色器缓存”，或关掉游戏后直接删。"
 refs = []
+observed_only = true
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -471,7 +507,7 @@ why = "程序崩溃后 Windows 保存现场，准备发给微软或开发者分�
 lose = "只是丢掉以前崩溃的诊断记录，不影响任何程序使用。"
 how = ["builtin_tool", "delete"]
 how_detail = "“设置 > 系统 > 存储 > 临时文件”里勾选“Windows 错误报告”，或直接删除。"
-refs = []
+refs = ["https://learn.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -485,7 +521,7 @@ why = "系统崩溃时把内存内容存下来，用于排查原因"
 lose = "只是丢掉排查蓝屏的线索；如果你正在找人分析蓝屏原因，先别删。"
 how = ["builtin_tool", "delete"]
 how_detail = "“磁盘清理 > 清理系统文件”勾选“系统错误内存转储文件”；手动删需要管理员权限。"
-refs = []
+refs = ["https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/memory-dump-file-options"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -586,7 +622,44 @@ why = "应用运行时放临时文件或网页缓存的地方"
 lose = "不丢数据；应用正在运行时部分文件删不掉。"
 how = "delete"
 how_detail = "关掉对应应用后删除里面的内容。"
-refs = []
+refs = ["https://learn.microsoft.com/en-us/windows/apps/develop/data/store-and-retrieve-app-data"]
+verified_on = "2026-09-23"
+
+# 第 1 轮安全评审第 8 条：商店版 Linux 发行版（Ubuntu 等）的整个系统盘 ext4.vhdx 在 LocalState 里。
+# 上层 store-app-package 给的办法是“重置”，对 WSL 发行版来说重置 = 清空整个 Linux，所以这一层单独标 keep。
+[[rule]]
+id = "store-wsl-distro-state"
+owner = "WSL（商店版 Linux 发行版）"
+category = "vm"
+tier = "keep"
+kind = "dir"
+match = ['%LOCALAPPDATA%\Packages\*\LocalState']
+when_child = ["ext4.vhdx"]
+owner_from_path = true
+what = "商店版 Linux 发行版（WSL）的整个系统盘所在的文件夹"
+why = "从 Microsoft Store 装的 Ubuntu 等发行版，把整个 Linux 系统和你在里面的文件都放在这里的 ext4.vhdx 里"
+lose = "删了或在“设置 > 应用”里点“重置”，整个 Linux 连同里面的代码、数据都会没了，无法恢复。"
+how = "migrate"
+how_detail = "要腾 C 盘就把发行版迁到别的盘：WSL 2.3.11 及以上（在 PowerShell 里运行 wsl --version 查看）可以用 wsl --manage 发行版名 --move D:\\WSL\\发行版名 一步搬走；旧版本分几步：1）wsl --export 发行版名 D:\\backup\\distro.tar 导出；2）确认导出的文件大小正常、目标盘剩余空间够；3）wsl --import 新名字 D:\\WSL\\新名字 D:\\backup\\distro.tar 导入并进去确认文件都在；4）最后才 wsl --unregister 旧发行版（这一步会删掉 C 盘上的旧系统）。千万别用“重置”。"
+refs = ["https://learn.microsoft.com/en-us/windows/wsl/basic-commands", "https://github.com/microsoft/WSL/releases/tag/2.3.11"]
+verified_on = "2026-09-23"
+
+# 第 1 轮评审（产品）第 1 条：LocalCache\Local 这一层本身。
+[[rule]]
+id = "store-app-sandbox-appdata"
+owner = "Microsoft Store 应用（沙箱）"
+category = "userdata"
+tier = "review"
+scope = "self"
+kind = "dir"
+owner_from_path = true
+match = ['%LOCALAPPDATA%\Packages\*\LocalCache\Local', '%LOCALAPPDATA%\Packages\*\LocalCache\Roaming', '%LOCALAPPDATA%\Packages\*\LocalCache\LocalLow']
+what = "商店应用沙箱：这个应用以及它启动的程序写到 AppData 的东西，被 Windows 挪到了这里"
+why = "打包成 MSIX 的桌面应用（以及它启动的命令行工具，比如 pip、git、编译器）在 AppData 里新建的文件，Windows 会重定向到这个应用自己的文件夹，程序自己看到的还是原来的 AppData 位置"
+lose = "这一层本身不是某一样东西，里面每个文件夹要按它原本的位置分别看：有的是缓存（能删），有的是别的程序的数据。DiskWhy 会按原位置逐个说明。"
+how = "none"
+how_detail = "点进去逐个看；卸载这个应用时 Windows 会把这里一起删掉。"
+refs = ["https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes"]
 verified_on = "2026-09-23"
 
 [[rule]]
@@ -851,4 +924,138 @@ lose = "不要手动删（系统服务在用）；想清掉请用系统设置。
 how = "builtin_tool"
 how_detail = "“设置 > 隐私和安全性 > 诊断和反馈 > 删除诊断数据”。"
 refs = []
+verified_on = "2026-09-23"
+
+# ───────── 第 1 轮评审后补的常见文件夹（C 盘根目录、AppData\Local 里常见的小文件夹）─────────
+
+[[rule]]
+id = "system-drive-temp-dirs"
+owner = "你自己或某个安装程序"
+category = "userdata"
+tier = "review"
+kind = "dir"
+match = ['%SystemDrive%\Temp', '%SystemDrive%\tmp']
+what = "C 盘根目录下的临时文件夹（不是 Windows 自己的 Temp）"
+why = "Windows 自己的临时文件夹在 Windows\\Temp 和 AppData\\Local\\Temp；C:\\Temp、C:\\tmp 通常是某个安装程序、驱动包或者你自己建来临时放东西的"
+lose = "里面是什么要看是谁放的：可能是装完就没用的安装文件，也可能是你自己放的东西。"
+how = "manual"
+how_detail = "点进去逐个看，认得出是装完的安装包、驱动解压文件的可以删，认不出的先留着。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "perflogs"
+owner = "Windows 性能监视器"
+category = "log"
+tier = "keep"
+kind = "dir"
+match = ['%SystemDrive%\PerfLogs']
+what = "Windows 自带的性能日志文件夹（通常是空的）"
+why = "“性能监视器”收集性能数据时默认存到这里，系统安装时就建好了"
+lose = "一般几乎不占空间；普通权限打不开是正常的。文件夹本身别删。"
+how = "none"
+how_detail = "不用管。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "inetpub"
+owner = "Windows（IIS / 安全更新）"
+category = "system"
+tier = "keep"
+kind = "dir"
+match = ['%SystemDrive%\inetpub']
+what = "IIS 网站服务的文件夹；没装 IIS 时是 2025 年 4 月安全更新建的空文件夹"
+why = "装了 IIS（Windows 自带的网站服务器）时放网站文件；KB5055523 及以后的更新会特意建这个文件夹作为安全防护"
+lose = "微软明确说这个文件夹不要删（不管有没有启用 IIS），删了会削弱那次安全更新的防护。空的时候不占空间。"
+how = "none"
+how_detail = "不用管。"
+refs = ["https://support.microsoft.com/en-us/topic/april-8-2025-kb5055523-os-build-26100-3775-348facce-4988-4c6a-8cb9-50cab59fd385"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "legacy-iconcache-db"
+owner = "Windows 资源管理器"
+category = "cache"
+tier = "review"
+kind = "file"
+match = ['%LOCALAPPDATA%\IconCache.db']
+what = "旧式的图标缓存文件"
+why = "资源管理器把程序图标存一份，打开文件夹时显示更快；新版 Windows 主要用 Explorer 文件夹里的 iconcache_*.db"
+lose = "删了图标会重新生成，期间可能短暂显示成白图标；资源管理器开着时一般删不掉。通常只有几 MB，不值得专门清。"
+how = "builtin_tool"
+how_detail = "用“磁盘清理”勾选“缩略图”；不建议手动删。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "connected-devices-platform"
+owner = "Windows（跨设备功能）"
+category = "system"
+tier = "keep"
+match = ['%LOCALAPPDATA%\ConnectedDevicesPlatform']
+what = "Windows 跨设备功能（手机连接、跨设备继续、剪贴板同步等）的本机数据"
+why = "Windows 的“连接设备平台”服务记录你的设备和账号信息"
+lose = "一般只有几 MB；删了跨设备的配对和同步可能要重新设置。"
+how = "none"
+how_detail = "不用管。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "uac-virtualstore"
+owner = "Windows（UAC 文件虚拟化）"
+category = "userdata"
+tier = "keep"
+match = ['%LOCALAPPDATA%\VirtualStore']
+what = "老程序以为写进了 Program Files / Windows 的文件，其实被 Windows 放在了这里"
+why = "老式程序没有管理员权限却要往 Program Files 里写配置或存档时，Windows 把这些写入悄悄转到这里，程序自己看不出区别"
+lose = "里面可能是某个老程序的设置、存档或数据；删了那个程序会以为文件丢了。通常是空的。"
+how = "manual"
+how_detail = "点进去看看是哪个程序的；那个程序已经卸载了才考虑删。"
+refs = ["https://learn.microsoft.com/en-us/archive/blogs/mrsnrub/uac-virtualization-allowing-standard-users-to-update-a-system-protected-area"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "onedrive-local-cache"
+owner = "OneDrive"
+category = "cache"
+tier = "review"
+match = ['%LOCALAPPDATA%\OneDrive']
+what = "OneDrive 客户端在本机的缓存文件夹"
+why = "本机这里只有一个 cache 子文件夹；OneDrive 的程序本体在 AppData\\Local\\Microsoft\\OneDrive，同步的文件在你的 OneDrive 文件夹里"
+lose = "不是你同步的文件本身；但我没找到微软对这个文件夹的说明，不确定删了 OneDrive 会不会要重新同步或重新登录。"
+how = "manual"
+how_detail = "一般很小，不用管；要清就先在托盘里退出 OneDrive。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "pip-root"
+owner = "pip（Python）"
+category = "cache"
+tier = "review"
+scope = "self"
+match = ['%LOCALAPPDATA%\pip']
+what = "pip 的本机文件夹（主要是里面的 cache）"
+why = "pip 装库时下载的文件缓存在里面的 cache 子文件夹"
+lose = "这一层本身不用管，里面的 cache 可以放心清（单独标绿）。"
+how = "none"
+how_detail = "点进去看 cache。"
+refs = ["https://pip.pypa.io/en/stable/topics/caching/"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "yarn-root"
+owner = "Yarn"
+category = "cache"
+tier = "review"
+scope = "self"
+match = ['%LOCALAPPDATA%\Yarn']
+what = "Yarn 的本机文件夹（Cache 是下载缓存，bin 是全局装的命令）"
+why = "Yarn 装依赖时把包缓存在 Cache 里；yarn global add 装的命令放在 bin 里"
+lose = "这一层本身不用管：Cache 可以放心清（单独标绿），bin 里是你全局装的命令，删了那些命令就没了。"
+how = "none"
+how_detail = "点进去看。"
+refs = ["https://classic.yarnpkg.com/en/docs/cli/cache"]
 verified_on = "2026-09-23"

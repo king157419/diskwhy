@@ -98,6 +98,14 @@ pub struct RuleDef {
     pub when_child: Vec<String>,
     #[serde(default)]
     pub owner_from_path: bool,
+    /// safe 规则没有找到官方出处、只在本机观察过时写 `true`（界面上标“本机观察”）。
+    /// safe 规则必须有 refs 或这一项为 true（第 1 轮安全评审第 12 条）。
+    #[serde(default)]
+    pub observed_only: bool,
+    /// 命中后再按内容核一遍：目前只有 `"chromium-disk-cache"`（文件夹名和每个文件名都得是 Chromium
+    /// 磁盘缓存的标准格式，否则降为 review）。给 `**` 通配的 Chromium 缓存规则用。
+    #[serde(default)]
+    pub verify: Option<String>,
 }
 
 impl RuleDef {
@@ -135,6 +143,8 @@ pub struct Rule {
     pub kind: KindFilter,
     pub when_child: Vec<String>,
     pub owner_from_path: bool,
+    pub observed_only: bool,
+    pub verify: Option<String>,
 }
 
 /// 规则集合 + 展平的已编译模式表。
@@ -153,6 +163,95 @@ pub struct InheritedHit {
 }
 
 const PROTECTED_UNDER_PROFILE: &[&str] = &["desktop", "documents", "pictures", "videos", "music", "downloads"];
+
+/// safe 档的模式里不许出现的段名（小写，第 1 轮安全评审第 7 条）：凭据、代码仓库、聊天数据、网页存储等。
+/// 这些地方就算里面有缓存，也应该写更具体的规则，而不是把整段标成可放心清理。
+pub const SAFE_DENY_SEGMENTS: &[&str] = &[
+    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".git", ".svn", ".hg", "source", "repos", "projects",
+    "saved games", "contacts", "favorites", "links", "tdata", "wechat files", "xwechat_files", "tencent files", "wxwork",
+    "db_storage", "msg", "local storage", "session storage", "indexeddb", "databases", "login data", "cookies",
+    "network", "sync data", "extensions", "user", "localstate", "roamingstate", "documents", "desktop", "pictures",
+    "videos", "music", "downloads",
+];
+
+/// `**` 通配的 safe 模式允许的最后一段（已知的缓存文件夹名，小写）。没有 `when_child` 时最后一段必须是其中之一。
+pub const KNOWN_CACHE_DIR_NAMES: &[&str] = &[
+    "cache", "code cache", "codecache", "gpucache", "dawncache", "dawngraphitecache", "dawnwebgpucache", "grshadercache",
+    "graphitedawncache", "shadercache", "scriptcache", "crashpad", "crash reports",
+];
+
+/// safe 模式的静态额外检查（段名黑名单、变量后面至少一段写死的名字、`**` 的限制）。返回问题列表。
+fn safe_pattern_problems(raw: &str, has_when_child: bool) -> Vec<String> {
+    let mut e = Vec::new();
+    let segs = split_lower(raw);
+    let after: &[String] = if segs.len() > 1 { &segs[1..] } else { &[] };
+    for s in after {
+        let bare = s.trim_matches('*');
+        if SAFE_DENY_SEGMENTS.contains(&s.as_str()) || (s.contains('*') && bare.ends_with("projects")) {
+            e.push(format!("safe 档的模式 `{raw}` 含有不该标成可放心清理的一段「{s}」（凭据 / 代码 / 聊天记录 / 网页存储一类）"));
+        }
+    }
+    let is_temp_itself = segs.len() == 1 && segs[0] == "%temp%";
+    let has_literal = after.iter().any(|s| !s.contains('*') && !s.contains('?'));
+    if !is_temp_itself && !has_literal && !(has_when_child && !after.is_empty()) {
+        e.push(format!("safe 档的模式 `{raw}` 在变量后面至少要有一段写死的文件夹名（只有通配时必须配 when_child）"));
+    }
+    if after.iter().any(|s| s == "**") && !has_when_child {
+        let last = after.last().map(String::as_str).unwrap_or("");
+        if !KNOWN_CACHE_DIR_NAMES.contains(&last) {
+            e.push(format!("safe 档的 ** 模式 `{raw}` 没有 when_child，最后一段也不是已知的缓存文件夹名"));
+        }
+    }
+    e
+}
+
+/// safe 模式展开后的位置检查（取决于本机环境变量，第 1 轮安全评审第 2 条）。返回 Some(原因) 时跳过这个模式。
+///
+/// - 展开后只有 1~2 段（盘根或盘根下一层）；
+/// - 模式能匹配到用户目录、Windows、Program Files、ProgramData、AppData、公共用户目录、个人文件夹本身或它们的上层；
+/// - `%TEMP%` 开头但本机 TEMP 的最后一段不叫 Temp / Tmp（有人把 TEMP 设成了 `D:\` 或用户目录）。
+pub fn safe_location_problem(raw: &str, compiled: &Pattern, env: &EnvMap) -> Option<String> {
+    if compiled.segs.len() <= 2 {
+        return Some(format!("展开后是「{}」，离盘根太近", compiled.expanded));
+    }
+    let mut roots: Vec<(String, String)> = Vec::new();
+    for v in [
+        "USERPROFILE",
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PUBLIC",
+        "OneDrive",
+        "OneDriveConsumer",
+        "OneDriveCommercial",
+    ] {
+        if let Some(p) = env.get(v) {
+            roots.push((format!("%{v}%"), p.to_string()));
+        }
+    }
+    if let Some(home) = env.get("USERPROFILE") {
+        for d in PROTECTED_UNDER_PROFILE {
+            roots.push((format!("%USERPROFILE%\\{d}"), format!("{home}\\{d}")));
+        }
+    }
+    for (name, p) in &roots {
+        let r = split_lower(p);
+        if (1..=r.len()).any(|k| compiled.matches(&r[..k])) {
+            return Some(format!("展开后是「{}」，会把 {name}（{p}）本身或它的上层当成可放心清理", compiled.expanded));
+        }
+    }
+    if split_lower(raw).first().is_some_and(|f| f == "%temp%") {
+        let temp = env.get("TEMP").unwrap_or("");
+        let last = split_lower(temp).last().cloned().unwrap_or_default();
+        if last != "temp" && last != "tmp" {
+            return Some(format!("的 TEMP 是「{temp}」，最后一段不叫 Temp / Tmp，不像专门的临时文件夹"));
+        }
+    }
+    None
+}
 
 /// 某个 safe 模式是否会落到个人文件夹里（按原始模式静态判断）。
 fn safe_pattern_hits_personal(raw: &str) -> bool {
@@ -243,6 +342,17 @@ pub fn validate(def: &RuleDef, seen_ids: &mut HashSet<String>) -> Vec<String> {
         }
         if def.tier == Tier::Safe && safe_pattern_hits_personal(p) {
             e.push(format!("safe 档的模式 `{p}` 落在了桌面/文档/图片/视频/音乐/下载/OneDrive 等个人文件夹下"));
+        }
+        if def.tier == Tier::Safe {
+            e.extend(safe_pattern_problems(p, !def.when_child.is_empty()));
+        }
+    }
+    if def.tier == Tier::Safe && def.refs.is_empty() && !def.observed_only {
+        e.push("safe 档必须写 refs（出处），或者明确标 observed_only = true（只在本机观察过）".into());
+    }
+    if let Some(v) = &def.verify {
+        if v != "chromium-disk-cache" {
+            e.push(format!("verify `{v}` 不认识（目前只有 chromium-disk-cache）"));
         }
     }
     e
@@ -376,13 +486,18 @@ impl RuleSet {
                 };
                 errors.extend(dup.warnings.into_iter().map(|w| format!("[{group}] {w}")));
                 seen_patterns.record(def.id.trim(), dup.raw_keys, dup.exp_keys);
-                self.push(def, group, env, &dup.skip);
+                let id = def.id.trim().to_string();
+                for w in self.push(def, group, env, &dup.skip) {
+                    errors.push(format!("[{group}] 规则 `{id}`：{w}"));
+                }
             }
         }
         errors
     }
 
-    fn push(&mut self, def: RuleDef, group: &str, env: &EnvMap, skip: &[usize]) {
+    /// 加入一条已校验的规则，返回运行时警告（safe 模式展开后位置不对、被跳过的）。
+    fn push(&mut self, def: RuleDef, group: &str, env: &EnvMap, skip: &[usize]) -> Vec<String> {
+        let mut warnings = Vec::new();
         let idx = self.rules.len();
         let how = def.how();
         let rule = Rule {
@@ -403,6 +518,8 @@ impl RuleSet {
             kind: def.kind,
             when_child: def.when_child,
             owner_from_path: def.owner_from_path,
+            observed_only: def.observed_only,
+            verify: def.verify,
         };
         // 环境变量在本机不存在的模式直接跳过（比如 32 位系统没有 ProgramFiles(x86)）；
         // 展开后和别的规则撞车的模式也跳过（见 duplicate_check）。
@@ -411,10 +528,18 @@ impl RuleSet {
                 continue;
             }
             if let Ok(expanded) = env.expand(raw) {
-                self.patterns.push((idx, Pattern::compile(&expanded)));
+                let compiled = Pattern::compile(&expanded);
+                if rule.tier == Tier::Safe {
+                    if let Some(why) = safe_location_problem(raw, &compiled, env) {
+                        warnings.push(format!("safe 模式 `{raw}` 在本机{why}；为安全起见跳过这个模式"));
+                        continue;
+                    }
+                }
+                self.patterns.push((idx, compiled));
             }
         }
         self.rules.push(rule);
+        warnings
     }
 
     /// 加载用户自定义规则目录（`*.toml`）。不存在就什么都不做。返回警告。

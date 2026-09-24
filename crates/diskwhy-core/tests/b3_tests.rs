@@ -5,7 +5,7 @@ use diskwhy_core::explain::env::EnvMap;
 use diskwhy_core::explain::llm::LlmSettings;
 use diskwhy_core::explain::registry::RegistrySnapshot;
 use diskwhy_core::explain::rules::RuleSet;
-use diskwhy_core::explain::{msix_redirect, ExplainCtx, Explanation, Source, Tier};
+use diskwhy_core::explain::{msix_redirect, ExplainCtx, Explanation, Source, Tier, tier_summary};
 use diskwhy_core::view;
 use diskwhy_core::view::{explain_path, export_tree, outer_ancestors, subtree_complete, truncate_tree};
 use diskwhy_core::*;
@@ -257,10 +257,22 @@ fn b3_msix_sandbox_redirect_and_standalone_cargo_target() {
         assert!(e.notes.iter().any(|n| n.contains("沙箱")), "{p}: {:?}", e.notes);
     }
 
-    // 沙箱里谁也认不出的：退回包自己的规则，但提醒“不一定是这个应用的”。
+    // 沙箱里谁也认不出的：第 1 轮评审后不再沿用包规则的说法（“Claude 的登录信息……”），
+    // 而是“沙箱里的东西，还没认出是谁的”，线索第一条写明重定向。
     let e = ex(&t, &ctx, &format!(r"{pkg}\LocalCache\Local\qzx-unknown"));
-    assert_eq!(rule_id(&e), Some("claude-desktop-data"));
-    assert!(e.notes.iter().any(|n| n.contains("不一定都是这个应用自己的数据")), "{:?}", e.notes);
+    assert!(e.is_unknown(), "{:?}", e.source);
+    assert!(e.what.contains("沙箱"), "{}", e.what);
+    assert!(e.clues[0].contains("Claude_pzs8sxrjxfjjc") && e.clues[0].contains(r"AppData\Local\qzx-unknown"), "{:?}", e.clues);
+    // LocalCache\Local 这一层本身：沙箱说明（self 规则），不再是“Claude 的登录信息”。
+    let e = ex(&t, &ctx, &format!(r"{pkg}\LocalCache\Local"));
+    assert_eq!(rule_id(&e), Some("store-app-sandbox-appdata"));
+    assert!(e.what.contains("挪到了这里"));
+    // 汇总：沙箱里的 pip 缓存按 pip-cache 记，认不出的记“规则没覆盖”，不再记到 claude-desktop-data。
+    let s = tier_summary(&t, &ctx);
+    let find = |id: &str| s.top_safe.iter().chain(&s.top_review).chain(&s.top_keep).find(|r| r.id == id).map(|r| r.bytes);
+    assert_eq!(find("pip-cache"), Some(5_000_000), "{s:?}");
+    assert!(s.uncovered_bytes >= 3_000_000, "{s:?}");
+    assert_eq!(find("claude-desktop-data"), Some(8_000), "只剩 Settings 里的：{s:?}");
     // 沙箱外的包数据照旧，不加提醒。
     let e = ex(&t, &ctx, &format!(r"{pkg}\Settings"));
     assert_eq!(rule_id(&e), Some("claude-desktop-data"));

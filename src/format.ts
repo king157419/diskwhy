@@ -53,7 +53,7 @@ export function attrText(a: number): string {
 }
 
 // ───── 阶段 B：解释相关的中文标签 ─────
-import type { Explanation, How, TierKey } from "./api";
+import type { Explanation, How, SourceKey, TierKey } from "./api";
 
 export const TIER_SHORT: Record<TierKey, string> = {
   safe: "可清理",
@@ -66,14 +66,29 @@ export const TIER_BIG: Record<TierKey, string> = {
   safe: "可以放心清理",
   review: "需要你来判断",
   keep: "建议保留，别删",
-  unknown: "我还不知道这是什么",
+  unknown: "还没认出来，先别删",
 };
 
 export const TIER_HINT: Record<TierKey, string> = {
   safe: "缓存一类的东西，删了会自动重新生成，不丢你的数据。",
   review: "删了有代价，下面写清楚了会失去什么，由你决定。",
   keep: "是你的数据或系统需要的东西；想腾空间请看“该怎么腾”，用迁移或系统工具。",
-  unknown: "规则库和启发式都没认出来。先别删，看看下面的线索，或者问问 AI。",
+  unknown: "规则库里没有，看内容也没认出来。先别删，看看下面的线索，或者问问 AI。",
+};
+
+/** 解释来源：列表每行的小标签和顶部图例 */
+export const SOURCE_SHORT: Record<SourceKey, string> = {
+  rule: "规则",
+  heuristic: "推测",
+  llm: "AI",
+  unknown: "未知",
+};
+
+export const SOURCE_HINT: Record<SourceKey, string> = {
+  rule: "规则库里查得到，写明了出处",
+  heuristic: "规则库里没有，按里面的文件特征推测",
+  llm: "AI 根据名字猜的，只当参考",
+  unknown: "没认出来，只列线索",
 };
 
 export const HOW_LABEL: Record<How, string> = {

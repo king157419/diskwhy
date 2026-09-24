@@ -65,7 +65,7 @@ async function doSave() {
 
       <label class="switch-row">
         <input type="checkbox" v-model="s.enabled" />
-        <span>启用 AI 推测</span>
+        <span>启用 AI 推测（默认关闭；关着时 DiskWhy 不会联网）</span>
       </label>
 
       <div class="form-grid">

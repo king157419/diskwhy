@@ -2,7 +2,7 @@
 
 # 阶段 B 验证记录：解释引擎
 
-> 第 1–6 节是 2026-09-23 上午第一次做阶段 B 时的记录（当时 179 条规则、47 个测试）。当晚 S22 轮在分支 `phase-b` 上补做了 B-1、B-2、B-3，见文末第 7（决定）、8、9、10 节；第 3 节的覆盖率已被第 10 节和新的 coverage.md 取代。
+> 第 1–6 节是 2026-09-23 上午第一次做阶段 B 时的记录（当时 179 条规则、47 个测试）。当晚 S22 轮在分支 `phase-b` 上补做了 B-1、B-2、B-3、B-4，见文末第 7（决定）、8、9、10、11 节；第 3 节的覆盖率已被第 10 节和新的 coverage.md 取代。
 > **注意**：B-2 改了几处第 1 节写过的行为——启发式现在可以对签名严格的 Chromium 缓存给 safe（1.4 节说“永不 safe”已过时）；LLM 请求体从 9 个字段收紧到 4 个、回复只收 what/why/lose、可信度固定 0.3（1.5 节已过时）。以第 9 节为准。
 
 日期：2026-09-23　机器：Windows 11 Pro 10.0.26200，C 盘 NTFS 199 GB，**普通用户权限（未提权）**
@@ -265,6 +265,15 @@ DiskWhy 解释：C:\
 | 31 | （B-3）任务写“`cargo build --release`” | 只构建了 `-p diskwhy-cli` 的发布版，Tauri 壳用 `cargo check -p diskwhy` 确认能编译 | B-3 没改界面；worktree 里没有前端依赖，整个工作区发布版会连 Tauri 一起 LTO 编译，时间长而且和另一轮会话抢同一个 target/ |
 | 32 | （B-3）第二轮要不要重扫 | 重扫（60 秒），不用第一轮的 JSON | 第一轮 JSON 里的摘要是修改前的引擎算的，重扫才能让“JSON 摘要”和“explain 结果”逐行对得上（实测 51/51 一致） |
 | 33 | （B-3）coverage.md 怎么处理旧版本 | 整个重写（旧版在 master 的 5c4c7e0 里），路径里的用户名换成 `<用户>`（`--md` 输出自动做） | 旧版是 179 条规则时的数，而且没脱敏 |
+| 34 | （B-4）任务要“Tauri IPC 新增 explain 命令”，但列表每行的解释已经随 `list_dir` 一次带回 | 新增 `explain(path, kind?)`（直接转发 core 的 `explain`，不联网、不问 AI），和 `node_info` 共用同一个“找节点 + 建 Target”的函数；**列表仍由 `list_dir` 一次带回全部解释**，`explain` 给详情面板在节点没带解释时补取 | 一个文件夹几百行，每行再走一次 IPC 会让列表逐行闪出来；两条路径最终调同一个 core 函数，结果一致（用 WebView2 远程调试在真实窗口里调用核对过，见 11.2） |
+| 35 | 档位颜色 | safe 绿、review 琥珀、**keep 改成石板灰 + 锁图标**（原来是红色）、未知改成淡紫 + 问号 + 虚线框；方块图同一套颜色 | 任务写“keep 灰锁”；红色容易被读成“危险、快删”，而 keep 的意思恰恰是“别动”。未知不能也用灰色（会和 keep 混），用和三档都不像的淡紫，并加问号 |
+| 36 | “解释来源”图例放哪、怎么标 | 在概览和列表之间加一条常驻的图例条（收起概览时也在）：左边四种颜色、右边三种来源（规则 / 推测 / 未知；有 AI 结果时多一个 AI），每种后面是**当前文件夹里的项数**；列表每行在档位标签后面加同款来源小标签（规则实线框、推测虚线框） | 图例光告诉颜色不够，数字能让人一眼看出“这个文件夹有多少是真查到的、多少是猜的” |
+| 37 | “BuiltinTool 显示工具名”：规则里只有 `how_detail` 一段话，没有单独的工具名字段 | 在 core 加 `Explanation.tool`（PLAN 第 2 节的 `BuiltinTool(name)`），由新文件 `explain/tools.rs` 从 `how_detail` 里认：一张约 30 项的对照表（DISM、powercfg、磁盘清理、“设置 > 系统 > 存储”、conda clean、pnpm store prune……）+ 浏览器“清除浏览数据”带上浏览器名 + 软件菜单“→ 设置”；**在文字里最先出现的那个**算主工具（规则文案都是先写推荐办法再写备选）。在 `enforce_guards` 出口统一填，JSON 里没有工具时不出现这个键 | 不给 203 条规则加新字段：59 条 builtin_tool 规则逐条手填容易漏；测试 `b4_every_builtin_tool_rule_names_its_tool` 要求 59 条全部认得出（当前全部认得出，逐条列表见 `_ops/S22` 的测试输出）。缺点：新写规则时如果用了表里没有的工具，只会退到“某软件自己的设置”或不显示，测试会拦住“完全认不出”的情况 |
+| 38 | 界面主题 | 只保留浅色：删掉 `styles.css` 里 3 段 `prefers-color-scheme: dark`，`color-scheme: light`，底色改成偏暖的纸白 `#f5f5f0`；`tauri.conf.json` 窗口加 `"theme": "Light"`（查了本机 tauri-utils 2.9.3 源码里 `WindowConfig.theme` 的说明：“The initial window theme. Defaults to the system theme. Only implemented on Windows and macOS 10.14+.”，v2.tauri.app 配置页只列出了 Theme 取值 Light/Dark） | 任务要求“浅色底、深色字，不要黑底”；这台机器系统是深色主题，阶段 A 的截图就跟着变成了黑底 |
+| 39 | 详情面板窄（1280×800 逻辑像素时只有 340px），六项左右两栏排时每个字段都折成三四行 | 改成“小标题在上、内容在下”，内容用满整行 | 同样的高度能多放一倍的字；“怎么腾”里的工具名和迁移建议不用滚很远 |
+| 40 | 截图文件名 | 新截图叫 `phaseB-b4-1…6-*.png`，**不覆盖**第一次做阶段 B 时的 `phaseB-1…7` | 旧图记录的是当时的界面（红色 keep、深色系统下的样子），留着方便对比；文件名都以 `phaseB-` 开头，符合任务要求 |
+| 41 | 截图里的用户名 | 截图脚本用 UI Automation 找出**名字里含用户名（区分大小写）**的控件，把它们在截图上的区域打马赛克（面包屑里的用户名按钮、详情里的完整路径）；列表切到“只看列表”，不截方块图（方块图画在 canvas 上，文字读不出来也就遮不了） | 第一次用不区分大小写匹配，把 `Kingsoft`（WPS）整行也遮了，改成区分大小写。含用户名的试拍图已删除 |
+| 42 | worktree 里没有 `node_modules`，`npm run tauri build` 跑不了 | 在 worktree 里建了一个指向主目录 `node_modules` 的目录联接（junction），没有重新下载依赖 | 两边 `package.json` / `package-lock.json` 完全一致（`git diff master phase-b` 为空）；`node_modules` 在 `.gitignore` 里，不会进提交。以后删 worktree 时要先 `rmdir` 这个联接，别递归删 |
 
 ## 8. B-1：规则库骨架 + 首批规则（S22 补做，分支 `phase-b`）
 
@@ -489,3 +498,71 @@ diskwhy-cli explain D:\somewhere --top 20 --llm                  # 设置里启�
 - 仍在 `D:\desk\claudex\13\diskwhy\.worktrees\phase-b` 做、提交到 `phase-b`，构建用 `CARGO_TARGET_DIR=D:/desk/claudex/13/diskwhy/target`。另一轮会话在主目录做阶段 D、会覆盖 `target/release/diskwhy-cli.exe`，本轮用的 CLI 另存了一份在 `target/tmp/diskwhy-cli-b3.exe`，扫描产物在 `target/tmp/`（`scan.json`、`c.dwsnap`、`explain50.json`、`report50.json`、`report200.json`、`cov200.md`；`r1/` 是第一轮）。
 - 规则待办看 coverage.md 最后一节；`tier_summary` 接上沙箱重定向；GUI 构建截图。
 - 用户醒来后要决定：阶段 D 那批改动怎么处理、`phase-b` 何时合回 master。
+
+## 11. B-4：GUI 接入（S22，分支 `phase-b`）
+
+### 11.1 做了什么
+
+先对照任务逐条核。第一次做阶段 B 时 GUI 已经有：列表色标 + 一句话、详情六项、未知项线索 + “问 AI”、顶部各档合计、设置页（AI 开关默认关）。B-4 补的是：
+
+| 任务要求 | 状态 | 位置 |
+|---|---|---|
+| Tauri IPC 新增 `explain` 命令（转发 core） | **本轮加** `explain(path, kind?)`；和 `node_info` 共用 `with_target`（决定 34） | `src-tauri/src/lib.rs`、`src/api.ts` 的 `explainPath` |
+| 列表每行档位色标：safe 绿 / review 琥珀 / keep 灰锁 + 一句话 | **本轮改**：keep 从红色改为灰色 + 锁，未知改为淡紫 + 问号；新组件 `TierChip`（对勾 / 三角 / 锁 / 问号四个小图标）；每行多一个来源小标签 | `src/components/TierChip.vue`、`DirList.vue`、`styles.css`、`TreemapView.vue` 的配色 |
+| 详情六项：这是什么 / 属于哪个软件 / 为什么会有 / 删了会失去什么 / 能腾多少 / 怎么腾 | 标签改成任务原文；排版改为上下排（决定 39） | `DetailPanel.vue` |
+| 怎么腾：BuiltinTool 显示工具名，Migrate 显示迁移建议，无删除按钮 | **本轮加** `Explanation.tool`（决定 37），面板里“用这个工具：DISM 命令（管理员终端）”；迁移类的做法小标题是“迁移建议”；面板底部写明“只解释、不删除：没有删除按钮” | `crates/diskwhy-core/src/explain/tools.rs`、`mod.rs`、`DetailPanel.vue` |
+| 未知项显示“我也不确定，这是我看到的线索：…” | 已有；**本轮把线索框挪到六项之前**，未知项一选中先看到线索 | `DetailPanel.vue` |
+| 顶部“解释来源”小图例（规则 / 启发式 / 未知） | **本轮加**，带当前文件夹的计数（决定 36） | `src/components/ExplainLegend.vue`、`App.vue` |
+| 设置页 LLM 兜底开关（默认关）与端点填写 | 已有；开关文字改成“启用 AI 推测（默认关闭；关着时 DiskWhy 不会联网）” | `SettingsDialog.vue` |
+| 中文、大白话、清新（浅色底、深色字，不要黑底） | **本轮改**：去掉深色模式、纸白底、窗口主题固定 Light（决定 38） | `styles.css`、`src-tauri/tauri.conf.json` |
+
+### 11.2 怎么验证的
+
+- `cargo test -p diskwhy-core -p diskwhy-cli`：**79 个通过，0 失败，2 个忽略**（B-3 时 76 个；新增 `explain::tools` 单元测试 1 个、`tests/b4_tests.rs` 2 个：59 条 builtin_tool 规则全部认得出工具名且不超过 40 字、百度网盘先写的是软件自己的设置所以不算“已安装的应用”；WinSxS 的解释带 `tool = "DISM 命令（管理员终端）"` 且 JSON 里有这个键；把 how 改成只有迁移后过护栏，`tool` 消失、JSON 里也没有这个键；未知项没有工具名、有线索）。59 条规则各自认出的工具名存在 `D:\desk\claudex\_ops\S22\B-4-tools.txt`，逐条看过。
+- 前端：`vue-tsc --noEmit` 通过；`vitest run` 7 个通过（阶段 C 的方块图布局测试，没有新增前端测试）。
+- 构建：`npm run tauri build -- --no-bundle`（worktree 里跑，`CARGO_TARGET_DIR` 指回主目录 `target/`）通过，产物 `D:\desk\claudex\13\diskwhy\target\release\diskwhy.exe`（第一次 4 分 06 秒；改了详情排版后重建 2 分 53 秒）。这次的 exe 另存了一份 `target\tmp\diskwhy-b4.exe`，防止主目录的另一轮会话覆盖。
+- **`explain` 命令在真实窗口里调过**：用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333` 启动发布版、GUI 里扫完 C 盘后，通过 Chrome DevTools 协议在页面里执行 `window.__TAURI_INTERNALS__.invoke("explain", …)`，走的就是前端 `explainPath` 那条 IPC。结果摘要如下（原始 JSON 存在 `D:\desk\claudex\_ops\S22\B-4-ipc-explain.txt`，用户名已换成 `~`）：
+
+```
+C:\Windows\WinSxS           => keep  rule winsxs      tool "DISM 命令（管理员终端）"  how [builtin_tool]
+~\AppData\Local\Temp        => safe  rule user-temp   tool "Windows 设置里的“存储”"   how [delete, builtin_tool]
+~\AppData\Local\wsl         => keep  rule wsl-root    tool null                       how [migrate]
+~\AppData\Local\OpenAI      => review unknown         tool null  线索 6 条  what "我也不确定这是什么"
+C:\Windows\System32 (Rest)  => keep  rule system32（其余小文件跟随所在文件夹）
+C:\swapfile.sys (File / 省略 kind) => keep rule swapfile
+C:\does-not-exist           => 错误“在扫描结果里找不到：C:\does-not-exist”（没有崩）
+C:\Windows (Rest)           => 错误“在扫描结果里找不到：C:\Windows”——C:\Windows 顶层只有 26 个文件，不到每个文件夹保留的 50 个，没有“其余小文件”节点，报错是对的
+```
+
+- GUI 扫描：普通权限，GUI 里扫了三次 C 盘（第一次 68 秒、第二次 63 秒，第三次是为调试通道重开后扫的、没计时），约 109.5 万个文件、224,506 个文件夹。
+
+**截图**（`docs/screenshots/`，发布版，普通权限，窗口 1600×1000 物理像素 = 1280×800 逻辑像素；方法同阶段 A/C：UI Automation 的 `InvokePattern` 点按钮和行、`ScrollPattern` 滚动详情面板、`PrintWindow(PW_RENDERFULLCONTENT)` 抓窗口；用户名区域打码，见决定 41）：
+
+| 文件 | 内容 |
+|---|---|
+| `phaseB-b4-1-root-list-legend.png` | 扫完 C 盘：概览下面是新的图例条（颜色：可清理 0 / 需判断 3 / 保留 8 / 未知 9；解释来源：规则 9 / 推测 2 / 未知 9）；列表每行灰色锁“保留” + “规则”标签 + 一句话；`tmp`、`AMD`、`Temp` 等是淡紫问号“未知”；右侧 C:\ 本身的六项 |
+| `phaseB-b4-2-safe-temp-tool.png` | `AppData\Local`（概览已收起，图例条还在）：选中 `Temp`，绿色“可清理”；怎么腾写“可以直接删除，或用系统或软件自带的工具清理”，下面蓝底 **“用这个工具：Windows 设置里的“存储””** 和具体做法 |
+| `phaseB-b4-3-keep-lock-winsxs-dism.png` | `C:\Windows`：111 项全部来自规则；选中 `WinSxS`，灰锁“保留”，能腾多少“不能手动删；用系统自带工具清理能腾出一部分（最多 3.65 GB）”，**工具 DISM 命令（管理员终端）** + 两条 DISM 命令 |
+| `phaseB-b4-4-keep-migrate-wsl.png` | `AppData\Local\wsl\{…}`：WSL 发行版的 ext4.vhdx，灰锁“建议保留，别删”，六项完整可见；怎么腾“迁到别的盘”，**“迁移建议：”** `wsl --manage … --move` / export-import |
+| `phaseB-b4-5-unknown-clues.png` | `AppData\Local\OpenAI`：淡紫问号“还没认出来，先别删”，六项之前先是 **“我也不确定，这是我看到的线索：”** 6 条（最大子项 Codex\、扩展名分布、文件数、修改时间、在 AppData 下、注册表里对不上） |
+| `phaseB-b4-6-settings-llm-off.png` | 设置页：“启用 AI 推测（默认关闭；关着时 DiskWhy 不会联网）”未勾选，接口地址 / 模型名 / API Key 都是空的，下面写着会发送的四样东西和绝不发送文件内容 |
+
+截图全程没有保存过设置，`%LOCALAPPDATA%\DiskWhy\settings.json` 不存在（AI 保持默认关闭）。截图时把界面切到了“只看列表”，结束前已通过同一个调试通道把这个偏好改回默认的“方块图 + 列表”。
+
+### 11.3 没做 / 没验证的
+
+- **没截方块图**：方块图的文字画在 canvas 上，UI Automation 读不到，用户名没法按控件打码（决定 41）。方块图用的是同一套新颜色（keep 灰、未知淡紫），只在一张没保存的试拍图里看过，没放进文档。
+- **“问 AI”这次没在 GUI 里重跑**：设置保持默认关闭，没连真实模型（第 4 节的 phaseB-5/6/7 是上午用旧界面拍的）。AI 结果区块的标签改成了和六项一致（加了“能腾多少”），但没有新截图。
+- **列表行和图例的“来源”没有 AI**：AI 结果只显示在详情面板里、不回写列表，所以图例里的 AI 计数实际上总是 0（代码里有，只在出现时显示）。
+- `explain` 命令在界面里只作兜底（节点没带解释时才调用）；正常操作下列表、方块图点选都已带解释，所以这条兜底路径在 GUI 里**没有被自然触发过**，只用调试通道直接调过命令本身。
+- 工具名靠对照表从文案里认，是启发式的（决定 37 写了缺点）；新写的 builtin_tool 规则要跑一遍 `b4_tests`。
+- 窗口 `theme: "Light"` 只在这台（系统深色主题的）Windows 11 上看过效果：标题栏和页面都是浅色。
+- 观察到但没处理：`AppData\Local` 这一层 120 项里有 75 项是“未知”（多是小文件夹），前 50 大目录覆盖率 100% 不代表每一层都认得全；属于规则库的下一批工作，不是 GUI 问题。
+- 前端没有新增单元测试（新组件都是展示逻辑）；验证靠 `vue-tsc`、真实窗口截图和 IPC 调用。
+
+### 11.4 下一阶段从哪接
+
+- 仍在 `D:\desk\claudex\13\diskwhy\.worktrees\phase-b` 做、提交到 `phase-b`；构建用 `CARGO_TARGET_DIR=D:/desk/claudex/13/diskwhy/target`。worktree 的 `node_modules` 是指向主目录的联接（决定 42）。
+- 截图脚本（UI Automation + PrintWindow + 按控件名打码）在本次会话的临时目录里，思路见决定 41，重写很快；若要长期用，可以放进仓库的 `scripts/`。
+- 合并：master 现在是另一轮会话提交的阶段 D（eb911fb），也改了 `DetailPanel.vue`、`App.vue`、`styles.css`、`lib.rs`；`git merge phase-b` 这几个文件**一定会冲突**，要手动合：保留阶段 D 的清理按钮 / 抽屉，同时保留 B-4 的六项标签、工具名、图例、浅色主题和 `explain` 命令。
+- 规则库：`AppData\Local` 里大量小的未知项、coverage.md 末尾的待办。

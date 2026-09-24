@@ -120,11 +120,11 @@ function palette(): Palette {
   return {
     tier: {
       safe: cssVar("--t-safe", "#1f9d55"),
-      review: cssVar("--t-review", "#d99a00"),
-      keep: cssVar("--t-keep", "#d64545"),
-      unknown: cssVar("--t-unknown", "#8a93a3"),
+      review: cssVar("--t-review", "#e0a100"),
+      keep: cssVar("--t-keep", "#6b7587"),
+      unknown: cssVar("--t-unknown", "#9ea2d8"),
     },
-    text: { safe: "#ffffff", review: "#2b1d00", keep: "#ffffff", unknown: "#ffffff" },
+    text: { safe: "#ffffff", review: "#2b1d00", keep: "#ffffff", unknown: "#23264f" },
     other: cssVar("--tm-other", "#c9ced8"),
     otherText: cssVar("--tm-other-text", "#3b4252"),
     pseudoBg: cssVar("--tm-pseudo", "#4a5160"),

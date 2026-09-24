@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { tierKey, tmKey, type DirListing, type NodeView } from "../api";
-import { TIER_SHORT, humanBytes, pct } from "../format";
+import { sourceKey, tierKey, tmKey, type DirListing, type NodeView } from "../api";
+import { SOURCE_HINT, SOURCE_SHORT, humanBytes, pct } from "../format";
+import TierChip from "./TierChip.vue";
 
 defineProps<{ listing: DirListing; selectedPath: string | null }>();
 const emit = defineEmits<{ open: [path: string]; select: [node: NodeView] }>();
@@ -81,7 +82,14 @@ function rowKey(n: NodeView): string {
             <span v-if="n.hardlink_dup" class="tag tag-map" title="硬链接：这个文件还有别的名字，空间记在另一个路径上">硬链接</span>
           </span>
           <span class="c-what" :title="n.explanation?.what">
-            <span class="chip" :class="'chip-' + tierKey(n.explanation)">{{ TIER_SHORT[tierKey(n.explanation)] }}</span>
+            <TierChip :tier="tierKey(n.explanation)" />
+            <span
+              v-if="n.explanation && sourceKey(n.explanation) !== 'unknown'"
+              class="src-tag"
+              :class="'src-' + sourceKey(n.explanation)"
+              :title="SOURCE_HINT[sourceKey(n.explanation)]"
+              >{{ SOURCE_SHORT[sourceKey(n.explanation)] }}</span
+            >
             <span class="what-text">{{ n.explanation?.what ?? "" }}</span>
           </span>
           <span class="c-bar"><i :style="{ width: Math.max(0.5, n.percent_of_parent) + '%' }"></i></span>

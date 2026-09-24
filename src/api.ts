@@ -22,7 +22,7 @@ export interface EnvInfo {
 
 // ───── 阶段 B：解释 ─────
 export type Tier = "safe" | "review" | "keep";
-/** 界面上的四种颜色：未知单独算灰色（后端 tier 仍是 review） */
+/** 界面上的四种颜色：safe 绿 / review 琥珀 / keep 灰（带锁）/ 未知淡紫（带问号；后端 tier 仍是 review） */
 export type TierKey = Tier | "unknown";
 export type How = "delete" | "builtin_tool" | "migrate" | "manual" | "none";
 export type Source =
@@ -42,6 +42,8 @@ export interface Explanation {
   lose: string;
   how: How[];
   how_detail: string;
+  /** how 里有 builtin_tool 时，工具叫什么（core 从 how_detail 认出来；认不出为空） */
+  tool?: string | null;
   gain_bytes: number;
   gain_note: string;
   source: Source;
@@ -78,6 +80,14 @@ export interface LlmSettings {
   base_url: string;
   model: string;
   api_key: string;
+}
+
+/** 解释从哪来（界面顶部“解释来源”图例用） */
+export type SourceKey = "rule" | "heuristic" | "llm" | "unknown";
+
+export function sourceKey(e: Explanation | null | undefined): SourceKey {
+  const k = e?.source.kind;
+  return k === "rule" || k === "heuristic" || k === "llm" ? k : "unknown";
 }
 
 export function tierKey(e: Explanation | null | undefined): TierKey {
@@ -243,6 +253,8 @@ export const saveSettings = (settings: LlmSettings) => invoke<string>("save_sett
 export const testLlm = (settings: LlmSettings) => invoke<string>("test_llm", { settings });
 export const askAi = (path: string) => invoke<Explanation>("ask_ai", { path });
 export const getTreemap = (path: string, depth = 3) => invoke<TreemapNode>("get_treemap", { path, depth });
+/** 单独解释一项（B-4：转发 core 的 explain，不联网）；kind 省略时按路径找 */
+export const explainPath = (path: string, kind?: NodeKind) => invoke<Explanation>("explain", { path, kind: kind ?? null });
 export const nodeInfo = (path: string, kind: NodeKind) => invoke<NodeView>("node_info", { path, kind });
 /** 弹“另存为”对话框；用户取消返回 null */
 export const saveSnapshot = () => invoke<string | null>("save_snapshot");

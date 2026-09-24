@@ -8,6 +8,9 @@
 //! - `list_dir`           (path, limit?) -> DirListing（子项按 allocated 降序，每项带 explanation）
 //! - `get_treemap`        (path, depth?) -> TreemapNode（阶段 C：方块图数据，最多 3 层，每块带档位）
 //! - `node_info`          (path, kind) -> NodeView（方块图里点了更深一层的块时取详情）
+//! - `explain`            (path, kind?) -> Explanation（阶段 B-4：单独取一项的完整解释，直接转发 core 的
+//!                        `explain`；规则 → 启发式 → 未知，不联网。列表里的每一行已经随 `list_dir` 带回解释，
+//!                        这个命令给详情面板补取 / 刷新用）
 //! - `save_snapshot`      -> 保存路径（弹系统“另存为”对话框，写 gzip JSON）
 //! - `open_snapshot`      (path?) -> ScanSummary（弹“打开”对话框读快照，替换当前结果；解释照常现算）
 //! - `startup_snapshot`   -> 启动参数里给的快照路径（`diskwhy.exe 某次扫描.dwsnap`，或双击关联的 .dwsnap）
@@ -219,35 +222,58 @@ async fn get_treemap(path: String, depth: Option<usize>, state: State<'_, AppSta
     .map_err(|e| format!("方块图线程异常：{e}"))?
 }
 
+/// 在扫描结果里找到一项并建好解释用的 [`Target`]，交给 `f`。
+/// `kind = Rest` 时 `path` 是所在目录，找的是它的“其余小文件合计”。
+fn with_target<T>(
+    r: &ScanResult,
+    path: &str,
+    kind: NodeKind,
+    f: impl FnOnce(&Target, Option<&diskwhy_core::Node>) -> T,
+) -> Result<T, String> {
+    let not_found = || format!("在扫描结果里找不到：{path}");
+    let (chain, node, full) = if kind == NodeKind::Rest {
+        let chain = find_dir(&r.tree, path).ok_or_else(not_found)?;
+        let dir = *chain.last().unwrap();
+        let rest = dir.children.iter().find(|c| c.kind == NodeKind::Rest).ok_or_else(not_found)?;
+        (chain, rest, dir.path.clone())
+    } else {
+        let (chain, node) = find_node(&r.tree, path).ok_or_else(not_found)?;
+        let full = if node.kind == NodeKind::Dir { node.path.clone() } else { path.to_string() };
+        (chain, node, full)
+    };
+    let parent = chain.last().copied();
+    let t = Target { node, path: &full, parent, ancestors: &chain };
+    Ok(f(&t, parent))
+}
+
 /// 任意节点（目录 / 文件 / “其余小文件”）的详情视图，带解释。
 #[tauri::command]
 fn node_info(path: String, kind: NodeKind, state: State<'_, AppState>) -> Result<NodeView, String> {
     let r = state.result()?;
     let ctx = state.ctx();
-    let not_found = || format!("在扫描结果里找不到：{path}");
-    let (chain, node, full) = if kind == NodeKind::Rest {
-        let chain = find_dir(&r.tree, &path).ok_or_else(not_found)?;
-        let dir = *chain.last().unwrap();
-        let rest = dir.children.iter().find(|c| c.kind == NodeKind::Rest).ok_or_else(not_found)?;
-        (chain, rest, dir.path.clone())
-    } else {
-        let (chain, node) = find_node(&r.tree, &path).ok_or_else(not_found)?;
-        let full = if node.kind == NodeKind::Dir { node.path.clone() } else { path.clone() };
-        (chain, node, full)
-    };
-    let parent = chain.last().copied();
-    let parent_path = parent.map(|p| p.path.as_str());
-    let parent_alloc = parent.map(|p| p.allocated).unwrap_or(r.used_bytes);
-    let mut v = node_view(node, parent_path, parent_alloc);
-    if node.kind == NodeKind::Rest {
-        v.path = full.clone();
-    }
-    if node.mapped {
-        v.mapped_to = view::mapped_to(&r, &node.path);
-    }
-    let t = Target { node, path: &full, parent, ancestors: &chain };
-    v.explanation = Some(diskwhy_core::explain::explain(&t, &ctx));
-    Ok(v)
+    with_target(&r, &path, kind, |t, parent| {
+        let node = t.node;
+        let parent_path = parent.map(|p| p.path.as_str());
+        let parent_alloc = parent.map(|p| p.allocated).unwrap_or(r.used_bytes);
+        let mut v = node_view(node, parent_path, parent_alloc);
+        if node.kind == NodeKind::Rest {
+            v.path = t.path.to_string();
+        }
+        if node.mapped {
+            v.mapped_to = view::mapped_to(&r, &node.path);
+        }
+        v.explanation = Some(diskwhy_core::explain::explain(t, &ctx));
+        v
+    })
+}
+
+/// 单独解释一项（阶段 B-4）：直接转发 core 的 `explain`（规则 → 启发式 → 未知，不联网，不问 AI）。
+/// `kind` 省略时按路径找（目录或文件）。
+#[tauri::command]
+fn explain(path: String, kind: Option<NodeKind>, state: State<'_, AppState>) -> Result<Explanation, String> {
+    let r = state.result()?;
+    let ctx = state.ctx();
+    with_target(&r, &path, kind.unwrap_or(NodeKind::Dir), |t, _| diskwhy_core::explain::explain(t, &ctx))
 }
 
 #[tauri::command]
@@ -389,6 +415,7 @@ pub fn run() {
             list_dir,
             get_treemap,
             node_info,
+            explain,
             save_snapshot,
             open_snapshot,
             startup_snapshot,

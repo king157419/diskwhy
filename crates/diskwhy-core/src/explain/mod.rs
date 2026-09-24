@@ -19,6 +19,7 @@ pub mod llm;
 pub mod pattern;
 pub mod registry;
 pub mod rules;
+pub mod tools;
 
 use crate::model::{Node, NodeKind};
 use crate::view::human_bytes;
@@ -99,6 +100,10 @@ pub struct Explanation {
     pub lose: String,
     pub how: Vec<How>,
     pub how_detail: String,
+    /// `how` 里有 `BuiltinTool` 时，工具叫什么（从 how_detail 认出来，见 [`tools::tool_name`]；
+    /// 对应 PLAN 第 2 节的 `BuiltinTool(name)`）。由 [`enforce_guards`] 统一填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
     /// 能腾出的字节（safe/review 且可删时 = 实际占用；keep 为 0）。
     pub gain_bytes: u64,
     /// “能腾出”一栏的大白话。
@@ -272,6 +277,7 @@ pub fn enforce_guards(mut e: Explanation, path: &str, ctx: &ExplainCtx) -> Expla
         }
         e.notes.push("档位被 DiskWhy 的护栏改成了“需要你判断”（AI 推测、没认出来的东西、个人文件夹里的东西都不会标成可放心清理）。".into());
     }
+    e.tool = if e.how.contains(&How::BuiltinTool) { tools::tool_name(&e.how_detail, e.owner.as_deref()) } else { None };
     e
 }
 
@@ -433,6 +439,7 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         lose: rule.lose.clone(),
         how,
         how_detail: rule.how_detail.clone(),
+        tool: None,
         gain_bytes,
         gain_note,
         source: Source::Rule {

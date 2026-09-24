@@ -32,6 +32,7 @@ import DetailPanel from "./components/DetailPanel.vue";
 import TierSummaryCard from "./components/TierSummaryCard.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import TreemapView from "./components/TreemapView.vue";
+import ExplainLegend from "./components/ExplainLegend.vue";
 import { pseudoView } from "./pseudo";
 
 type Phase = "idle" | "scanning" | "done";
@@ -292,6 +293,7 @@ async function doOpenSnapshot(path?: string) {
           <AttributionBar :summary="summary" />
           <TierSummaryCard :tiers="summary.tiers" :used-bytes="summary.used_bytes" />
         </div>
+        <ExplainLegend :listing="listing" />
         <div class="split">
           <div class="left" :class="'mode-' + viewMode">
             <div class="view-switch" role="group" aria-label="视图">

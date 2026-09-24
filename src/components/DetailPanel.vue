@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { askAi, tierKey, type Explanation, type NodeView } from "../api";
-import { HOW_LABEL, TIER_BIG, TIER_HINT, attrText, fmtInt, fmtTime, humanBytes, sourceLabel } from "../format";
+import { askAi, explainPath, sourceKey, tierKey, type Explanation, type NodeView } from "../api";
+import { HOW_LABEL, SOURCE_HINT, SOURCE_SHORT, TIER_BIG, TIER_HINT, attrText, fmtInt, fmtTime, humanBytes, sourceLabel } from "../format";
+import TierChip from "./TierChip.vue";
 
 const props = defineProps<{ node: NodeView | null; llmReady: boolean }>();
 const emit = defineEmits<{ openSettings: []; openPath: [path: string] }>();
 
 const aiResult = ref<Explanation | null>(null);
+/** 列表 / 方块图没带回解释时（极少），用 explain 命令单独取一次 */
+const fetched = ref<Explanation | null>(null);
+const fetchError = ref("");
 const aiLoading = ref(false);
 const aiError = ref("");
 const copied = ref("");
@@ -15,14 +19,29 @@ const linkError = ref("");
 
 watch(
   () => (props.node ? props.node.path + "|" + props.node.kind : ""),
-  () => {
+  async () => {
     aiResult.value = null;
     aiError.value = "";
     aiLoading.value = false;
+    fetched.value = null;
+    fetchError.value = "";
+    const n = props.node;
+    if (n && !n.explanation && !n.pseudo) {
+      try {
+        // “其余小文件”的 path 就是所在目录，后端按 kind 区分
+        const e = await explainPath(n.path, n.kind);
+        if (props.node === n) fetched.value = e;
+      } catch (e) {
+        if (props.node === n) fetchError.value = String(e);
+      }
+    }
   },
+  { immediate: true },
 );
 
-const ex = computed(() => props.node?.explanation ?? null);
+const ex = computed(() => props.node?.explanation ?? fetched.value ?? null);
+const sk = computed(() => sourceKey(ex.value));
+const isUnknown = computed(() => sk.value === "unknown");
 const tk = computed(() => tierKey(ex.value));
 const canAsk = computed(() => {
   const e = ex.value;
@@ -47,6 +66,14 @@ const status = computed(() => {
 
 function howText(e: Explanation): string {
   return e.how.map((h) => HOW_LABEL[h]).join("，或");
+}
+
+/** 具体做法那一段的小标题：迁移类叫“迁移建议”，用工具的叫“怎么用”，其余叫“具体做法” */
+function detailLabel(e: Explanation): string {
+  if (e.how.includes("migrate") && !e.how.includes("builtin_tool")) return "迁移建议";
+  if (e.how.includes("migrate")) return "迁移建议 / 怎么用";
+  if (e.how.includes("builtin_tool")) return "怎么用";
+  return "具体做法";
 }
 
 async function doAsk() {
@@ -102,32 +129,45 @@ async function copy(text: string) {
 
       <section v-if="ex" class="explain" :class="'ex-' + tk">
         <div class="ex-head">
-          <span class="ex-badge" :class="'chip-' + tk">{{ TIER_BIG[tk] }}</span>
-          <span v-if="ex.source.kind === 'heuristic'" class="tag">推测</span>
+          <TierChip :tier="tk" big :text="TIER_BIG[tk]" />
+          <span class="src-tag" :class="'src-' + sk" :title="SOURCE_HINT[sk]">{{ SOURCE_SHORT[sk] }}</span>
         </div>
         <p class="ex-hint muted small">{{ TIER_HINT[tk] }}</p>
+        <div v-if="isUnknown && ex.clues.length" class="ex-clues">
+          <div class="ex-sub">我也不确定，这是我看到的线索：</div>
+          <ul>
+            <li v-for="c in ex.clues" :key="c">{{ c }}</li>
+          </ul>
+        </div>
         <dl class="ex-grid">
           <dt>这是什么</dt>
           <dd><b>{{ ex.what }}</b></dd>
-          <dt>属于</dt>
+          <dt>属于哪个软件</dt>
           <dd>{{ ex.owner ?? "不确定" }}</dd>
           <dt>为什么会有</dt>
           <dd>{{ ex.why }}</dd>
           <dt>删了会失去什么</dt>
           <dd>{{ ex.lose }}</dd>
-          <dt>能腾出</dt>
+          <dt>能腾多少</dt>
           <dd>{{ ex.gain_note }}</dd>
-          <dt>该怎么腾</dt>
+          <dt>怎么腾</dt>
           <dd>
-            <div>{{ howText(ex) }}</div>
-            <div v-if="ex.how_detail" class="how-detail">{{ ex.how_detail }}</div>
+            <div class="how-line">
+              <span>{{ howText(ex) }}</span>
+            </div>
+            <div v-if="ex.tool" class="how-line how-tool-line">
+              <span class="how-label">用这个工具：</span><span class="how-tool">{{ ex.tool }}</span>
+            </div>
+            <div v-if="ex.how_detail" class="how-detail">
+              <span class="how-label">{{ detailLabel(ex) }}：</span>{{ ex.how_detail }}
+            </div>
           </dd>
         </dl>
         <ul v-if="ex.notes.length" class="ex-notes small">
           <li v-for="n in ex.notes" :key="n">{{ n }}</li>
         </ul>
-        <div v-if="ex.clues.length" class="ex-clues">
-          <div class="ex-sub">{{ ex.source.kind === "unknown" ? "我也不确定，这是我看到的线索：" : "依据：" }}</div>
+        <div v-if="!isUnknown && ex.clues.length" class="ex-clues">
+          <div class="ex-sub">依据：</div>
           <ul>
             <li v-for="c in ex.clues" :key="c">{{ c }}</li>
           </ul>
@@ -158,19 +198,22 @@ async function copy(text: string) {
 
       <section v-if="aiResult" class="explain ex-ai">
         <div class="ex-head">
-          <span class="ex-badge chip-review">AI 推测 · 需要你来判断</span>
+          <TierChip tier="review" big text="AI 推测 · 需要你来判断" />
+          <span class="src-tag src-llm">AI</span>
           <span class="muted small">可信度 {{ Math.round(aiResult.confidence * 100) }}%</span>
         </div>
         <dl class="ex-grid">
           <dt>这是什么</dt>
           <dd><b>{{ aiResult.what }}</b></dd>
-          <dt>属于</dt>
+          <dt>属于哪个软件</dt>
           <dd>{{ aiResult.owner ?? "没查到（归属只看注册表，不让 AI 猜）" }}</dd>
           <dt>为什么会有</dt>
           <dd>{{ aiResult.why }}</dd>
           <dt>删了会失去什么</dt>
           <dd>{{ aiResult.lose }}</dd>
-          <dt>该怎么腾</dt>
+          <dt>能腾多少</dt>
+          <dd>{{ aiResult.gain_note }}</dd>
+          <dt>怎么腾</dt>
           <dd>{{ aiResult.how_detail }}</dd>
         </dl>
         <ul class="ex-notes small">
@@ -200,7 +243,8 @@ async function copy(text: string) {
       <ul v-if="status.length" class="d-status">
         <li v-for="s in status" :key="s">{{ s }}</li>
       </ul>
-      <p class="muted small">目前只做解释，不提供删除按钮（带护栏的删除在下一阶段）。</p>
+      <p v-if="fetchError" class="ai-error small">没取到说明：{{ fetchError }}</p>
+      <p class="no-delete muted small">这里只解释、不删除：没有删除按钮。要腾空间，请按上面“怎么腾”自己动手，或用写明的工具。</p>
     </template>
     <template v-else>
       <p class="muted">点击左侧列表中的一项查看详情。</p>

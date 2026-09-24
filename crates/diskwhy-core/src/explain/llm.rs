@@ -370,6 +370,7 @@ pub fn to_explanation(a: LlmAnswer, model: &str, allocated: u64) -> Explanation 
         lose: if a.lose.is_empty() { "AI 没说清楚。请先确认再决定。".into() } else { a.lose },
         how: vec![How::Manual],
         how_detail: "这是 AI 根据名字和大小做的推测，不是确认。删之前请自己再核实一下（搜一下文件夹名、看看里面的文件）。".into(),
+        tool: None,
         gain_bytes: 0,
         gain_note: format!("占 {}；AI 推测不作为能否删除的依据", human_bytes(allocated)),
         source: Source::Llm { model: model.to_string() },

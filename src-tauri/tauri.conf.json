@@ -14,10 +14,12 @@
       {
         "label": "main",
         "title": "DiskWhy — C 盘每一块都说清楚",
-        "width": 1320,
+        "width": 1360,
         "height": 860,
-        "minWidth": 960,
-        "minHeight": 600
+        "minWidth": 1100,
+        "minHeight": 720,
+        "center": true,
+        "theme": "Dark"
       }
     ],
     "security": {

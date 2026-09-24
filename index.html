@@ -1,9 +1,23 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
     <title>DiskWhy</title>
+    <script>
+      // 在样式加载前就设好主题，避免启动时闪一下另一种颜色（默认深色；src/theme.ts 负责之后的切换）
+      try {
+        var t = localStorage.getItem("diskwhy.theme");
+        if (t === "light") document.documentElement.setAttribute("data-theme", "light");
+        else if (t === "system") document.documentElement.removeAttribute("data-theme");
+      } catch (e) {}
+    </script>
+    <style>
+      html { background: #0e0e11; }
+      html[data-theme="light"] { background: #efeff3; }
+      @media (prefers-color-scheme: light) { html:not([data-theme]) { background: #efeff3; } }
+    </style>
   </head>
   <body>
     <div id="app"></div>

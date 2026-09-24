@@ -2,7 +2,8 @@
 
 # 阶段 B 验证记录：解释引擎
 
-> 第 1–6 节是 2026-09-23 上午第一次做阶段 B 时的记录（当时 179 条规则、47 个测试）。当晚 S22 轮在分支 `phase-b` 上补做了 B-1，见文末第 7、8 节。
+> 第 1–6 节是 2026-09-23 上午第一次做阶段 B 时的记录（当时 179 条规则、47 个测试）。当晚 S22 轮在分支 `phase-b` 上补做了 B-1、B-2，见文末第 7、8、9 节。
+> **注意**：B-2 改了几处第 1 节写过的行为——启发式现在可以对签名严格的 Chromium 缓存给 safe（1.4 节说“永不 safe”已过时）；LLM 请求体从 9 个字段收紧到 4 个、回复只收 what/why/lose、可信度固定 0.3（1.5 节已过时）。以第 9 节为准。
 
 日期：2026-09-23　机器：Windows 11 Pro 10.0.26200，C 盘 NTFS 199 GB，**普通用户权限（未提权）**
 工具链：rustc/cargo 1.93.0，node 22，Tauri 2，windows-sys 0.61.2，toml 0.9，ureq 3.4.2（native-tls）
@@ -237,6 +238,19 @@ DiskWhy 解释：C:\
 | 4 | 任务写的 `how: BuiltinTool(name)` | 保持现有写法：`how = "builtin_tool"` + 必填的 `how_detail` 写具体工具和命令 | 已有 200 条规则、GUI 和 CLI 都按这个结构；工具名单独成字段对用户没有额外信息，how_detail 里已写明（DISM、powercfg、磁盘清理、Set-MpPreference……） |
 | 5 | “重复 match 报错”具体怎么算 | 原始写法重复（大小写、`/` 与 `\`、`%SystemRoot%` 与 `%WINDIR%` 视为相同）→ 报错，整条规则不加载；展开环境变量后和别的规则撞车 → 只跳过那个模式并警告；同一条规则里两种写法展开后相同（`%TEMP%` 与 `%LOCALAPPDATA%\Temp`）允许；`kind` / `when_child` 不同不算重复 | 原始重复是写规则的人的错，应该在测试里就炸；展开后撞车取决于某台机器的环境变量（比如 `%TEMP%` 被改成 `C:\Windows\Temp`），不能因此把整条规则扔掉 |
 | 6 | “Defender 缓存”原来只有一条整体 keep 的规则 | 新增 `defender-scans`（keep + 系统工具）和 `defender-quarantine`（review + 系统工具），路径在本机核实存在；清理办法只写 Windows 安全中心界面和 `Set-MpPreference`，不教用户在资源管理器里删 | 两篇微软文档写的默认保留天数不一致（15 天 / 30 天；隔离区“不设置就一直留” / 组策略默认 90 天），规则里如实写了两种说法，让用户用 `Get-MpPreference` 看本机值 |
+| 7 | 任务要求注册表“用 windows-registry 或 winreg crate，查 docs.rs 后再写” | **不换 crate**，继续用已经在依赖里的 `windows-sys` 直接调 `RegOpenKeyExW` / `RegEnumKeyExW` / `RegGetValueW` | 这段代码阶段 B 已写好、按 learn.microsoft.com 核过参数语义、本机读出 260 个软件（12–14 ms）；换成封装 crate 功能不变，却要多拉一个依赖并重测。任务真正要的“读 Uninstall 键做归属”已经满足 |
+| 8 | “含 WOW6432Node”——HKCU 要不要也读一遍 32 位视图 | HKLM 读 64 位、32 位两个视图（`KEY_WOW64_64KEY` / `KEY_WOW64_32KEY`，不手拼 `WOW6432Node`）；**HKCU 只读一遍** | 微软文档 “Registry Keys Affected by WOW64” 的表里 `HKEY_CURRENT_USER\SOFTWARE` 在 Win7 及以后是 **Shared**（不重定向），没有单独的 32 位视图可读 |
+| 9 | 启发式什么时候可以给 safe | 只有 `chromium-cache` 一个：文件夹名必须是 Chromium 的缓存目录名（Cache / Cache_Data / GPUCache / Code Cache 及其 js、wasm / GrShaderCache / DawnCache 等），**并且**里面每个看得到的文件都是磁盘缓存的标准文件名（`index`、`data_N`、`f_十六进制`、`16 位十六进制_0/_1/_s`、`index-dir\the-real-index`），并且不在个人文件夹下。名字对但混了别的文件 → `chromium-cache-mixed`（review） | “像缓存”不等于“是缓存”。标准文件名是 Chromium 磁盘缓存自己的格式，别的程序几乎不会这样起名；本机 Chrome 的 `Cache` 里还有新版才有的 `No_Vary_Search`（只含 .baj/.baf），也放行了 |
+| 10 | LLM 请求体发什么 | 只发 4 个字段：`name`、`parent`（`X:\Users\<名字>` → `~`）、`children`（前 20 个子项的**名字**，不带大小）、`size`（总大小）。名字、父路径、子项名里出现的用户名（≥3 个字符）也换成 `~`。原来的扩展名分布、修改日期、文件数、子项大小都删了 | 任务原文“只含目录名、父路径脱敏、子项名摘要、大小”；多发的东西对猜测帮助不大，但会多泄露信息 |
+| 11 | LLM 回复能决定什么 | 只收 `what / why / lose`；模型多给的 `tier`、`owner`、`confidence`、`how` 反序列化时直接丢掉。档位强制 review，可信度固定 `LLM_CONFIDENCE = 0.3`，`how` 固定“手动”，能腾出固定 0；归属只用注册表对得上的已安装软件，不让 AI 猜。每项最多 300 字、去掉控制字符 | “回复只能填 what/why/lose” |
+| 12 | `explain()` 要不要自动问 LLM | 新增 `explain_full(target, ctx, Option<&dyn LlmOracle>)`：规则 → 启发式 → （传了 oracle **且**设置里开了开关）LLM → 未知。原来的 `explain()` 等于不传 oracle。列目录（每个子项都要解释）不传；只有用户点“问 AI”才走 LLM | 列目录时自动联网会让界面卡住、也会在用户不知情时发请求；把网络藏在 `LlmOracle` trait 后面，测试可以用假的 oracle 验证整条链，不联网 |
+| 13 | 统一护栏放哪 | `enforce_guards()` 在 `explain` / `explain_full` / `llm::ask` 的出口都跑一遍：LLM、未知一律 review；启发式的 safe 只认白名单 `SAFE_HEURISTICS = ["chromium-cache"]`；任何来源的 safe 落在桌面 / 文档 / 下载 / OneDrive 下降为 review | 启发式内部已有一道，出口再兜一道，防止以后加新启发式时忘了 |
+| 14 | node_modules 怎么说 | 有 package.json → 说出项目名和路径（node_modules 里面的包、嵌套的 node_modules 都指向最外层项目）；Electron 布局（`resources\app.asar.unpacked\node_modules`、`resources\app\node_modules`）或在 Program Files / `AppData\Local\Programs` / 注册表安装目录下 → `app-bundled-modules`，**keep**；都不是 → `node-modules-orphan`（review，手动） | 本机全量对照时 Typeless、Notion 自带的 node_modules 一开始被说成“遗留的，可以删”——删了软件就坏，所以加了这条 |
+| 15 | 聊天数据换了位置怎么办 | 路径里有 `WeChat Files` / `xwechat_files` / `Tencent Files` / `WXWork` 这一层 → `chat-data`，keep + 迁移，而且排在所有签名最前面（视频占大头也不会被“媒体文件”抢走）；Program Files 下的 `WXWork` 是程序本体，排除 | 用户常把微信存储改到 D 盘（本机就是），规则库只认 `%USERPROFILE%\Documents\...` |
+| 16 | conda 装在别处（本机是 `D:\conda`） | 里面有 conda-meta 且上一层叫 envs → `conda-env`（keep + 迁移，和规则 conda-envs 一致）；叫 envs 且旁边有 conda-meta → 同上；叫 pkgs 且有 `urls.txt` + `cache` → `conda-pkgs`（review + `conda clean --all`；规则里同一样东西是 safe，但启发式不许 safe） | 任务要求 conda envs 是 keep + Migrate |
+| 17 | 游戏平台缓存第二批依据 | `epic-launcher-webcache`、`battlenet-cache` 标 safe，依据是官方客服文章；`steam-htmlcache` 标 review | Epic 页面直接抓取返回 403（有反爬），暴雪页面 WebFetch 断连、curl 跟随跳转后 200；这两篇的正文是通过搜索引擎对官方页面的摘录读到的（Epic：退出启动器后删 `%LOCALAPPDATA%\EpicGamesLauncher\Saved` 下的 webcache / webcache_4147 / webcache_4430；暴雪：结束 Agent.exe 后删 `%ProgramData%\Blizzard Entertainment`，不影响游戏数据）。Steam 的 htmlcache 没找到 Valve 的官方说明，按“拿不准就 review”处理 |
+| 18 | “超过 180 天的缓存提示很久没用”对哪些生效 | 只对 category = cache 的（规则命中的缓存和启发式的缓存都算），写“很久没用了：已经 N 个月没动过……对应的软件可能已经不怎么用”；模型、程序等不写这句（模型很久不动是正常的），其余启发式仍然写原来的“已经 N 个月没动过了” | 规则命中时为了算这个要看子树的修改时间，最多看 5000 个节点，列目录仍然秒开 |
+| 19 | 主工作区在我干活期间还在变（`TreemapView.vue` 新改了、多了 `phaseD-*.png` 截图） | 判断为另一轮会话正在主目录做阶段 D，继续只在 worktree 里改，不看、不碰主目录。两边共用 `target/`，cargo 有文件锁，会排队 | B-2 在 phase-b 上只改了 `DetailPanel.vue` 和 `SettingsDialog.vue` 各两行文案；阶段 D 也改了 `DetailPanel.vue`，将来合并时这两行可能要手动合 |
 
 ## 8. B-1：规则库骨架 + 首批规则（S22 补做，分支 `phase-b`）
 
@@ -300,3 +314,92 @@ DiskWhy 解释：C:\
 - 分支 `phase-b` 在 `D:\desk\claudex\13\diskwhy\.worktrees\phase-b`（git worktree）。后续小节继续在这个目录里做、在这个分支上提交；**不要**在主目录 `checkout phase-b`（git 会拒绝，因为 worktree 占着它；而且主目录有别人的未提交改动）。构建时 `CARGO_TARGET_DIR=D:/desk/claudex/13/diskwhy/target`，复用已编译的依赖。
 - 用户醒来后要决定：主目录那批阶段 D 改动是继续做完提交，还是先放一边；之后再把 `phase-b` 合回 master（`git merge phase-b`，预计无冲突）。
 - 规则库下一批：coverage.md 里前 200 的 9 个未知项、以及在装了国内软件的机器上核对那 86 条没命中的路径。
+
+## 9. B-2：第二批规则 + 启发式 + 归属推断 + LLM 兜底（S22，分支 `phase-b`）
+
+### 9.1 做了什么
+
+先对照任务逐条核：master 上的阶段 B 已经有 200 条规则（任务点名的 AI 模型缓存、国内软件、conda envs、Steam shadercache 全都在）、12 个启发式、注册表快照和默认关闭的 LLM。B-2 只补真正缺的和做得不对的：
+
+| 任务要求 | 状态 | 位置 |
+|---|---|---|
+| 规则总数 ≥ 80，AI 模型 / 国内软件 / conda envs / 游戏平台 | 已有 200 条；本轮 +3 条游戏平台（`steam-htmlcache` review、`epic-launcher-webcache` safe、`battlenet-cache` safe）→ **203 条** | `rules/misc.toml` |
+| 微信、QQ 聊天文件与 FileStorage 必须 keep + Migrate | 已有（`wechat-files` / `qq-files` / `wecom-files`，FileStorage 按 tree 继承）；本轮加测试逐个路径核对；另加启发式 `chat-data` 兜住改过位置的聊天数据 | `tests/b2_tests.rs`、`explain/heuristics.rs` |
+| 启发式：Chromium 缓存 → safe | **本轮改**：原来一律 review。现在签名严格才 safe，不严格的叫 `chromium-cache-mixed`（review） | `heuristics.rs` 的 `strict_chromium_cache` / `is_chromium_disk_cache` |
+| site-packages → review；node_modules → review 并提示项目；target + Cargo.toml → review | 已有；**本轮加**：node_modules 说出项目名和路径、node_modules / target / site-packages 里面的子文件夹也能认出（原来只认最外层）、没有 package.json 的叫 `node-modules-orphan`、软件自带的叫 `app-bundled-modules`（keep） | `heuristics.rs` |
+| 模型权重占多数 → review；*.vhdx → keep；*.log 占多数 → review | 已有（阈值见 1.4 节） | — |
+| 超过 180 天的缓存提示“很久没用” | **本轮加**：缓存类（规则和启发式都算）写“很久没用了：……” | `heuristics::long_unused_note`、`mod.rs` 的 `from_rule` |
+| 注册表 Uninstall（HKLM/HKCU，含 WOW6432Node）的 DisplayName / InstallLocation / DisplayIcon，按目录名或路径前缀匹配 | 已有（决定 7、8）；本轮补测试 | `explain/registry.rs`、`heuristics::owner_from_path` |
+| LLM：OpenAI 兼容端点、支持本机 Ollama、默认 enabled=false | 已有 | `explain/llm.rs` |
+| LLM 请求体只含目录名、脱敏父路径、前 20 个子项名、大小 | **本轮改**：从 9 个字段收紧到 4 个（决定 10） | `llm::LlmInput`、`build_input_with` |
+| LLM 回复只填 what/why/lose，tier 强制 review、source=Llm、可信度低 | **本轮改**（决定 11） | `llm::LlmAnswer`、`to_explanation`、`LLM_CONFIDENCE` |
+| 用 mock HTTP 或纯函数测试脱敏和字段约束，不真的联网 | **本轮加** `LlmOracle` trait + 测试里的 `MockOracle`（纯函数）；原有的本地假服务器测试（127.0.0.1）保留 | `llm.rs`、`tests/b2_tests.rs` |
+| `explain()` 串起来：规则 → 启发式 → （可选）LLM → Unknown，记录 source / confidence | **本轮加** `explain_full` + `enforce_guards`（决定 12、13） | `explain/mod.rs` |
+| 测试覆盖优先级与护栏（启发式只有 Chromium 缓存能 safe，LLM 永不 safe） | **本轮加** | `tests/b2_tests.rs` |
+
+另外：conda 装在别处时的 `conda-env`（keep + 迁移）和 `conda-pkgs`（review + `conda clean --all`）两个启发式（决定 16）；GUI 详情面板和设置页里“会发送什么”的说明改成新的四样东西，“属于”一栏在 AI 结果里改为“没查到（归属只看注册表，不让 AI 猜）”。
+
+**规则库现状（203 条）：**
+
+| 文件 | 条数 | safe | review | keep |
+|---|---:|---:|---:|---:|
+| windows-system.toml | 58 | 10 | 7 | 41 |
+| browsers.toml | 19 | 9 | 1 | 9 |
+| dev-caches.toml | 41 | 16 | 12 | 13 |
+| ai-models.toml | 13 | 0 | 12 | 1 |
+| cn-apps.toml | 36 | 7 | 12 | 17 |
+| misc.toml | 36 | 8 | 19 | 9 |
+| **合计** | **203** | 50 | 63 | 90 |
+
+**启发式现状（按尝试顺序）**：chat-data（keep）→ chromium-cache（**唯一可 safe**）/ chromium-cache-mixed → conda-pkgs / conda-env（keep）/ python-venv / python-env → site-packages 里面（python-env）→ app-bundled-modules（keep）/ node-modules / node-modules-orphan → rust-target → dotnet-build → model-weights → virtual-disk（keep）→ logs-dumps → downloaded-installer → temp-files → media-files → 注册表归属（registry-install-dir / registry-program-dir / registry-appdata）→ 未知。
+
+### 9.2 怎么验证的
+
+**单元 / 集成测试**（`CARGO_TARGET_DIR` 指回主目录 `target/`）：`cargo test -p diskwhy-core -p diskwhy-cli` → **70 个通过，0 失败，2 个忽略**（忽略的是阶段 C 的 dedup 手动对照和本轮的全量对照，都要设环境变量才跑）。B-1 时是 59 个，本轮新增 `tests/b2_tests.rs` 11 个：
+
+| 测试 | 测什么 |
+|---|---|
+| `b2_rules_total_and_listed_software` | 规则 ≥ 80；任务点名的 27 条规则逐条核档位；8 类 AI 模型都有 migrate + delete；聊天文件和 conda envs 都是 migrate 且没有 delete |
+| `b2_listed_items_real_paths` | 31 个真实长相的路径（HF hub/transformers、Ollama、torch、ModelScope、insightface、paddle、LM Studio、whisper、微信 FileStorage\File / Video、xwechat_files、QQ FileRecv / nt_qq、企业微信、飞书、钉钉、网易云、QQ 音乐、酷狗、B 站、WPS、搜狗、微软拼音、conda envs、Steam shadercache / htmlcache、Epic webcache 两种名字、暴雪缓存）：规则 id、档位、文案非空、keep 不给删除且能腾出 = 0 |
+| `b2_chromium_cache_strict_signature_is_the_only_safe_heuristic` | 真实建目录：新版 Cache\Cache_Data（含 No_Vary_Search）、GPUCache、Code Cache 及 js → safe 且带“很久没用”；混了 .docx / readme.txt 的、名字不对的 → mixed（review）；“文档”里的 → review 并说明原因；最后把整棵树每个文件夹都解释一遍，safe 只能来自 chromium-cache |
+| `b2_heuristics_project_hints_chat_data_conda_and_inheritance` | node_modules 本身 / 里面的包 / 嵌套的都指向项目「web」；遗留的；Typeless 式 `app.asar.unpacked\node_modules` 和 `resources\app\node_modules` → keep；target\debug → 项目「rs」；site-packages\numpy；改了位置的 `WeChat Files`（视频占大头）→ keep + 只给迁移；Program Files 下的 WXWork 不算；conda envs / 某个环境 → keep；conda pkgs → review + 系统工具 |
+| `b2_long_unused_note_on_cache_rules` | 规则命中的 pip 缓存 400 天没动 → “很久没用”；HF 模型不写；10 天不写 |
+| `b2_registry_owner_by_install_location_prefix_and_name` | InstallLocation 为空时用 DisplayIcon 的 exe 目录做路径前缀匹配；AppData 下文件夹名匹配 DisplayName |
+| `b2_real_registry_reads_three_views` | 真实注册表：来源只有 HKLM64 / HKLM32 / HKCU 三种 |
+| `b2_llm_input_four_fields_top20_and_username_redacted` | 序列化后只有 `children / name / parent / size` 四个键；32 个子项只发 20 个；`bobtools` → `~tools`、`Bob-Notes.txt` → `~-Notes.txt`、叫 `BOB` 的子文件夹 → `~\`；整个请求体里找不到 “bob”；扫用户目录本身时名字是 `~`；用户目录不在 `C:\Users` 下时靠调用方给的用户名脱敏 |
+| `b2_llm_answer_only_what_why_lose` | 回复里带 `tier:"safe"`、`owner`、`confidence:0.99`、`how:["delete"]` 全部不算数；控制字符被去掉；1000 字的字段截到 300 |
+| `b2_explain_chain_priority_rule_heuristic_llm_unknown` | 用假 oracle（纯函数，记录调用次数和请求体）：规则命中不问、启发式命中不问、都没认出来且开关打开才问一次（结果 review / Llm / 0.3 / 不写 AI 猜的归属 / 保留线索 / 请求体没有用户名）；开关默认关闭时一次都不调用；不传 oracle 等于 `explain()`；oracle 出错或回复不是 JSON → 退回未知并在 notes 里写原因 |
+| `b2_enforce_guards_on_every_source` | 直接构造各来源的解释过护栏：LLM 的 safe / keep → review 且能腾出清零；未知 → review；非白名单启发式的 safe → review；chromium-cache 在普通位置保持 safe、在“文档”里 → review；规则的 safe 在“文档”里 → review，keep 不动 |
+
+旧测试按新行为改了 4 处：Chromium 缓存样例从 review 改为 safe、没有 package.json 的 node_modules 从“不认”改为 `node-modules-orphan`、LLM 字段数从 9 改为 4 个具名字段、AI 可信度从“≤0.9”改为固定 0.3。
+
+**变异检查**：临时把启发式出口的 safe 白名单和 `enforce_guards` 里的启发式分支都拿掉，`b2_chromium_cache_…` 和 `b2_enforce_guards_…` 两个测试立刻失败；恢复后全绿。说明护栏测试真的在看护栏。
+
+**本机全量对照**（手动测试 `b2_manual_real_dir_sweep`，发布版，本机真实环境变量 + 内置规则 + 本机 `%LOCALAPPDATA%\DiskWhy\rules` 里另一轮会话留下的 4 条演示规则 = 207 条、真实注册表 260 个软件，只读扫描、不联网）：
+
+| 目录 | 扫描 | 文件夹数 | 解释用时 | 结果要点 |
+|---|---:|---:|---:|---|
+| `C:\Users\king\AppData\Local` | 31 s | 73,148 | 1.9 s | 规则精确 970 / 继承 63,215；启发式判 safe 的只有 1 处（Playwright 浏览器配置里的 `Shared Dictionary\cache`，264 KB）；`app-bundled-modules` 26 处（Typeless、Notion 自带依赖，keep）；未知 3,797 个文件夹 21.1 GB |
+| `D:\conda` | 16 s | 89,246 | 6.0 s | 16 个环境全部 `conda-env`（keep，合计 49.0 GB）；`D:\conda\pkgs` 1.44 GB → `conda-pkgs`（review + conda clean） |
+| `D:\desk` | 6 s | 72,522 | 5.9 s | 启发式 safe 283 处共 1019 MB，逐条看都是测试用 Chrome 配置目录里的 `Default\Cache`；`rust-target` 895 个（含本项目 `target\`）；`node-modules` 5,698 个、`node-modules-orphan` 119 个（多是 `dist\client\node_modules` 这类打包输出） |
+
+对照中发现并修掉的问题：**Typeless、Notion 安装目录里的 `resources\app.asar.unpacked\node_modules` 第一次跑时被说成“遗留的依赖，可以删”**——删了软件就坏。改成先判断是否是软件自带（Electron 布局 / 程序目录 / 注册表安装目录）→ keep，并补了测试。另外 kimi-code 在 AppData 里的 node_modules 没有 package.json，原文案“项目可能已经删了”不对，改成“在 AppData 里通常是某个软件运行要用的”，办法改成手动。
+
+**其他**：`cargo check -p diskwhy`（Tauri 壳）通过；两个新参考链接：暴雪文章 curl 跟随跳转后 200（规则里改成跳转后的地址 `…/en/help/article/34721`），Epic 文章返回 403（站点反爬，浏览器能打开）。
+
+### 9.3 没做 / 没验证的
+
+- **没有在 GUI 里重新构建和截图**：worktree 里没有 `node_modules`，而主目录正被另一轮会话用来做阶段 D；本轮前端只改了两处文案，Tauri 壳 `cargo check` 通过，但 `npm run tauri build` 和截图没做。
+- **LLM 没有连真实模型重测**：新的四字段请求体只用假 oracle 和本地假服务器验证过；本机 Ollama 能不能靠这么少的信息猜得像样，没试（按要求不联网）。可以预期猜得比原来更泛，这也是可信度固定 0.3 的原因。
+- Epic、暴雪两条规则的依据是官方客服文章经搜索引擎摘录的正文，不是我直接打开页面读到的（Epic 403、暴雪 WebFetch 断连）；本机没装这两个启动器，路径没在本机核实。Steam htmlcache 本机存在（301 MB），但没找到官方说明，所以是 review。
+- Chromium 严格签名在本机只见过 Chrome / Edge / Steam 内置浏览器 / Playwright 配置的缓存格式；别的 Electron 程序如果在缓存目录里放了额外文件，会落到 `chromium-cache-mixed`（review），这是有意偏保守。
+- 被合并进“其余小文件”的文件看不到名字：Chromium 缓存判断只能核对最大的 50 个文件名，`index` 被合并掉时去文件系统确认它存在。理论上有漏网的可能，概率很低。
+- 注册表仍没换成 windows-registry / winreg crate（决定 7）；以管理员身份运行、其他用户账户的 HKCU 仍未验证。
+- 第 6 节里“86 条规则的路径本机不存在、没在装了这些软件的机器上核实”仍然成立。
+
+### 9.4 下一步从哪接
+
+- 继续在 `D:\desk\claudex\13\diskwhy\.worktrees\phase-b` 做，提交到 `phase-b`，构建用 `CARGO_TARGET_DIR=D:/desk/claudex/13/diskwhy/target`。
+- 用户醒来后要决定：主目录里那批阶段 D 改动怎么处理；之后 `git merge phase-b`。`src/components/DetailPanel.vue` 两边都改过，合并时注意那两行“发送什么”的文案要保留 B-2 的版本。
+- 想看真实模型在四字段下的表现：在设置里填本机 Ollama，对 `AppData\Local` 里的未知项点“问 AI”，把结果和第 4 节的截图对比。
+- 手动全量对照可以随时重跑：`DISKWHY_SWEEP_DIR=<目录> cargo test --release -p diskwhy-core --test b2_tests b2_manual_real_dir_sweep -- --ignored --nocapture`。

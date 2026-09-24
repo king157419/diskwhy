@@ -149,6 +149,26 @@ fn has_child(n: &Node, name: &str) -> bool {
     child(n, name).is_some()
 }
 
+/// cargo 编译目录的标记：目录里同时有 `CACHEDIR.TAG` 和 `.rustc_info.json`。
+fn is_cargo_target_node(n: &Node) -> bool {
+    n.kind == NodeKind::Dir && has_child(n, "CACHEDIR.TAG") && has_child(n, ".rustc_info.json")
+}
+
+/// 自己或上层（最多往上 8 层）是 cargo 编译目录时，返回那个目录的路径。
+/// 自己的子项没在内存里时（JSON 截断），去文件系统确认两个标记文件在不在。
+fn cargo_target_dir(t: &Target) -> Option<String> {
+    let me = t.node;
+    if me.kind == NodeKind::Dir {
+        let on_disk = me.children.is_empty()
+            && Path::new(t.path).join("CACHEDIR.TAG").is_file()
+            && Path::new(t.path).join(".rustc_info.json").is_file();
+        if is_cargo_target_node(me) || on_disk {
+            return Some(t.path.trim_end_matches('\\').to_string());
+        }
+    }
+    t.ancestors.iter().rev().take(8).find(|a| is_cargo_target_node(a)).map(|a| a.path.clone())
+}
+
 fn parent_path(t: &Target) -> Option<String> {
     if let Some(p) = t.parent {
         if !p.path.is_empty() {
@@ -778,6 +798,25 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
                 clues: vec![format!("在 target 文件夹里，旁边有 Cargo.toml（项目在 {project}）")],
             });
         }
+    }
+    // 4b. 用 CARGO_TARGET_DIR / --target-dir 指到别处的编译目录：旁边没有 Cargo.toml，
+    //     但 cargo 会在目录里放 CACHEDIR.TAG（给备份软件看的“这是缓存”标记）和 .rustc_info.json。
+    //     只查这两个文件在不在，不读内容。本身或任一上层文件夹是这样的目录都算。
+    if let Some(tdir) = cargo_target_dir(t) {
+        let own = tdir.eq_ignore_ascii_case(t.path.trim_end_matches('\\'));
+        return Some(Hint {
+            name: "rust-target",
+            tier: Tier::Review,
+            category: Category::Build,
+            what: if own { "Rust 的编译产物目录（cargo 的 target，单独放在这里）".into() } else { "Rust 编译产物的一部分（cargo 的 target，单独放在这里）".into() },
+            why: "有人用 CARGO_TARGET_DIR 或 --target-dir 把 cargo build / cargo test 的输出放到了这里".into(),
+            lose: "删了只是下次要重新编译（可能要几分钟到几十分钟），不丢源代码。如果正在编译，先等它结束。".into(),
+            how: vec![How::Delete],
+            how_detail: format!("在对应项目里执行 cargo clean --target-dir \"{tdir}\"，或在没有编译进行时直接删掉 {tdir}。"),
+            confidence: 0.7,
+            owner: None,
+            clues: vec![format!("{tdir} 里有 CACHEDIR.TAG 和 .rustc_info.json（cargo 编译目录的标记），旁边没有 Cargo.toml，看不出是哪个项目")],
+        });
     }
 
     // 6. .NET bin/obj（旁边有 *.csproj，且 bin 和 obj 同时存在）。

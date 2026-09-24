@@ -512,6 +512,21 @@ impl RuleSet {
         None
     }
 
+    /// 某个路径（不一定是真实节点的路径）命中的 `scope = tree` 规则，挑最具体的。
+    /// 商店应用沙箱重定向时，用“应用以为自己写到的位置”找上层规则（见 `explain::msix_redirect`）。
+    pub fn best_tree_exact(&self, segs: &[String], node: Option<&Node>) -> Option<usize> {
+        let mut best: Option<(u32, usize)> = None;
+        for (ri, p) in &self.patterns {
+            if self.rules[*ri].scope != Scope::Tree {
+                continue;
+            }
+            if (best.is_none() || p.specificity > best.unwrap().0) && p.matches(segs) && self.rule_accepts(*ri, node) {
+                best = Some((p.specificity, *ri));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     pub fn by_id(&self, id: &str) -> Option<&Rule> {
         self.rules.iter().find(|r| r.id == id)
     }

@@ -456,3 +456,166 @@ pub fn human_bytes(b: u64) -> String {
         format!("{v:.2} {}", U[i])
     }
 }
+
+// ───────────────────────── 阶段 B-3：带解释的 JSON 导出 / 扫描根以上的祖先 / 子树是否完整 ─────────────────────────
+
+/// `diskwhy-cli scan --json` 导出的目录树节点：原节点字段 + 目录的解释摘要。
+///
+/// 读回来时（[`crate::snapshot::from_json_bytes`]）按普通 [`Node`] 解析，`explanation` 字段被忽略。
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainedNode {
+    #[serde(flatten)]
+    pub node: Node,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<explain::ExplainSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ExplainedNode>,
+}
+
+/// 导出一棵截断过的树：
+/// - 前 `depth` 层全部保留（depth=0 只保留根）；
+/// - `keep` 里的每个目录（通常是前 N 大目录），连同它的所有上层文件夹，都把**直接子项**保留下来，
+///   这样读回 JSON 后前 N 大目录还在、规则的 `when_child` 和“旁边有没有 package.json”这类判断还能做；
+/// - 给了 `ctx` 时，每个目录节点附解释摘要（在完整的树上算，不受截断影响；不调 LLM）。
+///
+/// `outer` 是扫描根以上的祖先（见 [`outer_ancestors`]），用于上层规则的继承。
+pub fn export_tree(tree: &Node, depth: usize, keep: &[&str], outer: &[Node], ctx: Option<&ExplainCtx>) -> ExplainedNode {
+    let mut spine = std::collections::HashSet::new();
+    for p in keep {
+        let norm = crate::scan::normalize_root(p).to_lowercase();
+        let mut cur = norm.as_str();
+        loop {
+            spine.insert(cur.to_string());
+            match cur.rsplit_once('\\') {
+                Some((parent, _)) if parent.len() >= 2 => {
+                    cur = if parent.len() == 2 { &norm[..3] } else { parent };
+                    if spine.contains(cur) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    let mut chain: Vec<&Node> = outer.iter().collect();
+    export_walk(tree, 0, depth, &spine, &mut chain, ctx)
+}
+
+fn export_walk<'a>(
+    n: &'a Node,
+    level: usize,
+    depth: usize,
+    spine: &std::collections::HashSet<String>,
+    chain: &mut Vec<&'a Node>,
+    ctx: Option<&ExplainCtx>,
+) -> ExplainedNode {
+    let explanation = match (ctx, n.kind) {
+        (Some(ctx), NodeKind::Dir) => {
+            let t = Target { node: n, path: &n.path, parent: chain.last().copied(), ancestors: chain };
+            Some(explain::explain(&t, ctx).summary())
+        }
+        _ => None,
+    };
+    let expand = n.kind == NodeKind::Dir && (level < depth || spine.contains(&n.path.to_lowercase()));
+    let mut children = Vec::new();
+    if expand {
+        chain.push(n);
+        for c in &n.children {
+            if c.kind == NodeKind::Dir {
+                children.push(export_walk(c, level + 1, depth, spine, chain, ctx));
+            } else {
+                children.push(ExplainedNode { node: c.clone_shallow(), explanation: None, children: Vec::new() });
+            }
+        }
+        chain.pop();
+    }
+    ExplainedNode { node: n.clone_shallow(), explanation, children }
+}
+
+/// 扫描根以上的各层文件夹（从盘符根开始，不含扫描根本身），每个只带**直接子项的名字和类型**
+/// （读一次目录，不量大小）。只扫 `C:\Users\me\AppData\Local\pip\cache` 时，
+/// 靠它才能知道上层 `pip` 文件夹命中了哪条规则（继承），以及 node_modules 旁边有没有 package.json。
+pub fn outer_ancestors(root: &str) -> Vec<Node> {
+    let norm = crate::scan::normalize_root(root);
+    let mut prefixes = Vec::new();
+    let mut cur = norm.as_str();
+    while let Some((parent, _)) = cur.rsplit_once('\\') {
+        if parent.len() < 2 {
+            break;
+        }
+        let p = if parent.len() == 2 { &norm[..3] } else { parent };
+        if p.eq_ignore_ascii_case(cur) {
+            break;
+        }
+        prefixes.push(p.to_string());
+        cur = p;
+        if p.len() <= 3 {
+            break;
+        }
+    }
+    prefixes.reverse();
+    prefixes
+        .into_iter()
+        .map(|p| {
+            let name = if p.len() <= 3 { p.clone() } else { p.rsplit('\\').next().unwrap_or("").to_string() };
+            let mut me = Node {
+                name,
+                path: p.clone(),
+                kind: NodeKind::Dir,
+                logical: 0,
+                allocated: 0,
+                mtime: 0,
+                attrs: 0,
+                reparse_tag: 0,
+                inaccessible: false,
+                error_code: 0,
+                reparse_skipped: false,
+                cloud_placeholder: false,
+                system_reserved: false,
+                hardlink_dup: false,
+                mapped: false,
+                files: 0,
+                dirs: 0,
+                children: Vec::new(),
+            };
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                for ent in rd.flatten().take(5_000) {
+                    let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let cname = ent.file_name().to_string_lossy().to_string();
+                    let mut c = me.clone_shallow();
+                    c.path = if is_dir { join(&p, &cname) } else { String::new() };
+                    c.name = cname;
+                    c.kind = if is_dir { NodeKind::Dir } else { NodeKind::File };
+                    me.children.push(c);
+                }
+            }
+            me
+        })
+        .collect()
+}
+
+/// 这个目录的子树在内存里是不是完整的（没被 JSON 导出截断）。
+///
+/// 扫描出来的树满足：`dirs` = 子树里的目录数，`files` = 各子项 `files` 之和（Rest 节点记被合并的个数）。
+/// 截断过的树（`--json-depth`）不满足。无权限、链接、目录映射本来就不展开，算完整。
+pub fn subtree_complete(n: &Node) -> bool {
+    if n.kind != NodeKind::Dir || n.inaccessible || n.reparse_skipped || n.mapped {
+        return true;
+    }
+    let mut dirs = 0u64;
+    let mut files = 0u64;
+    for c in &n.children {
+        files += c.files;
+        if c.kind == NodeKind::Dir {
+            dirs += 1 + c.dirs;
+        }
+    }
+    dirs == n.dirs && files == n.files && n.children.iter().all(subtree_complete)
+}
+
+/// 解释一个节点：祖先链由调用方给（可以包含 [`outer_ancestors`] 造出来的扫描根以上的各层）。
+/// `llm` 见 [`explain::explain_full`]：不传就不联网。
+pub fn explain_at(node: &Node, path: &str, ancestors: &[&Node], ctx: &ExplainCtx, llm: Option<&dyn explain::llm::LlmOracle>) -> Explanation {
+    let t = Target { node, path, parent: ancestors.last().copied(), ancestors };
+    explain::explain_full(&t, ctx, llm)
+}

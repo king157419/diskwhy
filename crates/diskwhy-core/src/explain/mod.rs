@@ -118,6 +118,25 @@ impl Explanation {
     pub fn is_unknown(&self) -> bool {
         self.source == Source::Unknown
     }
+
+    /// 来自规则库（精确命中或继承上层）。
+    pub fn is_rule(&self) -> bool {
+        matches!(self.source, Source::Rule { .. })
+    }
+
+    pub fn summary(&self) -> ExplainSummary {
+        ExplainSummary { tier: self.tier, owner: self.owner.clone(), source: self.source.clone(), what: self.what.clone() }
+    }
+}
+
+/// 解释摘要：`diskwhy-cli scan --json` 给树里每个目录节点附上的那一小段
+/// （档位、属于谁、说明从哪来、一句话）。完整解释用 `diskwhy-cli explain`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplainSummary {
+    pub tier: Tier,
+    pub owner: Option<String>,
+    pub source: Source,
+    pub what: String,
 }
 
 /// 解释用的上下文：展开后的环境变量、规则库、注册表快照、LLM 设置。启动时建一次。
@@ -263,14 +282,94 @@ pub fn explain_with_inherited(t: &Target, inherited: Option<&InheritedHit>, ctx:
         return enforce_guards(explain_rest(t, inherited, ctx), t.path, ctx);
     }
     let segs = split_lower(t.path);
+    let redirect = msix_redirect(t.path, ctx);
     let e = if let Some(idx) = ctx.rules.best_exact(&segs, Some(node)) {
         from_rule(&ctx.rules.rules[idx], t, &segs, None, ctx)
+    } else if let Some(e) = redirect.as_ref().and_then(|r| explain_redirected(t, r, ctx)) {
+        e
     } else if let Some(h) = inherited {
-        from_rule(&ctx.rules.rules[h.rule], t, &segs, Some(&h.from_path), ctx)
+        let mut e = from_rule(&ctx.rules.rules[h.rule], t, &segs, Some(&h.from_path), ctx);
+        if let Some(r) = &redirect {
+            e.notes.push(format!(
+                "注意：这里是商店应用「{}」的沙箱，里面其实是写到「{}」的东西被 Windows 重定向了过来，不一定都是这个应用自己的数据；DiskWhy 按应用本身来说明，你删之前最好点进去看看。",
+                r.package, r.virtual_path
+            ));
+        }
+        e
     } else {
         heuristics::explain_unmatched(t, ctx)
     };
     enforce_guards(e, t.path, ctx)
+}
+
+/// 商店应用（MSIX）沙箱重定向：打包的桌面应用（以及它启动的程序）在 `AppData` 里**新建**的文件和文件夹，
+/// Windows 会写到 `%LOCALAPPDATA%\Packages\<包名>\LocalCache\{Local,Roaming,LocalLow}\…`，
+/// 应用自己看到的还是 `AppData\…`（learn.microsoft.com：Understanding how packaged desktop apps run on Windows）。
+/// 所以沙箱里的 `LocalCache\Local\pip\cache` 其实就是 pip 缓存，应该按 `%LOCALAPPDATA%\pip\cache` 来说明。
+pub struct MsixRedirect {
+    /// 包的文件夹名，如 `Claude_pzs8sxrjxfjjc`。
+    pub package: String,
+    /// 应用以为自己写到的位置，如 `C:\Users\me\AppData\Local\pip\cache`。
+    pub virtual_path: String,
+    /// `virtual_path` 在真实路径里从第几段开始对应（真实路径前 `real_base_len` 段 = `…\LocalCache\Local`）。
+    pub real_base_len: usize,
+    /// 虚拟路径里 `AppData\Local` 这一层有几段。
+    pub virtual_base_len: usize,
+}
+
+pub fn msix_redirect(path: &str, ctx: &ExplainCtx) -> Option<MsixRedirect> {
+    let local = ctx.env.get("LOCALAPPDATA")?;
+    let lsegs = split_lower(local);
+    let segs = split_lower(path);
+    // …\Packages\<包>\LocalCache\<Local|Roaming|LocalLow>\<至少一层>
+    if segs.len() < lsegs.len() + 5 || segs[..lsegs.len()] != lsegs[..] || segs[lsegs.len()] != "packages" || segs[lsegs.len() + 2] != "localcache" {
+        return None;
+    }
+    let base = match segs[lsegs.len() + 3].as_str() {
+        "local" => local.to_string(),
+        "roaming" => ctx.env.get("APPDATA")?.to_string(),
+        "locallow" => format!("{}\\AppData\\LocalLow", ctx.env.get("USERPROFILE")?),
+        _ => return None,
+    };
+    let orig: Vec<&str> = path.trim_end_matches('\\').split('\\').filter(|s| !s.is_empty()).collect();
+    if orig.len() != segs.len() {
+        return None;
+    }
+    let real_base_len = lsegs.len() + 4;
+    let virtual_path = format!("{}\\{}", base.trim_end_matches('\\'), orig[real_base_len..].join("\\"));
+    Some(MsixRedirect { package: orig[lsegs.len() + 1].to_string(), virtual_path, real_base_len, virtual_base_len: split_lower(&base).len() })
+}
+
+/// 按重定向前的位置找规则：精确 → 上层 tree 规则 → 启发式。都认不出返回 None（调用方退回包自己的规则）。
+fn explain_redirected(t: &Target, r: &MsixRedirect, ctx: &ExplainCtx) -> Option<Explanation> {
+    let vsegs = split_lower(&r.virtual_path);
+    let note = format!(
+        "它在商店应用「{}」的沙箱里：Windows 把写到「{}」的新文件重定向到了这里（应用自己看到的还是原位置），所以按原位置来说明。",
+        r.package, r.virtual_path
+    );
+    let mut e = if let Some(idx) = ctx.rules.best_exact(&vsegs, Some(t.node)) {
+        from_rule(&ctx.rules.rules[idx], t, &vsegs, None, ctx)
+    } else {
+        // 上层：只看沙箱 LocalCache\<种类> 以下的祖先（再往上就是包自己的规则了）。
+        let hit = t.ancestors.iter().rev().filter(|a| split_lower(&a.path).len() > r.real_base_len).find_map(|a| {
+            let asegs = split_lower(&a.path);
+            let mut v = vsegs[..r.virtual_base_len].to_vec();
+            v.extend_from_slice(&asegs[r.real_base_len..]);
+            ctx.rules.best_tree_exact(&v, Some(a)).map(|idx| (idx, a.path.clone()))
+        });
+        match hit {
+            Some((idx, from)) => from_rule(&ctx.rules.rules[idx], t, &vsegs, Some(&from), ctx),
+            None => {
+                let h = heuristics::explain_unmatched(t, ctx);
+                if h.is_unknown() {
+                    return None;
+                }
+                h
+            }
+        }
+    };
+    e.notes.insert(0, note);
+    Some(e)
 }
 
 /// 目录的“其余小文件合计”节点：跟随所在目录的说明。

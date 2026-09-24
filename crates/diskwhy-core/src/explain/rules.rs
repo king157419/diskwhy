@@ -23,13 +23,19 @@
 //! 校验（[`validate`]）：字段齐全、枚举合法、id 唯一、模式以白名单环境变量开头、
 //! `safe` 不许落在桌面/文档/图片/视频/音乐/下载/OneDrive 之下、`keep` 不许 `how = delete`、
 //! `builtin_tool`/`migrate` 必须写 `how_detail`、`verified_on` 是 YYYY-MM-DD。
+//!
+//! 加载时另查重复模式（[`pattern_key`]）：同一个模式（大小写、`/` 与 `\`、`%SystemRoot%` 与
+//! `%WINDIR%` 都视为相同）出现在两条规则里，或同一条规则里写了两遍，报错，后来的那条不加载；
+//! 展开环境变量后两条规则落到同一个路径（比如用户规则写 `%USERPROFILE%\AppData\Local\npm-cache`，
+//! 内置规则写 `%LOCALAPPDATA%\npm-cache`）也算重复——否则后来的那条永远不会生效。
+//! `kind` 或 `when_child` 不同的两个同名模式不算重复（它们认的是不同的东西）。
 
 use super::env::{self, EnvMap};
 use super::pattern::{split_lower, Pattern};
 use super::{Category, How, Tier};
 use crate::model::{Node, NodeKind};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// 编译期嵌入的规则文件（文件名即分组名）。
@@ -242,12 +248,93 @@ pub fn validate(def: &RuleDef, seen_ids: &mut HashSet<String>) -> Vec<String> {
     e
 }
 
+/// 模式查重用的键（见模块文档）。`raw` 可以是原始写法，也可以是展开后的路径。
+pub fn pattern_key(raw: &str, kind: KindFilter, when_child: &[String]) -> String {
+    let mut segs = split_lower(raw);
+    if let Some(first) = segs.first_mut() {
+        if first == "%windir%" {
+            *first = "%systemroot%".to_string();
+        }
+    }
+    let mut wc: Vec<String> = when_child.iter().map(|w| w.trim().to_lowercase()).collect();
+    wc.sort();
+    wc.dedup();
+    format!("{}|{:?}|{}", segs.join("\\"), kind, wc.join(","))
+}
+
+/// 已加载规则的模式键 → 规则 id（原始写法、展开后各一张表）。
+#[derive(Default)]
+struct SeenPatterns {
+    raw: HashMap<String, String>,
+    expanded: HashMap<String, String>,
+}
+
+impl SeenPatterns {
+    fn record(&mut self, id: &str, raw_keys: Vec<String>, exp_keys: Vec<String>) {
+        for k in raw_keys {
+            self.raw.insert(k, id.to_string());
+        }
+        for k in exp_keys {
+            self.expanded.entry(k).or_insert_with(|| id.to_string());
+        }
+    }
+}
+
+/// 查重通过后的结果。
+struct DupOutcome {
+    raw_keys: Vec<String>,
+    exp_keys: Vec<String>,
+    /// 展开后和别的规则撞车的模式下标：这些模式不编译（规则本身照常加载）。
+    skip: Vec<usize>,
+    warnings: Vec<String>,
+}
+
+/// 查重。
+///
+/// - 原始写法重复（跨规则或本条规则内）：返回 `Err`，整条规则不加载。这是写规则的人的错，
+///   内置规则有一条这样的测试就失败。
+/// - 展开后和已加载的其他规则撞车：只跳过这个模式并给警告。它取决于本机环境变量（比如某台机器
+///   的 `%TEMP%` 被改成了 `C:\Windows\Temp`），不能因此把整条规则扔掉。
+/// - 同一条规则里两种写法展开后相同是允许的（`%TEMP%` 和 `%LOCALAPPDATA%\Temp` 互为兜底）。
+fn duplicate_check(def: &RuleDef, env: &EnvMap, seen: &SeenPatterns) -> Result<DupOutcome, Vec<String>> {
+    let id = def.id.trim();
+    let mut errs = Vec::new();
+    let mut out = DupOutcome { raw_keys: Vec::new(), exp_keys: Vec::new(), skip: Vec::new(), warnings: Vec::new() };
+    for (i, p) in def.patterns.iter().enumerate() {
+        let k = pattern_key(p, def.kind, &def.when_child);
+        if out.raw_keys.contains(&k) {
+            errs.push(format!("模式 `{p}` 在这条规则里写了两遍（大小写、斜杠不同也算同一个）"));
+        } else if let Some(other) = seen.raw.get(&k) {
+            errs.push(format!("模式 `{p}` 和规则 `{other}` 重复"));
+        }
+        out.raw_keys.push(k);
+        if let Ok(x) = env.expand(p) {
+            let ek = pattern_key(&x, def.kind, &def.when_child);
+            match seen.expanded.get(&ek) {
+                Some(other) if other != id => {
+                    out.warnings.push(format!(
+                        "规则 `{id}` 的模式 `{p}` 在本机展开后是 `{x}`，和规则 `{other}` 指向同一个位置，这个模式已跳过"
+                    ));
+                    out.skip.push(i);
+                }
+                _ => out.exp_keys.push(ek),
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(out)
+    } else {
+        Err(errs)
+    }
+}
+
 impl RuleSet {
     /// 从若干 (分组名, TOML 文本) 加载。校验不过的规则不加载，错误全部返回。
     pub fn from_sources(sources: &[(&str, &str)], env: &EnvMap) -> (RuleSet, Vec<String>) {
         let mut rs = RuleSet::default();
         let mut seen = HashSet::new();
-        let errors = rs.add_sources(sources, env, &mut seen);
+        let mut seen_patterns = SeenPatterns::default();
+        let errors = rs.add_sources(sources, env, &mut seen, &mut seen_patterns);
         (rs, errors)
     }
 
@@ -256,7 +343,13 @@ impl RuleSet {
         Self::from_sources(EMBEDDED, env)
     }
 
-    fn add_sources(&mut self, sources: &[(&str, &str)], env: &EnvMap, seen: &mut HashSet<String>) -> Vec<String> {
+    fn add_sources(
+        &mut self,
+        sources: &[(&str, &str)],
+        env: &EnvMap,
+        seen: &mut HashSet<String>,
+        seen_patterns: &mut SeenPatterns,
+    ) -> Vec<String> {
         let mut errors = Vec::new();
         for (group, text) in sources {
             let file: RuleFile = match toml::from_str(text) {
@@ -267,20 +360,29 @@ impl RuleSet {
                 }
             };
             for def in file.rule {
-                let errs = validate(&def, seen);
-                if !errs.is_empty() {
+                let mut errs = validate(&def, seen);
+                let dup = match duplicate_check(&def, env, seen_patterns) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        errs.extend(e);
+                        None
+                    }
+                };
+                let Some(dup) = dup.filter(|_| errs.is_empty()) else {
                     for x in errs {
                         errors.push(format!("[{group}] 规则 `{}`：{x}", def.id));
                     }
                     continue;
-                }
-                self.push(def, group, env);
+                };
+                errors.extend(dup.warnings.into_iter().map(|w| format!("[{group}] {w}")));
+                seen_patterns.record(def.id.trim(), dup.raw_keys, dup.exp_keys);
+                self.push(def, group, env, &dup.skip);
             }
         }
         errors
     }
 
-    fn push(&mut self, def: RuleDef, group: &str, env: &EnvMap) {
+    fn push(&mut self, def: RuleDef, group: &str, env: &EnvMap, skip: &[usize]) {
         let idx = self.rules.len();
         let how = def.how();
         let rule = Rule {
@@ -302,8 +404,12 @@ impl RuleSet {
             when_child: def.when_child,
             owner_from_path: def.owner_from_path,
         };
-        // 环境变量在本机不存在的模式直接跳过（比如 32 位系统没有 ProgramFiles(x86)）。
-        for raw in &rule.raw_patterns {
+        // 环境变量在本机不存在的模式直接跳过（比如 32 位系统没有 ProgramFiles(x86)）；
+        // 展开后和别的规则撞车的模式也跳过（见 duplicate_check）。
+        for (i, raw) in rule.raw_patterns.iter().enumerate() {
+            if skip.contains(&i) {
+                continue;
+            }
             if let Ok(expanded) = env.expand(raw) {
                 self.patterns.push((idx, Pattern::compile(&expanded)));
             }
@@ -316,13 +422,25 @@ impl RuleSet {
         let mut warnings = Vec::new();
         let Ok(rd) = std::fs::read_dir(dir) else { return warnings };
         let mut seen: HashSet<String> = self.rules.iter().map(|r| r.id.clone()).collect();
+        // 用户规则也要和已加载的规则查重。
+        let mut seen_patterns = SeenPatterns::default();
+        for r in &self.rules {
+            let raw_keys = r.raw_patterns.iter().map(|p| pattern_key(p, r.kind, &r.when_child)).collect();
+            let exp_keys = r
+                .raw_patterns
+                .iter()
+                .filter_map(|p| env.expand(p).ok())
+                .map(|x| pattern_key(&x, r.kind, &r.when_child))
+                .collect();
+            seen_patterns.record(&r.id, raw_keys, exp_keys);
+        }
         let mut files: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("toml"))).collect();
         files.sort();
         for f in files {
             match std::fs::read_to_string(&f) {
                 Ok(text) => {
                     let group = format!("user:{}", f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-                    let errs = self.add_sources(&[(group.as_str(), text.as_str())], env, &mut seen);
+                    let errs = self.add_sources(&[(group.as_str(), text.as_str())], env, &mut seen, &mut seen_patterns);
                     warnings.extend(errs);
                 }
                 Err(e) => warnings.push(format!("读取 {} 失败：{e}", f.display())),

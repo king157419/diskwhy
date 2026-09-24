@@ -932,3 +932,316 @@ fn former_unknowns_now_have_rules() {
         assert!(e.why.contains("没有找到") || e.lose.contains("不确定"), "{p} 应写明没核实：{}", e.why);
     }
 }
+
+// ───────────────────────── S22 · 阶段 B-1：schema 补测 + 重复模式 + 每条规则的样例 ─────────────────────────
+
+/// 拼一条合法规则的 TOML（`extra` 是额外字段行）。
+fn rule_toml(id: &str, matches: &str, extra: &str) -> String {
+    format!(
+        "[[rule]]\nid = \"{id}\"\nowner = \"o\"\ncategory = \"cache\"\ntier = \"safe\"\nmatch = [{matches}]\n\
+         what = \"w\"\nwhy = \"y\"\nlose = \"l\"\nhow = \"delete\"\nhow_detail = \"\"\nrefs = []\nverified_on = \"2026-09-23\"\n{extra}\n"
+    )
+}
+
+#[test]
+fn validation_accepts_legal_variants() {
+    // 合法写法：how 数组、scope/kind/when_child/owner_from_path、* 与 ** 通配、各个允许的根变量、refs 列表
+    let variants: &[(&str, &str)] = &[
+        ("how 数组", r#"
+[[rule]]
+id = "a-1"
+owner = "o"
+category = "model"
+tier = "review"
+match = ['%USERPROFILE%\.cache\foo']
+what = "w"
+why = "y"
+lose = "l"
+how = ["migrate", "delete"]
+how_detail = "先迁移"
+refs = ["https://example.com/a", "http://example.com/b"]
+verified_on = "2026-09-23"
+"#),
+        ("容器 + 目录 + when_child + owner_from_path", r#"
+[[rule]]
+id = "b-2"
+owner = "o"
+category = "cache"
+tier = "safe"
+scope = "self"
+kind = "dir"
+when_child = ["Cache_Data", "index"]
+owner_from_path = true
+match = ['%APPDATA%\**\Cache', '%LOCALAPPDATA%\*\Cache']
+what = "w"
+why = "y"
+lose = "l"
+how = "delete"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+"#),
+        ("keep + builtin_tool + 各种根变量", r#"
+[[rule]]
+id = "c-3"
+owner = "o"
+category = "system"
+tier = "keep"
+match = ['%SystemRoot%\x', '%WINDIR%\y', '%SystemDrive%\z', '%ProgramFiles%\p', '%ProgramFiles(x86)%\q', '%ProgramData%\r', '%TEMP%\t', '%PUBLIC%\Libraries']
+what = "w"
+why = "y"
+lose = "l"
+how = "builtin_tool"
+how_detail = "用系统工具"
+refs = []
+verified_on = "2026-09-23"
+"#),
+        ("safe 可以在用户目录下的非个人文件夹（.cache）", r#"
+[[rule]]
+id = "d-4"
+owner = "o"
+category = "cache"
+tier = "safe"
+match = ['%USERPROFILE%\.cache\pip', '%userprofile%\AppData\Local\x']
+what = "w"
+why = "y"
+lose = "l"
+how = "delete"
+how_detail = ""
+refs = []
+verified_on = "2026-09-23"
+"#),
+    ];
+    for (name, text) in variants {
+        let (rs, errs) = RuleSet::from_sources(&[("t", text)], &fake_env());
+        assert!(errs.is_empty(), "「{name}」应合法：{errs:?}");
+        assert_eq!(rs.rules.len(), 1, "「{name}」应加载 1 条");
+    }
+    // 非法 tier / category / how 取值：反序列化就失败
+    for (name, from, to) in [
+        ("tier 取值非法", "tier = \"safe\"", "tier = \"maybe\""),
+        ("category 取值非法", "category = \"cache\"", "category = \"stuff\""),
+        ("how 取值非法", "how = \"delete\"", "how = \"nuke\""),
+        ("verified_on 不是日期", "verified_on = \"2026-09-23\"", "verified_on = \"2026-13-40\""),
+    ] {
+        let t = GOOD.replace(from, to);
+        assert_ne!(t, GOOD);
+        let (rs, errs) = RuleSet::from_sources(&[("t", &t)], &fake_env());
+        assert!(rs.rules.is_empty() && !errs.is_empty(), "「{name}」应加载失败");
+    }
+    // safe 护栏：公共文件夹、OneDrive 变体、通配顶在个人文件夹那一层
+    for m in [r"'%PUBLIC%\Documents\x'", r"'%USERPROFILE%\Pictures'", r"'%USERPROFILE%\OneDrive'", r"'%USERPROFILE%\*\cache'", r"'%USERPROFILE%'"] {
+        let (rs, errs) = RuleSet::from_sources(&[("t", &rule_toml("s-x", m, ""))], &fake_env());
+        assert!(rs.rules.is_empty() && errs.iter().any(|e| e.contains("safe")), "safe 规则 {m} 应被拦：{errs:?}");
+        // 同样的位置写成 review 就可以
+        let (rs, errs) = RuleSet::from_sources(&[("t", &rule_toml("s-x", m, "").replace("tier = \"safe\"", "tier = \"review\""))], &fake_env());
+        assert!(errs.is_empty() && rs.rules.len() == 1, "review 规则 {m} 应放行：{errs:?}");
+    }
+}
+
+#[test]
+fn duplicate_match_is_rejected() {
+    let env = fake_env();
+    // 1. 两条规则写了同一个模式（大小写、斜杠不同）：后来的不加载
+    let a = rule_toml("dup-a", r"'%LOCALAPPDATA%\Foo\Cache'", "");
+    let b = rule_toml("dup-b", r"'%localappdata%/foo/CACHE'", "");
+    let (rs, errs) = RuleSet::from_sources(&[("g1", &a), ("g2", &b)], &env);
+    assert!(rs.by_id("dup-a").is_some() && rs.by_id("dup-b").is_none());
+    assert!(errs.iter().any(|e| e.contains("dup-b") && e.contains("dup-a") && e.contains("重复")), "{errs:?}");
+    // 2. 同一条规则里写两遍
+    let (rs, errs) = RuleSet::from_sources(&[("g", &rule_toml("dup-c", r"'%APPDATA%\x', '%APPDATA%\X'", ""))], &env);
+    assert!(rs.rules.is_empty() && errs.iter().any(|e| e.contains("写了两遍")), "{errs:?}");
+    // 3. %WINDIR% 和 %SystemRoot% 视为同一个根
+    let w = rule_toml("dup-w", r"'%WINDIR%\Foo'", "").replace("tier = \"safe\"", "tier = \"review\"");
+    let s = rule_toml("dup-s", r"'%SystemRoot%\foo'", "").replace("tier = \"safe\"", "tier = \"review\"");
+    let (rs, errs) = RuleSet::from_sources(&[("g", &format!("{w}\n{s}"))], &env);
+    assert!(rs.by_id("dup-s").is_none() && !errs.is_empty(), "{errs:?}");
+    // 4. 同名模式但 when_child 不同：认的是不同东西，不算重复
+    let x = rule_toml("wc-a", r"'%APPDATA%\**\Store'", "when_child = [\"a\"]");
+    let y = rule_toml("wc-b", r"'%APPDATA%\**\Store'", "when_child = [\"b\"]");
+    let (rs, errs) = RuleSet::from_sources(&[("g", &format!("{x}\n{y}"))], &env);
+    assert!(errs.is_empty() && rs.rules.len() == 2, "{errs:?}");
+    // 5. 展开后撞车：只跳过撞车的那个模式，规则照常加载，给警告
+    let p = rule_toml("exp-a", r"'%LOCALAPPDATA%\Bar'", "");
+    let q = rule_toml("exp-b", r"'%USERPROFILE%\AppData\Local\bar', '%LOCALAPPDATA%\Baz'", "");
+    let (rs, errs) = RuleSet::from_sources(&[("g", &format!("{p}\n{q}"))], &env);
+    assert!(rs.by_id("exp-b").is_some(), "展开撞车不应扔掉整条规则");
+    assert!(errs.iter().any(|e| e.contains("exp-b") && e.contains("exp-a") && e.contains("已跳过")), "{errs:?}");
+    assert_eq!(rs.patterns.len(), 2, "exp-a 一个 + exp-b 没撞车的一个");
+    let ctx = ctx_with(env.clone(), rs, vec![]);
+    let t = tree(&[(r"C:\Users\bob\AppData\Local\Bar\x", 1), (r"C:\Users\bob\AppData\Local\Baz\x", 1)]);
+    assert_eq!(rule_id(&ex(&t, r"C:\Users\bob\AppData\Local\Bar", &ctx)), Some("exp-a"));
+    assert_eq!(rule_id(&ex(&t, r"C:\Users\bob\AppData\Local\Baz", &ctx)), Some("exp-b"));
+    // 6. 同一条规则里两种写法展开后相同（互为兜底）：允许，没有警告
+    let (rs, errs) = RuleSet::from_sources(&[("g", &rule_toml("tmp", r"'%TEMP%', '%LOCALAPPDATA%\Temp'", ""))], &env);
+    assert!(errs.is_empty() && rs.rules.len() == 1, "{errs:?}");
+    // 7. 用户规则和内置规则重复：用户规则不加载，给警告
+    let dir = temp_root("userdup");
+    std::fs::write(dir.join("dup.toml"), rule_toml("my-npm", r"'%LOCALAPPDATA%\npm-cache'", "")).unwrap();
+    let (mut rs, _) = RuleSet::embedded(&env);
+    let warns = rs.load_user_dir(&dir, &env);
+    assert!(rs.by_id("my-npm").is_none());
+    assert!(warns.iter().any(|w| w.contains("my-npm") && w.contains("npm-cache")), "{warns:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    // 8. 某台机器 %TEMP% 被改到 C:\Windows\Temp：user-temp 的这个模式跳过，但规则还在、%LOCALAPPDATA%\Temp 照常生效
+    let mut odd = fake_env();
+    odd.set("TEMP", r"C:\Windows\Temp");
+    let (rs, errs) = RuleSet::embedded(&odd);
+    assert!(rs.by_id("user-temp").is_some(), "{errs:?}");
+    assert!(errs.iter().all(|e| e.contains("已跳过")), "只应有跳过警告：{errs:?}");
+    let ctx = ctx_with(odd, rs, vec![]);
+    let t = tree(&[(r"C:\Windows\Temp\a", 1), (r"C:\Users\bob\AppData\Local\Temp\b", 1)]);
+    assert_eq!(rule_id(&ex(&t, r"C:\Windows\Temp", &ctx)), Some("windows-temp"));
+    assert_eq!(rule_id(&ex(&t, r"C:\Users\bob\AppData\Local\Temp", &ctx)), Some("user-temp"));
+}
+
+/// 按模式造一个具体路径：`**` 换成 `deep`（为空时去掉），`*` 换成 `x1`，`?` 换成 `q`。
+fn sample_paths(expanded: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for deep in [None, Some(r"sample\deep")] {
+        let segs: Vec<String> = expanded
+            .split('\\')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                if s == "**" {
+                    deep.map(str::to_string)
+                } else {
+                    Some(s.replace('*', "x1").replace('?', "q"))
+                }
+            })
+            .collect();
+        let p = segs.join("\\");
+        let p = if p.ends_with(':') { format!("{p}\\") } else { p };
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// 每条内置规则至少有一个具体路径能让它“胜出”（被选为这条路径的说明）。
+/// 既证明每个模式都能匹配，也能抓出被更具体的规则完全盖住、永远不会生效的死规则。
+#[test]
+fn every_rule_has_a_matching_sample() {
+    use diskwhy_core::explain::rules::KindFilter;
+    let ctx = embedded_ctx();
+    let file_like = |last: &str| {
+        let l = last.to_lowercase();
+        [".sys", ".db", ".dmp", ".ost", ".pst", ".vhdx", ".elog"].iter().any(|x| l.ends_with(x))
+    };
+    let mut dead = Vec::new();
+    let mut samples = 0usize;
+    for (ri, rule) in ctx.rules.rules.iter().enumerate() {
+        let mut won = false;
+        let mut tried = Vec::new();
+        for (_, p) in ctx.rules.patterns.iter().filter(|(i, _)| *i == ri) {
+            for path in sample_paths(&p.expanded) {
+                let last = path.rsplit('\\').next().unwrap_or("").to_string();
+                let is_file = rule.kind == KindFilter::File || (rule.kind == KindFilter::Any && rule.when_child.is_empty() && file_like(&last));
+                let entries: Vec<(String, u64)> = if path == r"C:\" {
+                    vec![(r"C:\x.bin".to_string(), 1)]
+                } else if is_file {
+                    vec![(path.clone(), 1)]
+                } else if let Some(c) = rule.when_child.first() {
+                    vec![(format!("{path}\\{c}\\f.bin"), 1)]
+                } else {
+                    vec![(format!("{path}\\f.bin"), 1)]
+                };
+                let refs: Vec<(&str, u64)> = entries.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+                let t = tree(&refs);
+                samples += 1;
+                let e = ex(&t, &path, &ctx);
+                if rule_id(&e) == Some(rule.id.as_str()) {
+                    won = true;
+                    // 规则胜出时，解释里的字段都来自这条规则
+                    assert_eq!(e.what, rule.what);
+                    assert_eq!(e.category, rule.category);
+                    assert!((e.confidence - 1.0).abs() < f32::EPSILON);
+                } else {
+                    tried.push(format!("{path} → {:?}", e.source));
+                }
+            }
+        }
+        if !won {
+            dead.push(format!("{}：{tried:?}", rule.id));
+        }
+    }
+    assert!(dead.is_empty(), "这些规则没有任何样例能命中（死规则或模式写错）：\n{}", dead.join("\n"));
+    println!("{} 条规则、{samples} 个样例路径全部通过", ctx.rules.rules.len());
+}
+
+/// 任务 B-1 点名的条目：用真实长相的路径逐条核对档位、办法和说明来源。
+#[test]
+fn b1_listed_items_real_paths() {
+    let ctx = embedded_ctx();
+    let cases: &[(&str, &str, Tier)] = &[
+        // Windows 系统项
+        (r"C:\Windows\WinSxS", "winsxs", Tier::Keep),
+        (r"C:\Windows.old", "windows-old", Tier::Review),
+        (r"C:\Windows\Installer", "windows-installer-cache", Tier::Keep),
+        (r"C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization", "delivery-optimization", Tier::Safe),
+        (r"C:\hiberfil.sys", "hiberfil", Tier::Review),
+        (r"C:\pagefile.sys", "pagefile", Tier::Keep),
+        (r"C:\Windows\Temp", "windows-temp", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Temp", "user-temp", Tier::Safe),
+        (r"C:\Windows\Prefetch", "prefetch", Tier::Keep),
+        (r"C:\Users\bob\AppData\Local\Microsoft\Windows\Explorer\thumbcache_256.db", "thumbnail-cache", Tier::Safe),
+        (r"C:\Windows\SoftwareDistribution\Download", "windows-update-download", Tier::Safe),
+        (r"C:\Windows\Logs", "windows-logs", Tier::Review),
+        (r"C:\ProgramData\Microsoft\Windows Defender\Scans", "defender-scans", Tier::Keep),
+        (r"C:\ProgramData\Microsoft\Windows Defender\Quarantine", "defender-quarantine", Tier::Review),
+        // 浏览器缓存
+        (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Default\Cache", "chrome-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Profile 1\Code Cache", "chrome-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Default\GPUCache", "chrome-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage", "chrome-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Microsoft\Edge\User Data\Default\Cache", "edge-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Microsoft\Edge\User Data\Default\Service Worker\ScriptCache", "edge-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Mozilla\Firefox\Profiles\ab12cd.default-release\cache2", "firefox-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Cache", "chromium-browsers-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Roaming\SomeApp\GPUCache", "chromium-generic-gpu-cache", Tier::Safe),
+        // 开发缓存
+        (r"C:\Users\bob\AppData\Local\npm-cache", "npm-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\pnpm\store", "pnpm-store", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Yarn\Cache", "yarn-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\pip\cache", "pip-cache", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\uv\cache", "uv-cache", Tier::Safe),
+        (r"C:\Users\bob\.cargo\registry", "cargo-registry", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\go-build", "go-cache", Tier::Safe),
+        (r"C:\Users\bob\.gradle\caches", "gradle-cache", Tier::Safe),
+        (r"C:\Users\bob\.m2\repository", "maven-repo", Tier::Review),
+        (r"C:\Users\bob\.nuget\packages", "nuget-cache", Tier::Safe),
+        (r"C:\Users\bob\miniconda3\pkgs", "conda-pkgs", Tier::Safe),
+        (r"C:\Users\bob\AppData\Local\Docker\wsl\disk\docker_data.vhdx", "docker-data-vhdx", Tier::Keep),
+        (r"C:\Users\bob\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu_79rhkp1fndgsc\LocalState\ext4.vhdx", "wsl-distro-vhdx", Tier::Keep),
+        (r"C:\Users\bob\AppData\Local\Microsoft\VisualStudio", "visual-studio-cache", Tier::Review),
+        (r"C:\Users\bob\AppData\Local\JetBrains\PyCharm2025.2\caches", "jetbrains-caches", Tier::Safe),
+        (r"C:\Users\bob\AppData\Roaming\Code\CachedData", "vscode-family-cached", Tier::Safe),
+        (r"C:\Users\bob\AppData\Roaming\Cursor\CachedData", "vscode-family-cached", Tier::Safe),
+        (r"C:\Users\bob\AppData\Roaming\Cursor\User", "vscode-family-user", Tier::Keep),
+    ];
+    // 文件就放文件本身，文件夹里放一个 1 字节的文件
+    let is_file = |p: &str| [".sys", ".db", ".vhdx"].iter().any(|x| p.ends_with(x));
+    // 通用 Chromium 缓存规则要求里面有 index / data_0（when_child），按真实长相放 data_0
+    let inner = |p: &str| if p.ends_with("GPUCache") { "data_0" } else { "f.bin" };
+    let entries: Vec<String> =
+        cases.iter().map(|(p, _, _)| if is_file(p) { p.to_string() } else { format!("{p}\\{}", inner(p)) }).collect();
+    let t = tree(&entries.iter().map(|p| (p.as_str(), 1u64)).collect::<Vec<_>>());
+    for (p, id, tier) in cases {
+        let e = ex(&t, p, &ctx);
+        assert_eq!(rule_id(&e), Some(*id), "{p}：{:?}", e.source);
+        assert_eq!(e.tier, *tier, "{p}");
+        // 说明文案不能空；keep 档不能给删除；safe 档能腾出的就是它的大小
+        assert!(!e.what.is_empty() && !e.why.is_empty() && !e.lose.is_empty(), "{p}");
+        if *tier == Tier::Keep {
+            assert!(!e.how.contains(&How::Delete) && e.gain_bytes == 0, "{p}");
+        }
+        if *tier == Tier::Safe {
+            assert_eq!(e.gain_bytes, 1, "{p}");
+        }
+    }
+    let q = ctx.rules.by_id("defender-quarantine").unwrap();
+    assert!(q.how.contains(&How::BuiltinTool) && q.how_detail.contains("QuarantinePurgeItemsAfterDelay"));
+    let s = ctx.rules.by_id("defender-scans").unwrap();
+    assert!(s.how_detail.contains("ScanPurgeItemsAfterDelay"));
+}

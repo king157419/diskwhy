@@ -1,4 +1,8 @@
+阶段 B 是 DiskWhy 的“解释引擎”：给扫描出来的每个文件夹说清楚它是什么、属于谁、为什么在、删了会怎样、该怎么腾，只解释不删除。
+
 # 阶段 B 验证记录：解释引擎
+
+> 第 1–6 节是 2026-09-23 上午第一次做阶段 B 时的记录（当时 179 条规则、47 个测试）。当晚 S22 轮在分支 `phase-b` 上补做了 B-1，见文末第 7、8 节。
 
 日期：2026-09-23　机器：Windows 11 Pro 10.0.26200，C 盘 NTFS 199 GB，**普通用户权限（未提权）**
 工具链：rustc/cargo 1.93.0，node 22，Tauri 2，windows-sys 0.61.2，toml 0.9，ureq 3.4.2（native-tls）
@@ -220,3 +224,79 @@ DiskWhy 解释：C:\
 - AI 结果不保存，切换选中项就消失；API Key 明文存在本机 settings.json（设置页里写明了）。
 - 前 50 覆盖率 100% 里有 15 个是容器规则、3 个是媒体文件启发式（见 coverage.md 的说明）；前 200 还有 9 个未知。
 - 开发中踩到的坑：Bash 工具会把命令里的 `\\` 折成 `\`，导致早先写入的 `env.rs` / `pattern.rs` 里出现了非法的 `'\'` 字面量，已改正；之后所有含反斜杠的内容都改用文件编辑工具写入。
+
+---
+
+## 7. 决定（S22，2026-09-23 晚，用户在睡觉，自己拍板）
+
+| # | 分岔 | 决定 | 理由 |
+|---|---|---|---|
+| 1 | 任务要求“先确认工作区干净，再 `checkout -b phase-b`”，但主工作区**不干净**：有另一轮会话 12:37–13:00 写下、没提交的阶段 D 代码（`src/action/`、`action_tests.rs`、清理抽屉 / 隔离区对话框等 10 个改动 + 7 个新文件） | 不碰它们。用 `git worktree add .worktrees/phase-b -b phase-b master` 在独立目录里开 phase-b 分支；`.worktrees/` 写进 `.git/info/exclude`（不是受版本控制的文件） | 直接切分支再 `git add -A` 会把别人没写完的删除功能一起提交进 phase-b，既不是本轮写的，也违反“本轮不实现删除动作”；worktree 让主工作区、master 分支和那批改动都原封不动 |
+| 2 | 默认分支叫 `master` 不叫 `main` | 把“main 一字不改”理解为 master 一字不改 | 仓库里只有 master |
+| 3 | 阶段 B 的大部分要求在 master 的 5c4c7e0（阶段 B）和 291bacd（阶段 C）里已经做完（规则库、Explanation、explain 入口、198 条规则） | 不重写，只补缺口：重复模式校验、“每条规则至少一个匹配样例”的测试、schema 合法写法测试、Defender 缓存规则、文档 | 重写只会制造回归；缺口逐条对照任务清单找出来 |
+| 4 | 任务写的 `how: BuiltinTool(name)` | 保持现有写法：`how = "builtin_tool"` + 必填的 `how_detail` 写具体工具和命令 | 已有 200 条规则、GUI 和 CLI 都按这个结构；工具名单独成字段对用户没有额外信息，how_detail 里已写明（DISM、powercfg、磁盘清理、Set-MpPreference……） |
+| 5 | “重复 match 报错”具体怎么算 | 原始写法重复（大小写、`/` 与 `\`、`%SystemRoot%` 与 `%WINDIR%` 视为相同）→ 报错，整条规则不加载；展开环境变量后和别的规则撞车 → 只跳过那个模式并警告；同一条规则里两种写法展开后相同（`%TEMP%` 与 `%LOCALAPPDATA%\Temp`）允许；`kind` / `when_child` 不同不算重复 | 原始重复是写规则的人的错，应该在测试里就炸；展开后撞车取决于某台机器的环境变量（比如 `%TEMP%` 被改成 `C:\Windows\Temp`），不能因此把整条规则扔掉 |
+| 6 | “Defender 缓存”原来只有一条整体 keep 的规则 | 新增 `defender-scans`（keep + 系统工具）和 `defender-quarantine`（review + 系统工具），路径在本机核实存在；清理办法只写 Windows 安全中心界面和 `Set-MpPreference`，不教用户在资源管理器里删 | 两篇微软文档写的默认保留天数不一致（15 天 / 30 天；隔离区“不设置就一直留” / 组策略默认 90 天），规则里如实写了两种说法，让用户用 `Get-MpPreference` 看本机值 |
+
+## 8. B-1：规则库骨架 + 首批规则（S22 补做，分支 `phase-b`）
+
+### 8.1 做了什么
+
+对照任务清单逐条核对，已有的直接复用，缺的补上：
+
+| 任务要求 | 状态 | 位置 |
+|---|---|---|
+| TOML schema：id / owner / category / tier / match / what / why / lose / how / refs / verified_on | 已有（另有 how_detail、scope、kind、when_child、owner_from_path） | `crates/diskwhy-core/src/explain/rules.rs` |
+| `%LOCALAPPDATA%` `%APPDATA%` `%PROGRAMDATA%` `%USERPROFILE%` `%TEMP%` 等展开，`*` 通配，大小写不敏感 | 已有（白名单 11 个变量；另支持 `?` 和 `**`） | `explain/env.rs`、`explain/pattern.rs` |
+| rules/ 目录嵌入 + 运行时加载用户目录 | 已有（`include_str!` 嵌入 6 个文件；`%LOCALAPPDATA%\DiskWhy\rules\*.toml`） | `rules.rs` 的 `EMBEDDED`、`load_user_dir` |
+| 启动校验：根目录白名单、safe 不指向文档/桌面/图片/OneDrive、id 唯一、tier 合法 | 已有 | `rules.rs` 的 `validate` |
+| 启动校验：**重复 match 报错** | **本轮新增** | `rules.rs` 的 `pattern_key` / `duplicate_check`；内置规则和用户规则都查 |
+| Explanation（tier、owner、category、what、why、lose、gain_bytes、how、source、confidence）+ `explain(node)` | 已有（source = Rule{id} / Heuristic{name} / Llm{model} / Unknown） | `explain/mod.rs` |
+| ≥ 40 条规则，Windows 系统 / 浏览器 / 开发缓存三组 | 已有 198 条，本轮 +2 条 Defender、修 1 条 → **200 条** | `rules/*.toml` |
+| 单元测试：schema 合法/非法、展开、通配、safe 护栏 | 非法写法已有；**合法写法、非法枚举值、safe 护栏的 review 对照为本轮新增** | `tests/explain_tests.rs` |
+| 单元测试：**每条规则至少一个匹配样例** | **本轮新增**（自动按模式造路径，并要求这条规则在样例上“胜出”） | `every_rule_has_a_matching_sample` |
+
+**新查重立刻抓到一个真问题**：`pip-cache` 的 match 里写了 `%LOCALAPPDATA%\pip\cache` 和 `%LOCALAPPDATA%\pip\Cache`——匹配本来就不分大小写，第二个是多余的。已删掉一个。
+
+**规则库现状（200 条）：**
+
+| 文件 | 条数 | safe | review | keep |
+|---|---:|---:|---:|---:|
+| windows-system.toml | 58 | 10 | 7 | 41 |
+| browsers.toml | 19 | 9 | 1 | 9 |
+| dev-caches.toml | 41 | 16 | 12 | 13 |
+| ai-models.toml | 13 | 0 | 12 | 1 |
+| cn-apps.toml | 36 | 7 | 12 | 17 |
+| misc.toml | 33 | 6 | 18 | 9 |
+| **合计** | **200** | 48 | 62 | 90 |
+
+任务点名的条目全部有规则，并由新测试 `b1_listed_items_real_paths` 用真实长相的路径逐条核对（41 个路径）：WinSxS→keep+DISM、Windows.old→review+磁盘清理、Installer→keep、传递优化→safe、hiberfil→review+powercfg、pagefile→keep、两个 Temp→safe、Prefetch→keep、缩略图→safe、`SoftwareDistribution\Download`→safe、`Windows\Logs`→review、Defender 扫描记录→keep / 隔离区→review；Chrome / Edge / Firefox / Brave 的 Cache、Code Cache、GPUCache、Service Worker 与通用 Chromium 缓存；npm / pnpm / yarn / pip / uv / cargo registry / go / gradle / maven / nuget / conda pkgs / Docker vhdx / WSL vhdx / VS / JetBrains / VS Code / Cursor。
+
+### 8.2 怎么验证的
+
+- `cargo test -p diskwhy-core`（在 worktree 里跑，`CARGO_TARGET_DIR` 指回主目录的 `target/`，D 盘）：**59 个通过，0 失败，1 个忽略**（忽略的是阶段 C 就有的 dedup 手动对照测试，要设 `DISKWHY_CMP_DIR` 才跑）。其中 explain_tests 从 22 个变成 26 个，新增 4 个：
+
+| 测试 | 测什么 |
+|---|---|
+| `validation_accepts_legal_variants` | 4 种合法写法都能加载（how 数组、scope/kind/when_child/owner_from_path、全部根变量、safe 放在 `%USERPROFILE%\.cache`）；非法 tier / category / how / 日期都加载失败；5 个个人文件夹位置写成 safe 被拦、同样位置写成 review 放行 |
+| `duplicate_match_is_rejected` | 8 种情况：跨规则重复（大小写 + 斜杠不同）、同规则写两遍、`%WINDIR%` = `%SystemRoot%`、when_child 不同不算重复、展开后撞车只跳过那个模式且规则照常生效、同规则互为兜底允许、用户规则与内置 `npm-cache` 重复被拒、`%TEMP%` 被改到 `C:\Windows\Temp` 时 user-temp 仍然生效 |
+| `every_rule_has_a_matching_sample` | 对 200 条规则的 409 个模式，把 `*` / `?` / `**` 换成具体名字造出 **435 个样例路径**，每条规则至少要在一个样例上被选为说明（顺带抓出被更具体规则完全盖住的死规则——当前没有），并核对 what / category / 可信度来自该规则 |
+| `b1_listed_items_real_paths` | 上面 41 个真实长相的路径：规则 id、档位、文案非空、keep 不给删除且能腾出 = 0、safe 能腾出 = 实际大小；Defender 两条规则写了 `Set-MpPreference` 的参数名 |
+
+- 真实环境：`diskwhy-cli explain C:\Users\king\AppData\Local\pip --top 5` 用本机真实环境变量加载规则，**没有任何规则警告**，`pip\cache` 174 MB 由 `pip-cache` 说明为“可清理”（204 条 = 内置 200 + 本机 `%LOCALAPPDATA%\DiskWhy\rules\phaseD-demo.toml` 里另一轮会话留下的 4 条演示规则，没动它）。
+- 参考链接：规则里 65 个不重复的 `refs` 全部用 curl 请求，**65 个都返回 200**。新加的 3 个微软文档用 WebFetch 读过原文：`Set-MpPreference` 里 `ScanPurgeItemsAfterDelay`（默认 15 天，0 = 不删）和 `QuarantinePurgeItemsAfterDelay`（0 或不设 = 一直保留）；“Configure remediation” 页的组策略表写默认扫描历史 30 天、隔离区 90 天；“Restore quarantined files” 页写了 Windows 安全中心 → 保护历史记录的操作路径。
+- 本机核实：`C:\ProgramData\Microsoft\Windows Defender\` 下确实有 `Scans\` 和 `Quarantine\`，普通权限打开 `Scans` 报“Permission denied”——这也是规则里写“手动删不了”的依据。
+
+### 8.3 没做 / 没验证的
+
+- 没有在 GUI 里重新截图（B-1 只动了规则库和测试，界面代码没改；GUI 构建和截图留给后面的小节）。
+- 没跑 `cargo build --release` 和 `npm run tauri build`：B-1 只改了 core 的规则加载和规则文件，公开接口没变；CLI 已用 `cargo run -p diskwhy-cli` 编译运行过。
+- `defender-quarantine` 的“删除”操作路径来自微软文档里“还原”那一节的同一个界面（保护历史记录），界面上的“删除”按钮本身**没有在本机点过**（本机隔离区是空的，也不该为了测试去制造隔离项）。
+- 第 6 节里说的“86 条规则的路径本机不存在”仍然成立，本轮没有新的机器可以核实。
+- 主工作区里那批没提交的阶段 D 代码没看、没测、没动；它和 phase-b 分支将来合并时，两边都改了 `rules/` 之外的文件的可能性很小（phase-b 只改了 `explain/rules.rs`、`explain_tests.rs`、两个规则文件和本文档），但合并前仍要跑一遍全部测试。
+
+### 8.4 下一步从哪接
+
+- 分支 `phase-b` 在 `D:\desk\claudex\13\diskwhy\.worktrees\phase-b`（git worktree）。后续小节继续在这个目录里做、在这个分支上提交；**不要**在主目录 `checkout phase-b`（git 会拒绝，因为 worktree 占着它；而且主目录有别人的未提交改动）。构建时 `CARGO_TARGET_DIR=D:/desk/claudex/13/diskwhy/target`，复用已编译的依赖。
+- 用户醒来后要决定：主目录那批阶段 D 改动是继续做完提交，还是先放一边；之后再把 `phase-b` 合回 master（`git merge phase-b`，预计无冲突）。
+- 规则库下一批：coverage.md 里前 200 的 9 个未知项、以及在装了国内软件的机器上核对那 86 条没命中的路径。

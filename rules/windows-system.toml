@@ -618,6 +618,41 @@ refs = []
 verified_on = "2026-09-23"
 
 [[rule]]
+id = "defender-scans"
+owner = "Microsoft Defender"
+category = "cache"
+tier = "keep"
+match = ['%ProgramData%\Microsoft\Windows Defender\Scans']
+what = "Defender 杀毒的扫描记录和扫描缓存"
+why = "Defender 每次扫描会把结果、历史和加快下次扫描用的缓存存在这里，过一段时间会自己清掉旧记录"
+lose = "手动删不了（普通权限连打开都不行，防篡改保护也会拦），硬删还可能让 Defender 出错。它会按天数自动清理，一般不大。"
+how = "builtin_tool"
+how_detail = "想让它少留几天：用管理员身份打开 PowerShell，运行 Set-MpPreference -ScanPurgeItemsAfterDelay 7（数字是保留天数；不设置时微软文档写默认 15 天，组策略文档写 30 天，以本机为准，可以先用 Get-MpPreference 看 ScanPurgeItemsAfterDelay 当前值）。"
+refs = [
+  "https://learn.microsoft.com/en-us/powershell/module/defender/set-mppreference",
+  "https://learn.microsoft.com/en-us/defender-endpoint/configure-remediation-microsoft-defender-antivirus",
+]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "defender-quarantine"
+owner = "Microsoft Defender"
+category = "trash"
+tier = "review"
+match = ['%ProgramData%\Microsoft\Windows Defender\Quarantine']
+what = "Defender 的隔离区：被它当成病毒关起来的文件"
+why = "Defender 发现可疑文件时不直接删，先加密关在这里，万一是误报你还能放出来"
+lose = "清掉以后，被误报的文件就再也找不回来了。确定里面没有你要的东西再清。"
+how = "builtin_tool"
+how_detail = "打开「Windows 安全中心」→「病毒和威胁防护」→「保护历史记录」，筛选「已隔离的项目」，逐条选「删除」（误报的选「还原」）。也可以让它自动过期：管理员 PowerShell 运行 Set-MpPreference -QuarantinePurgeItemsAfterDelay 30（保留 30 天；设为 0 或不设置时，按 Set-MpPreference 文档是一直保留，组策略文档写默认 90 天）。别在资源管理器里直接删这个文件夹。"
+refs = [
+  "https://learn.microsoft.com/en-us/defender-endpoint/restore-quarantined-files-microsoft-defender-antivirus",
+  "https://learn.microsoft.com/en-us/defender-endpoint/configure-remediation-microsoft-defender-antivirus",
+  "https://learn.microsoft.com/en-us/powershell/module/defender/set-mppreference",
+]
+verified_on = "2026-09-23"
+
+[[rule]]
 id = "microsoft-local"
 owner = "微软的各类软件"
 category = "userdata"

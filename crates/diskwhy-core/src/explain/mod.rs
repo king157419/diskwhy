@@ -1,11 +1,17 @@
 //! 解释引擎（阶段 B）：告诉用户每个文件夹 / 文件是什么、属于谁、为什么在、删了会怎样、怎么腾。
 //!
-//! 顺序：
+//! 顺序（[`explain_full`]；[`explain`] 是不带 LLM 的同一条链）：
 //! 1. 规则库 `rules/*.toml`（[`rules`]）：精确命中当前路径；没命中再看上层文件夹有没有
-//!    `scope = "tree"` 的规则（“继承”）。
-//! 2. 启发式（[`heuristics`]）：目录内容签名 → 注册表归属 → 年龄提示。结果只能是 review / keep。
-//! 3. 都不行：`source = Unknown`，把看到的线索列出来。
-//! 4. LLM 兜底（[`llm`]）只在用户点“问 AI”时调用，不在这里自动跑。
+//!    `scope = "tree"` 的规则（“继承”）。`source = Rule`，可信度 1.0。
+//! 2. 启发式（[`heuristics`]）：目录内容签名 → 注册表归属 → 年龄提示。`source = Heuristic`，可信度 0.4~0.8。
+//!    只有签名严格的 Chromium 缓存能给 safe，其余只能 review / keep。
+//! 3. （可选）LLM 兜底（[`llm`]）：只有调用方传了 [`llm::LlmOracle`] **并且**设置里打开了开关，
+//!    而且前两步都没认出来时才问。`source = Llm`，档位强制 review，可信度固定为低值。
+//!    列目录时不传（不联网、不卡界面），用户点“问 AI”时才传。
+//! 4. 都不行：`source = Unknown`，把看到的线索列出来。
+//!
+//! 最后统一过一遍 [`enforce_guards`]：LLM / 未知永远 review；启发式的 safe 只认白名单；
+//! safe 落在桌面 / 文档等个人文件夹下一律降为 review。
 
 pub mod env;
 pub mod heuristics;
@@ -194,20 +200,77 @@ pub fn explain(t: &Target, ctx: &ExplainCtx) -> Explanation {
     explain_with_inherited(t, inherited.as_ref(), ctx)
 }
 
+/// 完整的链：规则 → 启发式 → （可选）LLM → 未知。
+///
+/// `llm = None` 时和 [`explain`] 完全一样。传了 oracle 也只在“前两步都没认出来”且
+/// `ctx.settings.usable()`（默认关闭）时才调用；LLM 出错时退回未知，并把错误写进 notes。
+pub fn explain_full(t: &Target, ctx: &ExplainCtx, llm: Option<&dyn llm::LlmOracle>) -> Explanation {
+    let mut e = explain(t, ctx);
+    if !e.is_unknown() || t.node.kind == NodeKind::Rest {
+        return e;
+    }
+    let Some(oracle) = llm else { return e };
+    if !ctx.settings.usable() {
+        return e;
+    }
+    match llm::ask_with(t, ctx, oracle) {
+        Ok(mut ai) => {
+            // 保留 DiskWhy 自己看到的线索，方便对照 AI 说得对不对。
+            ai.clues = std::mem::take(&mut e.clues);
+            enforce_guards(ai, t.path, ctx)
+        }
+        Err(msg) => {
+            e.notes.push(format!("问 AI 没成功：{msg}"));
+            e
+        }
+    }
+}
+
+/// 最后一道护栏（对所有来源都跑一遍）：
+/// - `Llm` / `Unknown`：档位一律 review（LLM 给什么都不算数）；
+/// - `Heuristic`：safe 只认 [`heuristics::SAFE_HEURISTICS`]；
+/// - 任何来源的 safe 落在桌面 / 文档 / 下载 / OneDrive 等个人文件夹下：降为 review。
+pub fn enforce_guards(mut e: Explanation, path: &str, ctx: &ExplainCtx) -> Explanation {
+    let protected_safe = e.tier == Tier::Safe && ctx.is_protected(&split_lower(path));
+    let demote = match &e.source {
+        Source::Llm { .. } | Source::Unknown => e.tier != Tier::Review,
+        Source::Heuristic { name } => e.tier == Tier::Safe && (!heuristics::SAFE_HEURISTICS.contains(&name.as_str()) || protected_safe),
+        Source::Rule { .. } => protected_safe,
+    };
+    if demote {
+        e.tier = Tier::Review;
+        match e.source {
+            Source::Llm { .. } | Source::Unknown => {
+                e.gain_bytes = 0;
+            }
+            _ => {
+                // 只有 safe 会走到这里，safe 的 gain_bytes 就是实际占用。
+                let alloc = e.gain_bytes;
+                let (g, note) = gain(Tier::Review, &e.how, alloc);
+                e.gain_bytes = g;
+                e.gain_note = note;
+            }
+        }
+        e.notes.push("档位被 DiskWhy 的护栏改成了“需要你判断”（AI 推测、没认出来的东西、个人文件夹里的东西都不会标成可放心清理）。".into());
+    }
+    e
+}
+
 /// 同 [`explain`]，但继承命中由调用方预先算好（列目录时对所有子项只算一次）。
 pub fn explain_with_inherited(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) -> Explanation {
     let node = t.node;
     if node.kind == NodeKind::Rest {
-        return explain_rest(t, inherited, ctx);
+        return enforce_guards(explain_rest(t, inherited, ctx), t.path, ctx);
     }
     let segs = split_lower(t.path);
-    if let Some(idx) = ctx.rules.best_exact(&segs, Some(node)) {
-        return from_rule(&ctx.rules.rules[idx], t, &segs, None, ctx);
-    }
-    if let Some(h) = inherited {
-        return from_rule(&ctx.rules.rules[h.rule], t, &segs, Some(&h.from_path), ctx);
-    }
-    heuristics::explain_unmatched(t, ctx)
+    let e = if let Some(idx) = ctx.rules.best_exact(&segs, Some(node)) {
+        from_rule(&ctx.rules.rules[idx], t, &segs, None, ctx)
+    } else if let Some(h) = inherited {
+        from_rule(&ctx.rules.rules[h.rule], t, &segs, Some(&h.from_path), ctx)
+    } else {
+        heuristics::explain_unmatched(t, ctx)
+    };
+    enforce_guards(e, t.path, ctx)
 }
 
 /// 目录的“其余小文件合计”节点：跟随所在目录的说明。
@@ -245,6 +308,12 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
     if tier == Tier::Safe && ctx.is_protected(segs) {
         tier = Tier::Review;
         notes.push("它在桌面 / 文档 / 下载 / OneDrive 等个人文件夹下面，为稳妥起见从“可放心清理”降为“需要你判断”。".into());
+    }
+    if rule.category == Category::Cache && t.node.kind != NodeKind::Rest {
+        let newest = heuristics::newest_mtime(t.node, 5_000);
+        if let Some(n) = heuristics::long_unused_note(newest, ctx.now) {
+            notes.push(n);
+        }
     }
     let owner = if rule.owner_from_path {
         match heuristics::owner_from_path(t.path, ctx) {

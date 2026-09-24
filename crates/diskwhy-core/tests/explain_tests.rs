@@ -556,10 +556,14 @@ fn heuristic_signatures_on_real_dirs() {
     let ctx = empty_rules_ctx(&root, Vec::new());
     let fx = Fixture::scan(root, ctx);
 
-    assert_heur(&fx.explain(r"appx\Cache"), "chromium-cache", Tier::Review);
+    // B-2：签名严格的 Chromium 缓存是唯一能给 safe 的启发式（其余护栏见 b2_tests.rs）
+    let cc = fx.explain(r"appx\Cache");
+    assert_eq!(heur_name(&cc), Some("chromium-cache"), "{:?}", cc.source);
+    assert_eq!(cc.tier, Tier::Safe);
     assert_heur(&fx.explain("py"), "python-env", Tier::Review);
     assert_heur(&fx.explain(r"webapp\node_modules"), "node-modules", Tier::Review);
-    assert_ne!(heur_name(&fx.explain(r"orphan\node_modules")), Some("node-modules"), "没有 package.json 不应判成 Node 依赖");
+    // B-2：没有 package.json 的 node_modules 也要说，但标成“遗留的”
+    assert_heur(&fx.explain(r"orphan\node_modules"), "node-modules-orphan", Tier::Review);
     assert_heur(&fx.explain(r"rs\target"), "rust-target", Tier::Review);
     assert_heur(&fx.explain(r"proj\.venv"), "python-venv", Tier::Review);
     assert_heur(&fx.explain(r"net\bin"), "dotnet-build", Tier::Review);
@@ -706,10 +710,11 @@ fn llm_request_body_has_no_file_content_and_redacted_path() {
         assert!(!body.to_lowercase().contains(&format!(r"users\\\\{}", user.to_lowercase())), "用户目录没有脱敏：{body}");
         assert!(input.parent.starts_with('~'), "父路径应以 ~ 开头：{}", input.parent);
     }
-    // 只发了这些字段
+    // 只发了这四个字段（B-2 收紧：名字、父路径、子项名、大小）
     let v: serde_json::Value = serde_json::to_value(&input).unwrap();
-    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-    assert_eq!(keys.len(), 9, "{keys:?}");
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, ["children", "name", "parent", "size"]);
 }
 
 #[test]
@@ -725,11 +730,11 @@ fn redact_path_rules() {
 fn llm_parse_and_always_review() {
     let a = llm::parse_answer("好的：\n```json\n{\"what\":\"某游戏的录像\",\"owner\":\"某游戏\",\"why\":\"自动录制\",\"lose\":\"录像没了\",\"confidence\":1.7}\n```").unwrap();
     assert_eq!(a.what, "某游戏的录像");
-    assert!(a.confidence <= 1.0);
     let e = llm::to_explanation(a, "m", 123);
     assert_eq!(e.tier, Tier::Review);
     assert_eq!(e.source, Source::Llm { model: "m".into() });
-    assert!(e.confidence <= 0.9);
+    assert_eq!(e.owner, None, "归属不让 AI 填");
+    assert!((e.confidence - llm::LLM_CONFIDENCE).abs() < f32::EPSILON, "AI 自报的 1.7 不算数");
     assert!(llm::parse_answer("我不知道").is_err());
     assert!(llm::parse_answer("{\"what\":\"\"}").is_err());
     assert_eq!(llm::chat_url("http://localhost:11434/v1/"), "http://localhost:11434/v1/chat/completions");

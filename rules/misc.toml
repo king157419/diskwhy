@@ -292,6 +292,50 @@ how_detail = "完全退出 Steam 后删除；着色器缓存也可以在 Steam �
 refs = []
 verified_on = "2026-09-23"
 
+# B-2（S22）：游戏平台缓存第二批。
+
+[[rule]]
+id = "steam-htmlcache"
+owner = "Steam"
+category = "cache"
+tier = "review"
+match = ['%LOCALAPPDATA%\Steam\htmlcache']
+what = "Steam 内置浏览器的数据（商店、社区、好友界面都是网页做的）"
+why = "Steam 客户端用 Chromium 内核显示商店和社区页面，网页缓存、显卡着色器缓存和网页登录信息都放在这里"
+lose = "游戏、存档和 Steam 账号本身不受影响；删了商店页面第一次打开会慢，内置网页里的登录状态和网页设置可能要重来。我没找到 Valve 官方对这个文件夹的说明，所以整个文件夹标“需要你判断”；里面的 Cache、Code Cache、GPUCache 等子文件夹 DiskWhy 会单独认出来。"
+how = "delete"
+how_detail = "完全退出 Steam（托盘图标右键退出）后再删；Steam 下次启动会重建。"
+refs = []
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "epic-launcher-webcache"
+owner = "Epic Games 启动器"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\EpicGamesLauncher\Saved\webcache*']
+what = "Epic Games 启动器的网页缓存"
+why = "启动器的商店和库界面是网页做的，缓存放在 webcache（有的版本叫 webcache_4147、webcache_4430）"
+lose = "不丢游戏、存档和账号；删了启动器第一次打开会慢一点。Epic 官方客服文章把删这些文件夹当作修启动器显示问题的办法。"
+how = "delete"
+how_detail = "右键托盘里的 Epic 图标 → 退出，然后删掉 %LOCALAPPDATA%\\EpicGamesLauncher\\Saved 下的 webcache、webcache_4147、webcache_4430，再打开启动器。"
+refs = ["https://www.epicgames.com/help/en-US/epic-games-store-c-202300000001639/launcher-support-c-202300000001735/how-do-i-clear-the-launcher-cache-on-pc-a202300000013316"]
+verified_on = "2026-09-23"
+
+[[rule]]
+id = "battlenet-cache"
+owner = "暴雪 Battle.net"
+category = "cache"
+tier = "safe"
+match = ['%ProgramData%\Blizzard Entertainment']
+what = "暴雪 Battle.net 的缓存文件夹"
+why = "Battle.net 和它的更新程序（Agent）把临时数据放在这里"
+lose = "暴雪官方客服文章说删掉它不会影响游戏数据和账号信息；缓存坏了反而会让游戏出问题。"
+how = "delete"
+how_detail = "先关掉所有暴雪程序，并在任务管理器里结束 Agent.exe（Blizzard Update Agent），再删 %ProgramData%\\Blizzard Entertainment，然后重新打开 Battle.net。"
+refs = ["https://us.support.blizzard.com/en/article/34721"]
+verified_on = "2026-09-23"
+
 [[rule]]
 id = "logitech-ghub"
 owner = "罗技 G HUB"

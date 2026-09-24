@@ -1,12 +1,15 @@
 //! 启发式：规则库没命中时按顺序尝试。
 //!
-//! 1. 目录内容签名（Chromium 缓存、Python 环境、node_modules、Rust target、虚拟环境、.NET bin/obj、
+//! 1. 目录内容签名（聊天数据、Chromium 缓存、Python 环境、node_modules、Rust target、虚拟环境、.NET bin/obj、
 //!    模型权重、虚拟磁盘、日志/转储、下载目录里的安装包、临时文件、媒体文件）；
 //! 2. 归属推断：注册表 Uninstall 快照里的 InstallLocation / DisplayName / Publisher；
-//! 3. 年龄：最近修改超过 180 天，附一句“已经 N 个月没动过”；
+//! 3. 年龄：最近修改超过 180 天，附一句“已经 N 个月没动过”；缓存类写“很久没用了”；
 //! 4. 都不行：`Source::Unknown`，列出看到的线索。
 //!
-//! **启发式结果的档位只能是 review 或 keep，永远不会是 safe**（[`finish`] 里兜底强制）。
+//! **档位护栏**：启发式只有一种情况能给 safe——[`SAFE_HEURISTICS`] 里的 `chromium-cache`，
+//! 而且要满足“文件夹名是 Chromium 的缓存目录名 + 里面每个文件都是 Chromium 磁盘缓存的标准文件名”
+//! 并且不在桌面 / 文档等个人文件夹下。其余一律 review 或 keep（[`finish`] 里兜底强制，
+//! `explain::enforce_guards` 再兜一次）。
 //!
 //! 看的是扫描树（内存里的 [`Node`]）：每个目录只保留了前 N 大文件，小文件合并成 Rest 节点，
 //! 所以“旁边有没有 package.json / Cargo.toml / *.csproj”这种判断在树里找不到、且父目录有 Rest
@@ -22,6 +25,14 @@ use std::path::Path;
 
 /// 最近修改超过多少天算“很久没动”。
 pub const STALE_DAYS: i64 = 180;
+/// 允许给出 safe 的启发式（只有签名极严格的 Chromium 磁盘缓存）。
+pub const SAFE_HEURISTICS: &[&str] = &["chromium-cache"];
+/// Chromium 用磁盘缓存格式（index + data_N / f_xxxxxx）存东西的文件夹名（小写）。
+const CHROMIUM_CACHE_DIRS: &[&str] =
+    &["cache_data", "gpucache", "grshadercache", "graphitedawncache", "dawncache", "dawngraphitecache", "dawnwebgpucache", "shadercache"];
+/// 聊天软件的数据文件夹名（小写）。用户改过存储位置时规则库按 %变量% 认不出来，靠名字兜底。
+const CHAT_DATA_DIRS: &[(&str, &str)] =
+    &[("wechat files", "微信"), ("xwechat_files", "微信"), ("tencent files", "QQ"), ("wxwork", "企业微信")];
 /// 统计子树时最多看多少个节点（大目录采样，保证列表秒开）。
 const MAX_VISIT: usize = 30_000;
 /// 单个模型文件至少多大才算“模型权重”。
@@ -189,6 +200,171 @@ fn sibling_with_ext(t: &Target, exts: &[&str]) -> Option<String> {
     None
 }
 
+/// 路径按 `\` 切成段（去掉空段）。
+fn segments(path: &str) -> Vec<&str> {
+    path.split(['\\', '/']).filter(|s| !s.is_empty()).collect()
+}
+
+fn seg_count(path: &str) -> usize {
+    segments(path).len()
+}
+
+/// 名字（不分大小写）等于 `name` 的段的下标，从浅到深。
+fn segment_indices(path: &str, name: &str) -> Vec<usize> {
+    segments(path).iter().enumerate().filter(|(_, s)| s.eq_ignore_ascii_case(name)).map(|(i, _)| i).collect()
+}
+
+fn first_segment(path: &str, name: &str) -> Option<usize> {
+    segment_indices(path, name).into_iter().next()
+}
+
+/// 前 `n` 段拼回路径（`C:` 单独一段时补成 `C:\`）。
+fn prefix_path(path: &str, n: usize) -> String {
+    let s = segments(path);
+    let n = n.min(s.len());
+    if n == 0 {
+        return String::new();
+    }
+    let joined = s[..n].join("\\");
+    if n == 1 && joined.ends_with(':') {
+        format!("{joined}\\")
+    } else {
+        joined
+    }
+}
+
+/// 严格的 Chromium 磁盘缓存文件名：`index`、`data_N`、`f_十六进制`、`16 位十六进制_0/_1/_s`（simple 格式）。
+fn is_chromium_cache_file(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    if l == "index" {
+        return true;
+    }
+    if let Some(d) = l.strip_prefix("data_") {
+        return !d.is_empty() && d.chars().all(|c| c.is_ascii_digit());
+    }
+    if let Some(h) = l.strip_prefix("f_") {
+        return !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    if let Some((h, suf)) = l.split_once('_') {
+        return h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()) && matches!(suf, "0" | "1" | "s");
+    }
+    false
+}
+
+/// 目录里每一项都是 Chromium 磁盘缓存的标准文件（可以有 `index-dir\the-real-index`），并且有 index 和至少一个数据文件。
+/// 被合并进“其余小文件”的看不到名字——看得到的最大 50 个都合格就算合格；index 被合并掉时去文件系统确认它存在。
+fn is_chromium_disk_cache(n: &Node) -> bool {
+    let (mut has_index, mut has_data, mut has_rest) = (false, false, false);
+    for c in &n.children {
+        match c.kind {
+            NodeKind::Rest => has_rest = true,
+            NodeKind::File => {
+                if !is_chromium_cache_file(&c.name) {
+                    return false;
+                }
+                if c.name.eq_ignore_ascii_case("index") {
+                    has_index = true;
+                } else {
+                    has_data = true;
+                }
+            }
+            NodeKind::Dir => {
+                let ok = c.name.eq_ignore_ascii_case("index-dir")
+                    && c.children.iter().all(|x| x.kind == NodeKind::File && x.name.eq_ignore_ascii_case("the-real-index"));
+                if !ok {
+                    return false;
+                }
+            }
+        }
+    }
+    if !has_index && has_rest && !n.path.is_empty() {
+        has_index = Path::new(&n.path).join("index").is_file();
+    }
+    has_index && has_data
+}
+
+/// 签名严格的 Chromium 缓存：返回线索；不够严格返回 None。
+fn strict_chromium_cache(t: &Target) -> Option<String> {
+    let n = t.node;
+    let name = n.name.to_lowercase();
+    let real = |c: &&Node| c.kind != NodeKind::Rest;
+    if CHROMIUM_CACHE_DIRS.contains(&name.as_str()) && is_chromium_disk_cache(n) {
+        return Some(format!("文件夹叫 {}，里面全是 Chromium 磁盘缓存的标准文件（index、data_N / f_xxxxxx）", n.name));
+    }
+    if name == "cache" {
+        // 新版：Cache\Cache_Data（新版 Chrome 旁边还有个很小的 No_Vary_Search）；老版：Cache 里直接是 index + data_N。
+        let mut cache_data_ok = false;
+        let all_ok = n.children.iter().filter(real).all(|c| {
+            if c.kind == NodeKind::Dir && c.name.eq_ignore_ascii_case("Cache_Data") {
+                cache_data_ok = is_chromium_disk_cache(c);
+                cache_data_ok
+            } else if c.kind == NodeKind::Dir && c.name.eq_ignore_ascii_case("No_Vary_Search") {
+                c.children.iter().all(|x| x.kind == NodeKind::File && (x.name.ends_with(".baj") || x.name.ends_with(".baf")))
+            } else {
+                false
+            }
+        });
+        if all_ok && cache_data_ok {
+            return Some("文件夹叫 Cache，里面是 Cache_Data，而且 Cache_Data 里全是 Chromium 磁盘缓存的标准文件".into());
+        }
+        if is_chromium_disk_cache(n) {
+            return Some("文件夹叫 Cache，里面全是 Chromium 老版磁盘缓存的标准文件（index、data_N）".into());
+        }
+        return None;
+    }
+    if name == "code cache" {
+        let subs: Vec<&Node> = n.children.iter().filter(real).collect();
+        let all_ok = !subs.is_empty()
+            && subs.iter().all(|c| {
+                c.kind == NodeKind::Dir
+                    && ["js", "wasm", "webui_js"].contains(&c.name.to_lowercase().as_str())
+                    && (c.children.is_empty() || is_chromium_disk_cache(c))
+            });
+        if all_ok && subs.iter().any(|c| is_chromium_disk_cache(c)) {
+            return Some("文件夹叫 Code Cache，里面只有 js / wasm，都是 Chromium 磁盘缓存的标准文件".into());
+        }
+        return None;
+    }
+    if ["js", "wasm", "webui_js"].contains(&name.as_str())
+        && t.parent.is_some_and(|p| p.name.eq_ignore_ascii_case("Code Cache"))
+        && is_chromium_disk_cache(n)
+    {
+        return Some(format!("在 Code Cache 里，文件夹叫 {}，里面全是 Chromium 磁盘缓存的标准文件", n.name));
+    }
+    None
+}
+
+/// 聊天软件的数据（不在规则库覆盖的默认位置时）：keep + 迁移。
+fn chat_data(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
+    let segs = segments(t.path);
+    let (idx, app) = segs.iter().enumerate().find_map(|(i, s)| {
+        let l = s.to_lowercase();
+        CHAT_DATA_DIRS.iter().find(|(d, _)| *d == l).map(|(_, app)| (i, *app))
+    })?;
+    // 程序安装目录下（比如 Program Files (x86)\WXWork）是程序本体，不是聊天数据。
+    let lower = split_lower(t.path);
+    let in_program = ["ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .any(|v| ctx.env.get(v).is_some_and(|base| under(&lower, &split_lower(base)) || lower == split_lower(base)));
+    if in_program {
+        return None;
+    }
+    let data_dir = prefix_path(t.path, idx + 1);
+    Some(Hint {
+        name: "chat-data",
+        tier: Tier::Keep,
+        category: Category::Userdata,
+        what: format!("{app}的聊天数据（聊天记录、收到的文件、图片和视频）"),
+        why: format!("{app}把每个账号的聊天记录和收到的文件都存在「{}」这个文件夹里", segs[idx]),
+        lose: "删了聊天记录和收到的文件都会丢，手机上没有、也没有漫游的就再也找不回来。".into(),
+        how: vec![How::Migrate],
+        how_detail: format!("在{app}的“设置 → 存储空间 / 文件管理 / 存储管理”里改存储位置，让它自己搬到别的盘；想腾空间用同一页面里的“清理”按钮，不要在资源管理器里直接删。"),
+        confidence: 0.7,
+        owner: Some(app.to_string()),
+        clues: vec![format!("路径里有「{}」这一层（{data_dir}），这是{app}存聊天数据的文件夹名", segs[idx])],
+    })
+}
+
 fn pct(x: f64) -> String {
     format!("{:.0}%", x * 100.0)
 }
@@ -227,6 +403,29 @@ pub fn stale_note(newest: i64, now: i64) -> Option<String> {
     } else {
         format!("已经 {months} 个月没动过了（最近一次修改在 {}）", ymd(newest))
     })
+}
+
+/// 缓存类（规则或启发式判定 category = cache）超过 180 天没动：提示“很久没用”。
+pub fn long_unused_note(newest: i64, now: i64) -> Option<String> {
+    stale_note(newest, now).map(|s| format!("很久没用了：{s}。对应的软件可能已经不怎么用，甚至已经卸载了。"))
+}
+
+/// 子树里最新的修改时间，最多看 `limit` 个节点（给规则命中的缓存算“很久没用”用，比 [`subtree_stats`] 轻）。
+pub fn newest_mtime(node: &Node, limit: usize) -> i64 {
+    let mut newest = 0i64;
+    let mut stack: Vec<&Node> = vec![node];
+    let mut visited = 0usize;
+    while let Some(n) = stack.pop() {
+        visited += 1;
+        if visited > limit {
+            break;
+        }
+        newest = newest.max(n.mtime);
+        if n.kind == NodeKind::Dir {
+            stack.extend(n.children.iter());
+        }
+    }
+    newest
 }
 
 fn ext_summary(s: &SubtreeStats, n: usize) -> String {
@@ -273,13 +472,25 @@ struct Hint {
     clues: Vec<String>,
 }
 
-/// 统一收尾：档位兜底（绝不 safe）、能腾多少、年龄提示。
+/// 统一收尾：档位兜底（只有 [`SAFE_HEURISTICS`] 且不在个人文件夹下才能 safe）、能腾多少、年龄提示。
 fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explanation {
-    let tier = if h.tier == Tier::Safe { Tier::Review } else { h.tier };
+    let protected = ctx.is_protected(&split_lower(t.path));
+    let safe_ok = h.tier == Tier::Safe && SAFE_HEURISTICS.contains(&h.name) && !protected;
+    let tier = if h.tier == Tier::Safe && !safe_ok { Tier::Review } else { h.tier };
     let (gain_bytes, gain_note) = gain(tier, &h.how, t.node.allocated);
-    let mut notes = vec!["这是 DiskWhy 根据文件夹里的内容推测的，不是规则库里核实过的说法，所以最多只标“需要你判断”。".to_string()];
+    let mut notes = Vec::new();
+    if tier == Tier::Safe {
+        notes.push("规则库里没有这一条，是 DiskWhy 看文件夹内容认出来的：名字和里面每个文件的名字都是 Chromium 磁盘缓存的标准格式，这种缓存删了程序会自己重建。".to_string());
+    } else if h.tier == Tier::Safe && protected {
+        notes.push("看内容像是能放心删的缓存，但它在桌面 / 文档 / 下载 / OneDrive 等个人文件夹下面，为稳妥起见标成“需要你判断”。".to_string());
+    } else if h.tier == Tier::Keep {
+        notes.push("这是 DiskWhy 根据文件夹里的内容推测的，不是规则库里核实过的说法；因为删错的代价很大，按“建议保留”处理。".to_string());
+    } else {
+        notes.push("这是 DiskWhy 根据文件夹里的内容推测的，不是规则库里核实过的说法，所以最多只标“需要你判断”。".to_string());
+    }
     let newest = if stats.newest_mtime > 0 { stats.newest_mtime } else { t.node.mtime };
-    if let Some(s) = stale_note(newest, ctx.now) {
+    let age = if h.category == Category::Cache { long_unused_note(newest, ctx.now) } else { stale_note(newest, ctx.now) };
+    if let Some(s) = age {
         notes.push(s);
     }
     let owner = h.owner.or_else(|| owner_from_path(t.path, ctx).filter(|o| o.installed).map(|o| o.label()));
@@ -323,23 +534,43 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
     let name = n.name.to_lowercase();
     let is_dir = n.kind == NodeKind::Dir;
 
-    // 1. Chromium 类缓存：Cache_Data\index，或老格式的 index + data_0。
+    // 0. 聊天软件的数据（用户把存储位置改到别处时，规则库按 %变量% 认不出来）：keep + 迁移。
+    if let Some(h) = chat_data(t, ctx) {
+        return Some(h);
+    }
+
+    // 1. Chromium 类缓存。签名严格（名字 + 每个文件名都对得上）→ safe；只是“像”→ review。
     if is_dir {
+        if let Some(clue) = strict_chromium_cache(t) {
+            return Some(Hint {
+                name: "chromium-cache",
+                tier: Tier::Safe,
+                category: Category::Cache,
+                what: "某个用 Chromium 内核的程序（浏览器或 Electron 应用）的缓存".into(),
+                why: "程序打开网页或界面时把图片、脚本、显卡着色器等存一份，下次打开更快".into(),
+                lose: "不丢聊天记录、文档、登录状态或设置；删掉后程序第一次打开会慢一点，缓存会自己重新长出来。程序开着时部分文件删不掉，跳过即可。".into(),
+                how: vec![How::Delete],
+                how_detail: "先退出对应的程序（托盘里也要退），再删这个文件夹；程序下次启动会自动重建。".into(),
+                confidence: 0.75,
+                owner: None,
+                clues: vec![clue],
+            });
+        }
         let new_fmt = child(n, "Cache_Data").is_some_and(|c| has_child(c, "index"));
         let old_fmt = has_child(n, "index") && (has_child(n, "data_0") || has_child(n, "data_1"));
         if new_fmt || old_fmt {
             return Some(Hint {
-                name: "chromium-cache",
+                name: "chromium-cache-mixed",
                 tier: Tier::Review,
                 category: Category::Cache,
-                what: "看起来是某个用 Chromium 内核的程序（浏览器或 Electron 应用）的网页缓存".into(),
+                what: "看起来是某个用 Chromium 内核的程序（浏览器或 Electron 应用）的网页缓存，但里面还混着别的东西".into(),
                 why: "程序打开网页或界面时把图片、脚本等存一份，下次打开更快".into(),
-                lose: "如果确实是缓存：删掉后程序会重新下载，第一次打开慢一点，不丢聊天记录、文档或设置。但它不在规则库里，没法百分之百确认，建议先关掉对应程序再删。".into(),
+                lose: "缓存部分删了只是下次打开慢一点；但这个文件夹的名字或内容和标准的 Chromium 缓存不完全一样，混着的那些文件是什么 DiskWhy 说不准，所以没标“可放心清理”。".into(),
                 how: vec![How::Delete],
-                how_detail: "先退出对应的程序，再删这个文件夹；程序下次启动会自动重建。".into(),
-                confidence: 0.7,
+                how_detail: "点进去看看：Cache_Data、GPUCache、Code Cache 这些子文件夹一般可以删；别的先弄清楚再说。删之前先退出对应的程序。".into(),
+                confidence: 0.6,
                 owner: None,
-                clues: vec![if new_fmt { "里面有 Cache_Data\\index（Chromium 新版缓存格式）".into() } else { "里面有 index 和 data_0/data_1（Chromium 老版缓存格式）".into() }],
+                clues: vec![if new_fmt { "里面有 Cache_Data\\index（Chromium 新版缓存格式），但文件夹名或其他内容对不上标准格式".into() } else { "里面有 index 和 data_0/data_1（Chromium 老版缓存格式），但还有别的文件".into() }],
             });
         }
     }
@@ -353,6 +584,24 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             || child(n, "Lib").is_some_and(|l| has_child(l, "site-packages"))
             || child(n, "lib").is_some_and(|l| l.children.iter().any(|c| c.name.to_lowercase().starts_with("python") && has_child(c, "site-packages")));
         let conda = has_child(n, "conda-meta");
+        // conda 的 envs 目录（或其中一个环境）装在规则库不认识的位置（比如 D:\conda\envs）：和规则 conda-envs 一样 keep + 迁移。
+        let parent_is_envs = t.parent.is_some_and(|p| p.name.eq_ignore_ascii_case("envs"));
+        let envs_root = name == "envs" && sibling_exists(t, "conda-meta");
+        if (conda && parent_is_envs) || envs_root {
+            return Some(Hint {
+                name: "conda-env",
+                tier: Tier::Keep,
+                category: Category::Userdata,
+                what: if envs_root { "conda 的环境目录（每个子文件夹是一套独立的 Python 和库）".into() } else { format!("conda 环境「{}」（一套独立的 Python 和库）", n.name) },
+                why: "给不同项目准备的运行环境，用 conda create 建出来的".into(),
+                lose: "删了环境里的库和配置都没了，用它的项目跑不起来，要照原样重建（很费时，版本还不一定装得回来）。".into(),
+                how: vec![How::Migrate],
+                how_detail: "要迁到别的盘：先 conda env export -n 环境名 > env.yml 备份，在 .condarc 的 envs_dirs 里加新位置，再 conda env create -f env.yml 重建，确认能用后 conda env remove -n 旧环境。不用的环境用 conda env remove -n 环境名 删，不要直接删文件夹。".into(),
+                confidence: 0.7,
+                owner: Some("conda（Anaconda / Miniconda）".into()),
+                clues: vec![if envs_root { "文件夹叫 envs，旁边有 conda-meta（conda 安装目录的标志）".into() } else { "里面有 conda-meta，上一层文件夹叫 envs".into() }],
+            });
+        }
         if has_cfg || (named_venv && site) {
             return Some(Hint {
                 name: "python-venv",
@@ -385,38 +634,81 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
         }
     }
 
-    // 3. node_modules（父目录有 package.json）。
-    if is_dir && name == "node_modules" && sibling_exists(t, "package.json") {
+    // 2b. 在某个 site-packages 里面（Python 环境里装的库）。
+    if let Some(i) = first_segment(t.path, "site-packages").filter(|&i| i + 1 < seg_count(t.path)) {
+        let env_dir = prefix_path(t.path, i);
         return Some(Hint {
-            name: "node-modules",
+            name: "python-env",
             tier: Tier::Review,
-            category: Category::Build,
-            what: "某个 JavaScript / Node.js 项目下载的依赖包".into(),
-            why: "运行 npm / pnpm / yarn install 时把项目需要的包全部下载到这里".into(),
-            lose: "删了项目暂时跑不起来，在项目目录里重新 npm install 就能装回来（要联网、要等一会儿），不丢你写的代码。".into(),
-            how: vec![How::Delete],
-            how_detail: "确认项目不在运行，删掉整个 node_modules；要用时在项目目录执行 npm install（或 pnpm install / yarn）。".into(),
-            confidence: 0.75,
+            category: Category::App,
+            what: "某个 Python 环境里装的库".into(),
+            why: "pip / conda 装库时放在 site-packages 里，程序运行要用".into(),
+            lose: "单独删其中一个库，用到它的程序会报错；想腾空间应该删整个环境，或者用 pip uninstall 卸载库。".into(),
+            how: vec![How::Manual],
+            how_detail: "用 pip uninstall 包名 卸载，或整个环境不用了再删整个环境。".into(),
+            confidence: 0.6,
             owner: None,
-            clues: vec!["文件夹叫 node_modules，旁边有 package.json".into()],
+            clues: vec![format!("在 {env_dir} 里面")],
         });
     }
 
-    // 4. Rust target（旁边有 Cargo.toml）。
-    if is_dir && name == "target" && sibling_exists(t, "Cargo.toml") {
+    // 3. node_modules：本身叫 node_modules，或者在某个 node_modules 里面。提示是哪个项目的。
+    if let Some(i) = first_segment(t.path, "node_modules") {
+        let project = prefix_path(t.path, i);
+        let project_name = project.trim_end_matches('\\').rsplit('\\').next().unwrap_or(&project).to_string();
+        let own = i + 1 == seg_count(t.path);
+        let has_pkg = if own { sibling_exists(t, "package.json") } else { Path::new(&project).join("package.json").exists() };
+        let (hname, what, clue, conf) = if has_pkg {
+            (
+                "node-modules",
+                if own { format!("项目「{project_name}」下载的 JavaScript 依赖包") } else { format!("项目「{project_name}」的 JavaScript 依赖包里的一部分") },
+                format!("在 node_modules 里；对应的项目是 {project}（那里有 package.json）"),
+                0.75,
+            )
+        } else {
+            (
+                "node-modules-orphan",
+                format!("一个 JavaScript 依赖包文件夹（node_modules），原来应该属于「{project_name}」"),
+                format!("在 {project} 下面，但那里没有 package.json：对应的项目可能已经删了或挪走了，这可能是遗留下来的"),
+                0.5,
+            )
+        };
         return Some(Hint {
-            name: "rust-target",
+            name: hname,
             tier: Tier::Review,
             category: Category::Build,
-            what: "Rust 项目的编译产物".into(),
-            why: "cargo build / cargo test 编译时生成的中间文件和程序".into(),
-            lose: "删了只是下次要重新编译（可能要几分钟到几十分钟），不丢源代码。".into(),
+            what,
+            why: "运行 npm / pnpm / yarn install 时把项目需要的包全部下载到这里".into(),
+            lose: "删了对应项目暂时跑不起来，在项目目录里重新 npm install 就能装回来（要联网、要等一会儿），不丢你写的代码。".into(),
             how: vec![How::Delete],
-            how_detail: "在项目目录执行 cargo clean，或直接删这个 target 文件夹。".into(),
-            confidence: 0.8,
-            owner: None,
-            clues: vec!["文件夹叫 target，旁边有 Cargo.toml".into()],
+            how_detail: format!("确认项目不在运行，删掉整个 {project}\\node_modules（不要只删一部分）；要用时在项目目录执行 npm install（或 pnpm install / yarn）。"),
+            confidence: conf,
+            owner: Some(format!("项目「{project_name}」（{project}）")),
+            clues: vec![clue],
         });
+    }
+
+    // 4. Rust target：本身叫 target 或在 target 里面，且 target 旁边有 Cargo.toml。
+    for i in segment_indices(t.path, "target") {
+        let project = prefix_path(t.path, i);
+        let own = i + 1 == seg_count(t.path);
+        let has_cargo = if own { sibling_exists(t, "Cargo.toml") } else { Path::new(&project).join("Cargo.toml").exists() };
+        if has_cargo {
+            let project_name = project.trim_end_matches('\\').rsplit('\\').next().unwrap_or(&project).to_string();
+            return Some(Hint {
+                name: "rust-target",
+                tier: Tier::Review,
+                category: Category::Build,
+                what: if own { format!("Rust 项目「{project_name}」的编译产物") } else { format!("Rust 项目「{project_name}」编译产物的一部分") },
+                why: "cargo build / cargo test 编译时生成的中间文件和程序".into(),
+                lose: "删了只是下次要重新编译（可能要几分钟到几十分钟），不丢源代码。".into(),
+                how: vec![How::Delete],
+                how_detail: format!("在 {project} 里执行 cargo clean，或直接删整个 target 文件夹。"),
+                confidence: 0.8,
+                owner: Some(format!("项目「{project_name}」（{project}）")),
+                clues: vec![format!("在 target 文件夹里，旁边有 Cargo.toml（项目在 {project}）")],
+            });
+        }
     }
 
     // 6. .NET bin/obj（旁边有 *.csproj，且 bin 和 obj 同时存在）。

@@ -2,7 +2,7 @@
 
 # 阶段 B 验证记录：解释引擎
 
-> 第 1–6 节是 2026-09-23 上午第一次做阶段 B 时的记录（当时 179 条规则、47 个测试）。当晚 S22 轮在分支 `phase-b` 上补做了 B-1、B-2，见文末第 7、8、9 节。
+> 第 1–6 节是 2026-09-23 上午第一次做阶段 B 时的记录（当时 179 条规则、47 个测试）。当晚 S22 轮在分支 `phase-b` 上补做了 B-1、B-2、B-3，见文末第 7（决定）、8、9、10 节；第 3 节的覆盖率已被第 10 节和新的 coverage.md 取代。
 > **注意**：B-2 改了几处第 1 节写过的行为——启发式现在可以对签名严格的 Chromium 缓存给 safe（1.4 节说“永不 safe”已过时）；LLM 请求体从 9 个字段收紧到 4 个、回复只收 what/why/lose、可信度固定 0.3（1.5 节已过时）。以第 9 节为准。
 
 日期：2026-09-23　机器：Windows 11 Pro 10.0.26200，C 盘 NTFS 199 GB，**普通用户权限（未提权）**
@@ -251,6 +251,20 @@ DiskWhy 解释：C:\
 | 17 | 游戏平台缓存第二批依据 | `epic-launcher-webcache`、`battlenet-cache` 标 safe，依据是官方客服文章；`steam-htmlcache` 标 review | Epic 页面直接抓取返回 403（有反爬），暴雪页面 WebFetch 断连、curl 跟随跳转后 200；这两篇的正文是通过搜索引擎对官方页面的摘录读到的（Epic：退出启动器后删 `%LOCALAPPDATA%\EpicGamesLauncher\Saved` 下的 webcache / webcache_4147 / webcache_4430；暴雪：结束 Agent.exe 后删 `%ProgramData%\Blizzard Entertainment`，不影响游戏数据）。Steam 的 htmlcache 没找到 Valve 的官方说明，按“拿不准就 review”处理 |
 | 18 | “超过 180 天的缓存提示很久没用”对哪些生效 | 只对 category = cache 的（规则命中的缓存和启发式的缓存都算），写“很久没用了：已经 N 个月没动过……对应的软件可能已经不怎么用”；模型、程序等不写这句（模型很久不动是正常的），其余启发式仍然写原来的“已经 N 个月没动过了” | 规则命中时为了算这个要看子树的修改时间，最多看 5000 个节点，列目录仍然秒开 |
 | 19 | 主工作区在我干活期间还在变（`TreemapView.vue` 新改了、多了 `phaseD-*.png` 截图） | 判断为另一轮会话正在主目录做阶段 D，继续只在 worktree 里改，不看、不碰主目录。两边共用 `target/`，cargo 有文件锁，会排队 | B-2 在 phase-b 上只改了 `DetailPanel.vue` 和 `SettingsDialog.vue` 各两行文案；阶段 D 也改了 `DetailPanel.vue`，将来合并时这两行可能要手动合 |
+| 20 | （B-3）`explain --json` 输出什么 | 改成 **Explanation 数组**：每项是一条完整的 Explanation，另外平铺 `rank`（0 = 目标本身）、`path`、`allocated`，从 JSON 补读过的加 `reread: true`；`--json -` 写到标准输出（这时人看的表格改走标准错误）。原来 `--json` 写的“带统计的报告对象”挪到新参数 `--report` | 任务原文“--json 输出 Explanation 数组”；只有 Explanation 不带路径没法用，所以平铺三个定位字段，不另套一层 |
+| 21 | （B-3）“直接对路径给出解释”怎么做 | `explain <路径>`：现扫这个路径，第 0 行解释它本身，后面是它下面前 N 大目录；`--top 0` 只解释它本身；路径是文件时扫它所在的文件夹再解释这个文件。统计只算第 1..N 行（`--top 0` 时算第 0 行） | 一个命令同时满足“解释一个路径”和“前 N 大逐个解释”；统计口径和 PLAN 的“前 50 大目录”一致，不把 `C:\` 本身算进去 |
+| 22 | （B-3）只扫一个子目录时，上层规则怎么继承 | 新增 `view::outer_ancestors`：把扫描根以上每一层造成只带“直接子项名字和类型”的节点（读一次目录，不量大小、不递归），接在祖先链前面 | 否则只扫 `pip\cache\http-v2` 时认不出它在 `pip\cache` 规则里，只扫 `node_modules` 时也看不到旁边的 package.json；实测 `explain …\pip\cache\http-v2` 得到“pip-cache（继承上层）” |
+| 23 | （B-3）scan 的 JSON 里树只到 3 层，前 50 大目录大多在更深处，`explain --from` 怎么办 | 导出时除了前 `--json-depth` 层，还保留**前 N 大目录连同它们的每一层上层**，这条链上每层的**直接子项**都保留（`view::export_tree`）。读回后前 N 大目录的集合和现扫一致 | 本机 C 盘 JSON 24 MB、24,186 个目录节点，比全量快照解压后小得多；链上的兄弟子项保留下来，规则的 `when_child` 和“旁边有没有 package.json”还能判断 |
+| 24 | （B-3）JSON 被截断后，启发式看不到深处的文件怎么办 | 规则只看路径，截断不影响；**规则没命中、子树又不完整时**（`view::subtree_complete`：`dirs` / `files` 计数对不上），回磁盘把这个文件夹只读地重扫一遍再解释，行上标 `reread`，notes 里写明；`--no-reread` 可以关掉 | 测试里构造了“日志藏在第 3 层”的例子：不补读时认不出（未知），补读后是 `logs-dumps`，和现扫一致；本机 C 盘前 50 只补读了 2 个文件夹（215 ms） |
+| 25 | （B-3）scan JSON 里每个目录节点的“解释摘要”在哪算 | 在**完整的**内存树上算（`ExplainSummary`：tier / owner / source / what），不调 LLM；`top_dirs` 里带完整 Explanation；另加 `explain` 字段写规则数、警告、用时。`--no-explain` 可以不附 | 摘要在截断前算，所以就算 JSON 里子树不全，摘要也是准的；本机 24,186 个节点 224 ms。读回 JSON 时 `explanation` 字段被忽略，旧的 `--from` 流程不受影响 |
+| 26 | （B-3）`--llm` 什么时候真的联网 | 两道开关：命令行 `--llm` **并且**设置里已启用（`enabled` + 地址 + 模型）。只对“规则、启发式都认不出”的行问，而且在回磁盘补读之后才判断；设置没启用时只打印“本次不会联网” | 默认关闭；避免一个开关就把几百个目录名发出去；测试用本机假服务器核对：不加 `--llm` 请求数 0、规则认得的目录请求数 0、未知目录正好 1 次且请求里没有文件内容 |
+| 27 | （B-3）覆盖率怎么算 | “规则 + 启发式”占前 N 大目录的比例，容器规则（`scope = self`）算命中，但单独列出个数，coverage.md 同时给“不算容器”的数字 | 容器规则确实回答了“这是什么”，但回答偏泛；两个数都给，读者自己判断 |
+| 28 | （B-3）真实 C 盘第一轮发现：商店应用沙箱里的东西被说成“Claude 的数据” | 新增 `explain::msix_redirect`：路径在 `%LOCALAPPDATA%\Packages\<包>\LocalCache\{Local,Roaming,LocalLow}\<至少一层>` 时，按应用以为的原位置找规则（精确 → 上层 tree 规则 → 启发式），都认不出才退回包自己的规则并加提醒；真实路径上本来就有更具体规则的（如 `claude-desktop-vm`）照旧 | 依据 learn.microsoft.com《Understanding how packaged desktop apps run on Windows》：打包应用在 AppData 里**新建**的文件和文件夹写到每用户每包的私有位置、运行时合并显示在原位置。本机 Claude 桌面版的 `LocalCache\Local` 里有 pip、GitHub CLI、playwright 等别的程序的数据 |
+| 29 | （B-3）`CARGO_TARGET_DIR` 放在别处的 Rust 编译目录旁边没有 Cargo.toml | `rust-target` 启发式多认一种：目录里同时有 `CACHEDIR.TAG` 和 `.rustc_info.json`（本身或上层 8 层内）。只查文件在不在，不读内容；只有 `CACHEDIR.TAG` 不算 | `CACHEDIR.TAG` 是 cargo 从 PR #8378 起在 target 目录放的备份排除标记（别的软件也会放，所以要两个一起）；`.rustc_info.json` 在 cargo 官方文档里没找到说明，是本机两个 target 目录里都看到的，**属于本机观察** |
+| 30 | （B-3）前 50 已达 100%，还要不要补规则 | 不补。“未命中”的待办写进 coverage.md；需要查官方资料的两条（Raspberry Pi Imager 缓存、`AppData\Local\OpenAI\Codex`）标“要查”留给下一批 | 任务说“达不到才补规则”；没查证就写规则违反“先查文档” |
+| 31 | （B-3）任务写“`cargo build --release`” | 只构建了 `-p diskwhy-cli` 的发布版，Tauri 壳用 `cargo check -p diskwhy` 确认能编译 | B-3 没改界面；worktree 里没有前端依赖，整个工作区发布版会连 Tauri 一起 LTO 编译，时间长而且和另一轮会话抢同一个 target/ |
+| 32 | （B-3）第二轮要不要重扫 | 重扫（60 秒），不用第一轮的 JSON | 第一轮 JSON 里的摘要是修改前的引擎算的，重扫才能让“JSON 摘要”和“explain 结果”逐行对得上（实测 51/51 一致） |
+| 33 | （B-3）coverage.md 怎么处理旧版本 | 整个重写（旧版在 master 的 5c4c7e0 里），路径里的用户名换成 `<用户>`（`--md` 输出自动做） | 旧版是 179 条规则时的数，而且没脱敏 |
 
 ## 8. B-1：规则库骨架 + 首批规则（S22 补做，分支 `phase-b`）
 
@@ -403,3 +417,75 @@ DiskWhy 解释：C:\
 - 用户醒来后要决定：主目录里那批阶段 D 改动怎么处理；之后 `git merge phase-b`。`src/components/DetailPanel.vue` 两边都改过，合并时注意那两行“发送什么”的文案要保留 B-2 的版本。
 - 想看真实模型在四字段下的表现：在设置里填本机 Ollama，对 `AppData\Local` 里的未知项点“问 AI”，把结果和第 4 节的截图对比。
 - 手动全量对照可以随时重跑：`DISKWHY_SWEEP_DIR=<目录> cargo test --release -p diskwhy-core --test b2_tests b2_manual_real_dir_sweep -- --ignored --nocapture`。
+
+## 10. B-3：CLI explain + 真实 C 盘覆盖率（S22，分支 `phase-b`）
+
+### 10.1 做了什么
+
+| 任务要求 | 状态 | 位置 |
+|---|---|---|
+| `explain` 子命令：对 scan 结果 JSON 解释 | **本轮加**：`explain --from scan.json [<路径>]`；JSON 截断时规则没命中的文件夹回磁盘只读补读（决定 23、24） | `crates/diskwhy-cli/src/explain_cmd.rs` |
+| `explain` 直接对路径解释 | **本轮加**：`explain <路径>`（文件也行），第 0 行是它本身，`--top 0` 只解释它；扫描根以上的规则继承靠 `outer_ancestors`（决定 21、22） | `main.rs`、`view::outer_ancestors` |
+| `--json` 输出 Explanation 数组 | **本轮改**（决定 20）；原来的报告挪到 `--report`；`--md` 输出 coverage.md 的表格（用户名脱敏） | `explain_cmd.rs` |
+| `--top N` 对前 N 大目录逐个解释 | 已有，改为基于目标文件夹（不一定是扫描根） | 同上 |
+| `--llm` 开关，默认关 | **本轮加**，要命令行和设置两道开关都开，只问认不出的（决定 26） | 同上，复用 B-2 的 `explain_full` / `HttpOracle` |
+| scan 的 JSON 里每个目录节点附解释摘要（tier / owner / source / 一句话） | **本轮加** `ExplainSummary`、`view::export_tree`；`top_dirs` 带完整解释；前 N 大目录连同上层保留在树里（决定 23、25） | `explain/mod.rs`、`view.rs`、`main.rs` 的 `write_scan_json` |
+| 真实 C 盘 scan + explain --top 50，写 coverage.md | 做了两轮（第二轮是修完说错的地方后重扫），见 [coverage.md](coverage.md) | `docs/coverage.md` |
+| 集成测试：临时目录假树跑 explain | **本轮加** CLI 端到端 3 个 + core 3 个 | `crates/diskwhy-cli/tests/explain_cli.rs`、`crates/diskwhy-core/tests/b3_tests.rs` |
+
+另外，真实 C 盘第一轮暴露的两处引擎问题一并修了（决定 28、29）：商店应用沙箱重定向（`explain::msix_redirect`，新 `RuleSet::best_tree_exact`）、单独放置的 cargo 编译目录（`heuristics::cargo_target_dir`）。
+
+**用法：**
+
+```
+diskwhy-cli scan C:\ --top 50 --json scan.json                 # 树里每个目录带摘要，前 50 大目录连同上层都保留
+diskwhy-cli explain --from scan.json --top 50 --json out.json    # 不重扫；out.json 是 Explanation 数组（51 项，第 0 项是 C:\）
+diskwhy-cli explain --from scan.json --top 50 --report r.json --md coverage.md
+diskwhy-cli explain C:\Users\me\AppData\Local\pip --top 0 --json -   # 只解释这一个路径，JSON 写到标准输出
+diskwhy-cli explain D:\somewhere --top 20 --llm                  # 设置里启用了 AI 才会问，只问认不出的
+```
+
+### 10.2 真实 C 盘结果（详见 coverage.md）
+
+| 范围 | 规则 | 启发式 | 未知 | 规则 + 启发式 |
+|---|---:|---:|---:|---:|
+| 前 50 大目录 | 47（94.0%；精确 35 其中容器 14，继承 12） | 3（6.0%） | 0（0.0%） | **100.0%**（目标 ≥ 80%）；不算容器 72% |
+| 前 200 大目录 | 183（91.5%） | 16（8.0%） | 1（0.5%） | 99.5% |
+
+- 扫描 60.1 秒（普通权限；同时另一轮会话在编译，比平时的 41 秒慢）；`scan.json` 24 MB，24,186 个目录节点全部带摘要（224 ms）；`explain --from` 51 行 219 ms，其中补读 2 个文件夹 215 ms。
+- 用脚本逐行核对：`explain` 的 51 行和 `scan.json` 里对应节点的摘要 **51/51 一致**；`top_dirs` 50 项都带完整解释。
+- **第一轮的 100% 里有 4 行是说错的**（Claude 商店应用沙箱里的 cargo 编译目录被说成“Claude 的登录信息和设置”），修完后第二轮其中 3 行变成 `rust-target`，1 行保留包规则但带提醒。只看覆盖率会高估质量，这次靠逐行人工看才发现。
+
+### 10.3 怎么验证的
+
+- `cargo test -p diskwhy-core -p diskwhy-cli`（`CARGO_TARGET_DIR` 指回主目录 `target/`）：**76 个通过，0 失败，2 个忽略**（忽略的两个同 B-2，要设环境变量才跑）。B-2 时是 70 个，本轮新增 6 个：
+
+| 测试 | 测什么 |
+|---|---|
+| `b3_scan_json_carries_summaries_and_explain_from_json_matches_live`（CLI） | 真跑 `diskwhy-cli.exe` 子进程，`%LOCALAPPDATA%` 等环境变量指到假树里：`scan --json --json-depth 1` 后树里每个目录都有摘要（且只是摘要，没有 lose）、第 5 层的前 N 大目录也在；`explain --from` 与现扫逐行一致（tier / source / what）；pip 精确 + 继承、Temp、node_modules 说出项目「proj」、严格 Chromium 缓存 safe、第 3 层的日志、未知项带线索；safe 只来自规则或 chromium-cache；只保留前 3 大目录的 JSON 里 `logsdir` 回磁盘补读后认出 `logs-dumps`，`--no-reread` 时认不出；`--from` 加子路径；`--report` 各来源个数之和 = 总数、不含第 0 行；`--md` 表头和待办小节 |
+| `b3_explain_single_paths_and_files`（CLI） | `--top 0` 只出一行；只扫 `node_modules` 也能看到上层的 package.json；只扫 `pip\cache\http-v2` 认出继承的 `pip-cache`，`inherited_from` 指向 `pip\cache`；解释单个文件；路径不存在时失败退出不崩；`scan --llm` 被拒 |
+| `b3_llm_flag_is_off_by_default_and_only_asks_for_unknowns`（CLI） | 本机 127.0.0.1 假服务器：设置里启用但不加 `--llm` → 0 次请求；加 `--llm` 解释规则认得的目录 → 0 次；未知目录 → 正好 1 次，结果 review / 可信度 < 0.5 / 不收 AI 给的 owner 和 safe / 保留线索，请求里没有文件内容、有名字和子项名；整棵树 `--llm` → 问的次数 = AI 行数 = 服务器收到的请求数；设置没启用时 `--llm` 只提示不联网 |
+| `b3_subtree_complete_and_export_tree_keeps_spine`（core） | 完整树 / 截断树的判定；导出只留 1 层时链上各层和它们的直接子项在、链外深处不在；摘要在完整树上算（http-v2 继承 pip-cache、owner = pip）；序列化平铺、能按 `Node` 读回 |
+| `b3_outer_ancestors_from_real_dirs`（core） | 真实目录：从盘符根到上一层、从浅到深，最后一层带子目录和文件名；`C:\` 为空、`C:\Windows` 为 1 层 |
+| `b3_msix_sandbox_redirect_and_standalone_cargo_target`（core） | 沙箱路径识别（不认 `LocalCache\Local` 本身、`Settings`、非包路径）；沙箱里的 pip 缓存按 `pip-cache`（精确 + 继承）并写明重定向；真实路径有更具体规则时照旧（`claude-desktop-vm`）；沙箱里的 cargo 编译目录及其子目录是 `rust-target`；认不出的退回 `claude-desktop-data` 并提醒；沙箱外的包数据不加提醒；沙箱外单独的 cargo 编译目录也认得；只有 `CACHEDIR.TAG` 不算 |
+
+- `cargo check -p diskwhy`（Tauri 壳）通过。
+- 真实环境：`explain C:\…\LocalCache\Local\pip --top 3` 在本机输出 `pip\cache` 141 MB“可清理（规则 pip-cache）”；`explain C:\Users\<用户>\AppData\Local\pip\cache\http-v2` 输出“pip-cache（继承上层）”。
+- 查过的资料：learn.microsoft.com《Understanding how packaged desktop apps run on Windows》（AppData 新建文件重定向到每用户每包的位置）；Cargo Book “Build cache”（target 目录布局、`CARGO_TARGET_DIR`；页面里没提 `CACHEDIR.TAG` / `.rustc_info.json`）；rust-lang/cargo PR #8378（target 目录放 `CACHEDIR.TAG`）。
+
+### 10.4 没做 / 没验证的
+
+- **`--llm` 没有连真实模型跑过**，只用本机假服务器验证了“什么时候问、发了什么、结果怎么处理”（按要求默认不联网）。
+- **没有在 GUI 里接这次的改动**：沙箱重定向和新的 `rust-target` 在 GUI 的列表 / 详情里会自动生效（同一个 `explain`），但没有重新构建 GUI、没截图；`cargo build --release` 只构建了 CLI（决定 31）。
+- **全盘按规则库归档（`tier_summary`）没跟着改沙箱重定向**：沙箱里的 pip 缓存在那组 safe / review / keep 合计里仍算在 `claude-desktop-data`（review）下，列表和详情里的单项说明是对的。本机影响约 141 MB。
+- `.rustc_info.json` 作为 cargo 编译目录标记，官方文档里没找到说明，是本机观察（决定 29）；如果将来 cargo 改名，这条启发式会失效（退回到包规则或未知，不会误判成 safe）。
+- `DiskWhy-build` 这一层（只装着一个 cargo 编译目录）仍按 Claude 包规则说明（带提醒），没有专门处理。
+- coverage.md 里两条“要查”的待办（Raspberry Pi Imager 缓存、`AppData\Local\OpenAI\Codex`）没有查证、没有写规则。
+- 扫描时另一轮会话在同一块盘上编译，C 盘数据在变；两轮之间有几百 MB 的差异（卷已用 182.19 → 182.28 GB），不影响前 50 的结论。
+- scan 的 JSON 现在按键名字母顺序输出（`serde_json::Value`），和以前的字段顺序不同；`--from` 读取不受影响，别的程序如果按顺序解析会受影响（目前没有）。
+
+### 10.5 下一阶段从哪接
+
+- 仍在 `D:\desk\claudex\13\diskwhy\.worktrees\phase-b` 做、提交到 `phase-b`，构建用 `CARGO_TARGET_DIR=D:/desk/claudex/13/diskwhy/target`。另一轮会话在主目录做阶段 D、会覆盖 `target/release/diskwhy-cli.exe`，本轮用的 CLI 另存了一份在 `target/tmp/diskwhy-cli-b3.exe`，扫描产物在 `target/tmp/`（`scan.json`、`c.dwsnap`、`explain50.json`、`report50.json`、`report200.json`、`cov200.md`；`r1/` 是第一轮）。
+- 规则待办看 coverage.md 最后一节；`tier_summary` 接上沙箱重定向；GUI 构建截图。
+- 用户醒来后要决定：阶段 D 那批改动怎么处理、`phase-b` 何时合回 master。

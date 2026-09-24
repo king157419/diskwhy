@@ -540,6 +540,9 @@ fn markdown(r: &Report, ctx: &ExplainCtx) -> String {
             human_bytes(t.safe_tool_bytes),
             human_bytes(t.guarded_bytes)
         );
+        for g in t.guard_items.iter().filter(|g| g.bytes > 0) {
+            let _ = writeln!(s, "- 护栏改记 {}：{}，最大一处 `{}`（{}）", g.what, human_bytes(g.bytes), redact(&g.top_path, &user), human_bytes(g.top_path_bytes));
+        }
     }
     // 没被规则说明的（启发式 + AI + 未知），按大小取前 10。
     let mut missed: Vec<&Row> = r.rows.iter().filter(|x| x.rank > 0 && !x.explanation.is_rule()).collect();

@@ -653,6 +653,9 @@ pub struct TierSummary {
     /// 不合 Chromium 缓存格式的通配命中）。已经算进 review_bytes / keep_bytes。
     #[serde(default)]
     pub guarded_bytes: u64,
+    /// 护栏改记的每一类（按字节从大到小），方便核对是哪些东西被从 safe 里拿出来的。
+    #[serde(default)]
+    pub guard_items: Vec<RuleBytes>,
     /// 命中过至少一次的规则数 / 规则总数。
     pub rules_hit: usize,
     pub rules_total: usize,
@@ -784,7 +787,7 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
             "source-repo" => ("护栏", "缓存 / 临时文件夹里的代码仓库"),
             _ => ("护栏", "缓存 / 临时文件夹里的文档"),
         };
-        items.push(RuleBytes {
+        let rb = RuleBytes {
             id: format!("guard:{name}"),
             owner: owner.into(),
             what: what.into(),
@@ -792,8 +795,11 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
             bytes: *b,
             top_path: path.clone(),
             top_path_bytes: *pb,
-        });
+        };
+        s.guard_items.push(rb.clone());
+        items.push(rb);
     }
+    s.guard_items.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     items.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     for it in items {
         let v = match it.tier {

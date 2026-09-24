@@ -120,6 +120,11 @@ pub struct Explanation {
     pub notes: Vec<String>,
     /// 线索（启发式 / 未知时列出看到了什么）。
     pub clues: Vec<String>,
+    /// 护栏：这一整项**不能整块删**的原因（里面混着像是用户数据的东西、下层有“需判断 / 保留”的规则、
+    /// 内容太多没看全、名字像缓存但格式不对）。这种项的档位已经降成 review，`how` 里可能仍有 delete
+    /// （指“挑出可清理的部分再删”），所以阶段 D 的删除必须看这个字段，见 [`delete_block_reason`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<String>,
 }
 
 impl Explanation {
@@ -158,6 +163,8 @@ pub struct ExplainCtx {
     protected: Vec<Vec<String>>,
     /// 当前时间（Unix 秒），测试可固定。
     pub now: i64,
+    /// 往下找用户数据陷阱时最多看多少个节点（默认 [`heuristics::TRAP_VISIT`]；测试可调小）。
+    pub trap_visit: usize,
 }
 
 /// 受保护的用户目录名（%USERPROFILE% 之下）。
@@ -188,7 +195,7 @@ impl ExplainCtx {
                 protected.push(split_lower(&format!("{public}\\{d}")));
             }
         }
-        ExplainCtx { env, rules, registry, settings, protected, now: now_unix() }
+        ExplainCtx { env, rules, registry, settings, protected, now: now_unix(), trap_visit: heuristics::TRAP_VISIT }
     }
 
     /// 生产用：当前进程环境变量 + 内置规则 + 用户自定义规则目录 + 注册表 + settings.json。
@@ -297,11 +304,35 @@ pub fn enforce_guards(mut e: Explanation, path: &str, ctx: &ExplainCtx) -> Expla
     e
 }
 
+/// 这一项能不能被“删除”动作整块删掉；不能时返回原因（给阶段 D 的删除清单 / 批量删除用）。
+///
+/// 一律拦下：来源是 AI 或未认出；保留档；`how` 里没有 delete（要用工具清、要迁移、要手动处理）；
+/// 护栏标了 [`Explanation::hold`]（整块删会连带用户数据）。review 档其余情况放行（用户逐项自己决定）。
+pub fn delete_block_reason(e: &Explanation) -> Option<String> {
+    match &e.source {
+        Source::Unknown => return Some("还没认出来是什么，不能删".into()),
+        Source::Llm { .. } => return Some("说明来自 AI 推测，不能作为删除依据".into()),
+        _ => {}
+    }
+    if e.tier == Tier::Keep {
+        return Some(format!("建议保留的东西不能删（{}）", e.what));
+    }
+    if !e.how.contains(&How::Delete) {
+        return Some("这一项不该直接删，按“怎么腾”里写的办法处理".into());
+    }
+    e.hold.clone()
+}
+
+/// 能不能进“一键清理可清理项”这种批量删除：只有 safe、`how` 含 delete、没有被护栏扣下的。
+pub fn batch_deletable(e: &Explanation) -> bool {
+    e.tier == Tier::Safe && delete_block_reason(e).is_none()
+}
+
 /// 同 [`explain`]，但继承命中由调用方预先算好（列目录时对所有子项只算一次）。
 pub fn explain_with_inherited(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) -> Explanation {
     let node = t.node;
     if node.kind == NodeKind::Rest {
-        return enforce_guards(explain_rest(t, inherited, ctx), t.path, ctx);
+        return enforce_guards(guard_rule_hit(explain_rest(t, inherited, ctx), t, ctx), t.path, ctx);
     }
     let segs = split_lower(t.path);
     let redirect = msix_redirect(t.path, ctx);
@@ -353,7 +384,7 @@ fn seg_len(p: &str) -> usize {
 /// keep 档不动；启发式、AI、未知来源不经过这里（启发式只有签名严格的 Chromium 缓存能 safe）。
 fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanation {
     let Source::Rule { id, inherited_from, .. } = &e.source else { return e };
-    if e.tier == Tier::Keep || t.node.kind == NodeKind::Rest {
+    if e.tier == Tier::Keep {
         return e;
     }
     let Some(rule) = ctx.rules.by_id(id) else { return e };
@@ -362,6 +393,15 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
     // review 规则只在“继承来的、而且不是专门讲虚拟机的规则”时才查（商店版 WSL 的 LocalState 挂在
     // store-app-package 下面）；专门为这个位置写的 review 规则（比如 Claude 的虚拟机镜像）已经考虑过里面有什么。
     if e.tier == Tier::Review && (from.is_none() || rule.category == Category::Vm) {
+        return e;
+    }
+    // “其余小文件合计”：扫描时记下的名字标志里有文档 / 虚拟磁盘 / 密钥，或者根本没记（第 2 轮安全评审 S1）。
+    if t.node.kind == NodeKind::Rest {
+        if let Some(tr) = heuristics::trap_here(t.path, t.node, e.tier, ctx) {
+            let mut x = heuristics::trap_explanation(&tr, t, &rule_what, ctx);
+            x.hold = Some("被合并显示的小文件里可能有你的文件".into());
+            return x;
+        }
         return e;
     }
 
@@ -380,6 +420,7 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
             let (g, note) = gain(Tier::Review, &e.how, t.node.allocated);
             e.gain_bytes = g;
             e.gain_note = note;
+            e.hold = Some("名字像 Chromium 缓存，但里面混着别的文件".into());
             e.notes.push(format!(
                 "规则按名字认出这是 Chromium 类程序的缓存，但{}里的文件不全是 Chromium 缓存的标准格式，混着别的东西，所以标成“需要你判断”。",
                 from.as_deref().map(|f| format!("「{f}」")).unwrap_or_else(|| "这个文件夹".into())
@@ -407,7 +448,19 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
         let (traps, truncated) = heuristics::traps_below(t.node, e.tier, ctx);
         if traps.is_empty() {
             if truncated && e.tier == Tier::Safe {
-                e.notes.push("内容太多，DiskWhy 只检查了其中一部分有没有混着你的数据。".into());
+                // 看不全就往保守的方向走（第 2 轮安全评审 S1）：不再只加一句提示照样标“可清理”。
+                e.tier = Tier::Review;
+                let (g, note) = gain(Tier::Review, &e.how, t.node.allocated);
+                e.gain_bytes = g;
+                e.gain_note = note;
+                e.hold = Some(format!("内容太多（超过 {} 项），没法确认里面全是可以清理的东西", ctx.trap_visit));
+                e.notes.insert(
+                    0,
+                    format!(
+                        "这里面的东西太多（超过 {} 项），DiskWhy 没能全部看一遍，没法确认里面没有混着你的数据，所以标成“需要你判断”。点进去看下一层会更准。",
+                        ctx.trap_visit
+                    ),
+                );
             }
             return e;
         }
@@ -418,7 +471,13 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
             .take(3)
             .map(|x| {
                 let rel = x.path.get(t.path.trim_end_matches('\\').len()..).unwrap_or(&x.path).trim_start_matches('\\');
-                format!("{}（{}）", rel, human_bytes(x.bytes))
+                let what = match x.name {
+                    "hidden-files" if !x.note.is_empty() => format!("，里面有{}", x.note),
+                    "unchecked-files" => "，没记下文件名".to_string(),
+                    "nested-rule" => x.rule.and_then(|i| ctx.rules.rules.get(i)).map(|r| format!("，{}", r.what)).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                format!("{}（{}{}）", rel, human_bytes(x.bytes), what)
             })
             .collect();
         let list = format!(
@@ -431,6 +490,7 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
             let mut x = heuristics::trap_explanation(biggest, t, &rule_what, ctx);
             x.what = format!("这个文件夹里大部分是：{}", x.what);
             x.notes.insert(0, format!("里面看起来是你的数据的地方：{list}。"));
+            x.hold = Some(format!("里面有看起来是你的数据的东西：{list}"));
             return x;
         }
         if e.tier == Tier::Safe {
@@ -447,8 +507,10 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
                 0,
                 format!("这里整体是可以清理的，但里面混着看起来是你的数据的东西：{list}。所以整个文件夹标成“需要你判断”，点进去逐项看。"),
             );
+            e.hold = Some(format!("里面混着看起来是你的数据的东西：{list}"));
         } else {
             e.notes.push(format!("里面有看起来是你的数据的东西：{list}。"));
+            e.hold = Some(format!("里面有看起来是你的数据的东西：{list}"));
         }
     }
     e
@@ -596,6 +658,7 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         confidence: 1.0,
         refs: rule.refs.clone(),
         observed_only: rule.observed_only,
+        hold: None,
         verified_on: Some(rule.verified_on.clone()),
         notes,
         clues: Vec::new(),
@@ -638,6 +701,25 @@ pub struct RuleBytes {
     pub top_path_bytes: u64,
 }
 
+/// 全盘“可清理”清单里的一项：一条 safe 规则命中的一处（文件夹或文件），按字节从大到小。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeItem {
+    pub path: String,
+    pub is_dir: bool,
+    /// 这一处里算“可清理”的字节（护栏挑出来的部分已经扣掉）。
+    pub bytes: u64,
+    pub rule_id: String,
+    pub owner: String,
+    pub what: String,
+    /// 规则的 how 里没有 delete：要用写明的工具清，别直接删文件夹。
+    #[serde(default)]
+    pub tool_only: bool,
+    /// 这一处里面还混着别的东西（像是用户数据、下层“需判断 / 保留”的规则、没记名字的小文件），
+    /// 所以它在列表里整体显示成“需判断”，可清理的只是其中一部分。
+    #[serde(default)]
+    pub mixed: bool,
+}
+
 /// 按规则库统计的各档合计（不含启发式；启发式和未知在列表里逐项看）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TierSummary {
@@ -663,8 +745,17 @@ pub struct TierSummary {
     pub top_safe: Vec<RuleBytes>,
     pub top_review: Vec<RuleBytes>,
     pub top_keep: Vec<RuleBytes>,
+    /// 全盘可清理清单（最多 [`SAFE_ITEMS_MAX`] 项，按字节从大到小）。界面上点“可清理”卡片时列出来。
+    #[serde(default)]
+    pub safe_items: Vec<SafeItem>,
+    /// 可清理的一共有几处（清单可能只列了前面一部分）。
+    #[serde(default)]
+    pub safe_items_total: usize,
     pub duration_ms: u64,
 }
+
+/// 可清理清单最多列多少项。
+pub const SAFE_ITEMS_MAX: usize = 300;
 
 /// 商店应用沙箱 `…\Packages\<包>\LocalCache\{Local,Roaming,LocalLow}` 这一层对应的“应用以为的位置”（小写段）。
 fn msix_virtual_base(segs: &[String], ctx: &ExplainCtx) -> Option<Vec<String>> {
@@ -688,7 +779,10 @@ struct SumAcc<'a> {
     ctx: &'a ExplainCtx,
     /// (规则, 命中根路径下标) → 字节
     per_root: std::collections::HashMap<(usize, usize), u64>,
-    roots: Vec<String>,
+    /// 命中根：(路径, 是不是文件夹)
+    roots: Vec<(String, bool)>,
+    /// 里面被护栏挑出过东西、或下层有非 safe 规则的命中根（下标）。
+    mixed: std::collections::HashSet<usize>,
     uncovered: u64,
     /// (护栏名, 改记到的档) → (字节, 最大一处路径, 最大一处字节)
     guard: std::collections::HashMap<(&'static str, Tier), (u64, String, u64)>,
@@ -701,9 +795,16 @@ impl SumAcc<'_> {
             None => self.uncovered += bytes,
         }
     }
-    fn root(&mut self, path: String) -> usize {
-        self.roots.push(path);
+    fn root(&mut self, path: String, is_dir: bool) -> usize {
+        self.roots.push((path, is_dir));
         self.roots.len() - 1
+    }
+    /// 记一处护栏改记，并把它所在的命中根标成“混着别的东西”。
+    fn guard_in(&mut self, root: usize, name: &'static str, tier: Tier, bytes: u64, path: &str) {
+        if root != usize::MAX {
+            self.mixed.insert(root);
+        }
+        self.guard(name, tier, bytes, path);
     }
     fn guard(&mut self, name: &'static str, tier: Tier, bytes: u64, path: &str) {
         let g = self.guard.entry((name, tier)).or_insert((0, String::new(), 0));
@@ -736,6 +837,7 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
         ctx,
         per_root: Default::default(),
         roots: Vec::new(),
+        mixed: Default::default(),
         uncovered: 0,
         guard: Default::default(),
     };
@@ -753,6 +855,31 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
             r.2 = b;
         }
     }
+    // 全盘可清理清单：safe 规则的每一处命中。
+    let mut safe_items: Vec<SafeItem> = acc
+        .per_root
+        .iter()
+        .filter(|(&(ri, _), &b)| b > 0 && rs.rules[ri].tier == Tier::Safe)
+        .filter_map(|(&(ri, root), &b)| {
+            let (path, is_dir) = acc.roots.get(root)?.clone();
+            let r = &rs.rules[ri];
+            Some(SafeItem {
+                path,
+                is_dir,
+                bytes: b,
+                rule_id: r.id.clone(),
+                owner: r.owner.clone(),
+                what: r.what.clone(),
+                tool_only: !r.how.contains(&How::Delete),
+                mixed: acc.mixed.contains(&root),
+            })
+        })
+        .collect();
+    safe_items.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    s.safe_items_total = safe_items.len();
+    safe_items.truncate(SAFE_ITEMS_MAX);
+    s.safe_items = safe_items;
+
     let mut items: Vec<RuleBytes> = Vec::new();
     for (i, &(b, root, rb)) in per_rule.iter().enumerate() {
         if b == 0 {
@@ -770,7 +897,7 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
             Tier::Review => s.review_bytes += b,
             Tier::Keep => s.keep_bytes += b,
         }
-        let top_path = acc.roots.get(root).cloned().unwrap_or_default();
+        let top_path = acc.roots.get(root).map(|r| r.0.clone()).unwrap_or_default();
         items.push(RuleBytes { id: r.id.clone(), owner: r.owner.clone(), what: r.what.clone(), tier: r.tier, bytes: b, top_path, top_path_bytes: rb });
     }
     for (&(name, tier), (b, path, pb)) in &acc.guard {
@@ -785,6 +912,9 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
             "chat-data" => ("护栏", "缓存 / 临时文件夹里的聊天数据"),
             "conda-env" => ("护栏", "缓存 / 临时文件夹里的 conda 环境"),
             "source-repo" => ("护栏", "缓存 / 临时文件夹里的代码仓库"),
+            "secret-key" => ("护栏", "缓存 / 临时文件夹里的密钥 / 密码库"),
+            "hidden-files" => ("护栏", "合并显示的小文件里有文档 / 密钥 / 虚拟磁盘"),
+            "unchecked-files" => ("护栏", "合并显示、没记下名字的小文件"),
             _ => ("护栏", "缓存 / 临时文件夹里的文档"),
         };
         let rb = RuleBytes {
@@ -824,24 +954,20 @@ fn guarded(r: &Rule) -> bool {
 fn settle_guarded(node: &Node, hit: (usize, usize), tier: Tier, acc: &mut SumAcc) {
     for c in &node.children {
         match c.kind {
-            NodeKind::Rest => acc.add(Some(hit), c.allocated),
+            NodeKind::Rest => match heuristics::rest_trap(c, tier) {
+                Some((name, to, _)) => acc.guard_in(hit.1, name, to, c.allocated, &node.path),
+                None => acc.add(Some(hit), c.allocated),
+            },
             NodeKind::File => {
-                // 文件的陷阱只看扩展名（聊天文件夹在上面的文件夹那一层就会被认出来）。
-                let e = heuristics::ext_of(&c.name);
-                let t = match tier {
-                    Tier::Safe if heuristics::VDISK_EXTS_PUB.contains(&e.as_str()) => Some(("virtual-disk", Tier::Keep)),
-                    Tier::Safe if heuristics::DOC_EXTS.contains(&e.as_str()) => Some(("user-document", Tier::Review)),
-                    Tier::Review if heuristics::VDISK_EXTS_PUB.contains(&e.as_str()) => Some(("virtual-disk", Tier::Keep)),
-                    _ => None,
-                };
-                match t {
-                    Some((name, to)) => acc.guard(name, to, c.allocated, &format!("{}\\{}", node.path.trim_end_matches('\\'), c.name)),
+                // 文件的陷阱只看名字（聊天文件夹在上面的文件夹那一层就会被认出来）。
+                match heuristics::file_trap(&c.name, tier) {
+                    Some((name, to)) => acc.guard_in(hit.1, name, to, c.allocated, &format!("{}\\{}", node.path.trim_end_matches('\\'), c.name)),
                     None => acc.add(Some(hit), c.allocated),
                 }
             }
             NodeKind::Dir => {
                 if let Some(tr) = heuristics::trap_here(&c.path, c, tier, acc.ctx) {
-                    acc.guard(tr.name, tr.tier, c.allocated, &c.path);
+                    acc.guard_in(hit.1, tr.name, tr.tier, c.allocated, &c.path);
                 } else if c.children.is_empty() {
                     acc.add(Some(hit), c.allocated);
                 } else {
@@ -858,39 +984,38 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
     // self 规则只说明文件夹本身，里面的东西不归它。
     let child_inherited = match exact {
         Some(i) if rs.rules[i].scope == Scope::Tree => {
-            let r = acc.root(node.path.clone());
+            let r = acc.root(node.path.clone(), true);
             Some((i, r))
         }
         _ => inherited,
     };
     for c in &node.children {
         match c.kind {
-            NodeKind::Rest => acc.add(child_inherited, c.allocated),
+            NodeKind::Rest => match child_inherited {
+                Some((i, r)) if guarded(&rs.rules[i]) => match heuristics::rest_trap(c, rs.rules[i].tier) {
+                    Some((name, to, _)) => acc.guard_in(r, name, to, c.allocated, &node.path),
+                    None => acc.add(child_inherited, c.allocated),
+                },
+                _ => acc.add(child_inherited, c.allocated),
+            },
             NodeKind::File => {
                 segs.push(c.name.to_lowercase());
                 let f = rs.best_exact_among(active, segs, Some(c));
                 segs.pop();
                 let hit = match f {
                     Some(i) => {
-                        let r = acc.root(format!("{}\\{}", node.path.trim_end_matches('\\'), c.name));
+                        let r = acc.root(format!("{}\\{}", node.path.trim_end_matches('\\'), c.name), false);
                         Some((i, r))
                     }
                     None => child_inherited,
                 };
                 match hit {
-                    Some((i, _)) if guarded(&rs.rules[i]) => {
-                        // 单个文件：扩展名陷阱
-                        let e = heuristics::ext_of(&c.name);
-                        let tier = rs.rules[i].tier;
-                        let vd = heuristics::VDISK_EXTS_PUB.contains(&e.as_str());
-                        let doc = tier == Tier::Safe && heuristics::DOC_EXTS.contains(&e.as_str());
+                    Some((i, r)) if guarded(&rs.rules[i]) => {
+                        // 单个文件：按名字认的陷阱（虚拟磁盘、密钥、文档）
                         let p = format!("{}\\{}", node.path.trim_end_matches('\\'), c.name);
-                        if vd {
-                            acc.guard("virtual-disk", Tier::Keep, c.allocated, &p);
-                        } else if doc {
-                            acc.guard("user-document", Tier::Review, c.allocated, &p);
-                        } else {
-                            acc.add(hit, c.allocated);
+                        match heuristics::file_trap(&c.name, rs.rules[i].tier) {
+                            Some((name, to)) => acc.guard_in(r, name, to, c.allocated, &p),
+                            None => acc.add(hit, c.allocated),
                         }
                     }
                     _ => acc.add(hit, c.allocated),
@@ -919,6 +1044,13 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
                     })
                     .collect();
                 let own = if child_active.is_empty() { None } else { rs.best_exact_among(&child_active, segs, Some(c)) };
+                // safe 规则的地盘里，下层文件夹命中了 review / keep 规则（Temp\Rar$EX*、INetCache\Content.Outlook）：
+                // 字节归下层规则（下面照常走），上层那一处在清单里标“混着别的东西”（第 2 轮安全评审 S2）。
+                if let (Some(o), Some((pi, pr))) = (own, child_inherited) {
+                    if rs.rules[pi].tier == Tier::Safe && rs.rules[o].tier != Tier::Safe && pr != usize::MAX {
+                        acc.mixed.insert(pr);
+                    }
+                }
                 // 这个文件夹里面归哪条规则管（tree 规则 = 自己；self 规则 = 沿用上层）。
                 let eff = match own {
                     Some(i) if rs.rules[i].scope == Scope::Tree => Some((i, usize::MAX)),
@@ -928,7 +1060,7 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
                 if let Some(i) = own {
                     let r = &rs.rules[i];
                     if r.tier == Tier::Safe && r.verify.as_deref() == Some("chromium-disk-cache") && !heuristics::verify_chromium_disk_cache(c, Some(node)) {
-                        acc.guard("verify-failed", Tier::Review, c.allocated, &c.path);
+                        acc.guard_in(child_inherited.map(|h| h.1).unwrap_or(usize::MAX), "verify-failed", Tier::Review, c.allocated, &c.path);
                         segs.pop();
                         continue;
                     }
@@ -938,7 +1070,11 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
                     let tier = rs.rules[i].tier;
                     if guarded(&rs.rules[i]) {
                         if let Some(tr) = heuristics::trap_here(&c.path, c, tier, acc.ctx) {
-                            acc.guard(tr.name, tr.tier, c.allocated, &c.path);
+                            let root = match own {
+                                Some(o) if rs.rules[o].scope == Scope::Tree => usize::MAX,
+                                _ => child_inherited.map(|h| h.1).unwrap_or(usize::MAX),
+                            };
+                            acc.guard_in(root, tr.name, tr.tier, c.allocated, &c.path);
                             segs.pop();
                             continue;
                         }
@@ -947,7 +1083,7 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
                 if child_active.is_empty() || c.children.is_empty() {
                     let hit = match own {
                         Some(i) if rs.rules[i].scope == Scope::Tree => {
-                            let r = acc.root(c.path.clone());
+                            let r = acc.root(c.path.clone(), true);
                             Some((i, r))
                         }
                         _ => child_inherited,

@@ -18,7 +18,17 @@ const props = defineProps<{
   /** 只把“可清理”画成彩色，其余变淡 */
   highlightSafe?: boolean;
 }>();
-const emit = defineEmits<{ select: [s: TmSelect]; open: [path: string]; up: [] }>();
+const emit = defineEmits<{ select: [s: TmSelect]; open: [path: string]; up: []; showSafe: [] }>();
+
+/** 全盘可清理清单里每一处的路径（小写）：“只高亮可清理”时，给里面有可清理内容的块描绿边 */
+const safePaths = computed(() => (props.summary.tiers.safe_items ?? []).map((i) => i.path.toLowerCase().replace(/\\+$/, "")));
+function containsSafe(path: string): boolean {
+  const p = path.toLowerCase().replace(/\\+$/, "");
+  if (!p) return false;
+  return safePaths.value.some((s) => s === p || s.startsWith(p + "\\"));
+}
+/** 当前这一层画出来的块里有没有绿的 / 描了绿边的 */
+const safeVisible = ref(0);
 
 const wrap = ref<HTMLDivElement | null>(null);
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -30,7 +40,6 @@ const renderMs = ref(0);
 const topCount = ref(0);
 let ro: ResizeObserver | null = null;
 let hatch: CanvasPattern | null = null;
-let hatchLight: CanvasPattern | null = null;
 
 const PSEUDO_LABEL: Record<PseudoKey, string> = {
   inacc: "无权限（推算）",
@@ -155,6 +164,20 @@ function nodeOf(it: TmItem): TreemapNode | null {
   return n as TreemapNode;
 }
 
+/** 右上角画一把小锁（“保留”块用；第 2 轮冷启动评审：保留不再用斜纹，斜纹只留给“读不了”） */
+function drawLock(ctx: CanvasRenderingContext2D, x: number, y: number, color: string) {
+  // 锁身 8×6，锁梁半径 2.5，整体约 9×10，左上角在 (x, y)
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  ctx.arc(x + 4.5, y + 4, 2.6, Math.PI, 0);
+  ctx.stroke();
+  ctx.fillRect(x + 0.5, y + 4, 8, 6);
+  ctx.restore();
+}
+
 /** 深层块稍微提亮，让嵌套层次看得出来 */
 function shade(hex: string, depth: number): string {
   const m = /^#([0-9a-f]{6})$/i.exec(hex);
@@ -201,9 +224,9 @@ function draw() {
     return;
   }
   const pal = palette();
-  // 无权限 / 推算的块：白底斜纹（不再用深灰，免得和“保留”“合并的小块”三种灰分不开）
+  // 无权限 / 推算的块：白底斜纹（不再用深灰，免得和“保留”“合并的小块”三种灰分不开）。
+  // 斜纹只用在这里；“保留”是纯色 + 右上角小锁。
   hatch = makeHatch(ctx, "#ffffff", pal.pseudoLine);
-  hatchLight = makeHatch(ctx, "", "rgba(255,255,255,0.35)");
   const laid = layoutTreemap(root, { x: 0, y: 0, w, h });
   items.value = laid;
   topCount.value = laid.filter((i) => i.depth === 1).length;
@@ -229,11 +252,6 @@ function draw() {
     }
     ctx.fillStyle = fill;
     ctx.fillRect(r.x, r.y, r.w, r.h);
-    // 保留档加一层淡斜纹（“锁纹”），和其他颜色一眼分开
-    if ((node?.system_reserved || (tk === "keep" && !props.highlightSafe && it.kind === "node")) && hatchLight) {
-      ctx.fillStyle = hatchLight;
-      ctx.fillRect(r.x, r.y, r.w, r.h);
-    }
     if (it.container) {
       // 容器：内部铺一层淡色底，标题栏保留档位色
       ctx.fillStyle = "rgba(0,0,0,0.18)";
@@ -242,6 +260,11 @@ function draw() {
     ctx.strokeStyle = pal.border;
     ctx.lineWidth = 1;
     ctx.strokeRect(r.x + 0.5, r.y + 0.5, Math.max(0, r.w - 1), Math.max(0, r.h - 1));
+    // 保留：右上角小锁（块太小就不画）
+    const locked = !pseudo && it.kind === "node" && (tk === "keep" || !!node?.system_reserved) && !props.highlightSafe;
+    if (locked && r.w >= 26 && r.h >= 16) {
+      drawLock(ctx, r.x + r.w - 13, r.y + 3, "rgba(255,255,255,0.9)");
+    }
 
     // 文字
     const pad = 4;
@@ -249,12 +272,12 @@ function draw() {
       if (r.w > 40) {
         ctx.fillStyle = textColor;
         ctx.font = "600 11.5px 'Segoe UI', 'Microsoft YaHei UI', sans-serif";
-        ctx.fillText(fitText(ctx, `${it.name}  ${humanBytes(it.value)}`, r.w - pad * 2), r.x + pad, r.y + 3);
+        ctx.fillText(fitText(ctx, `${it.name}  ${humanBytes(it.value)}`, r.w - pad * 2 - (locked ? 12 : 0)), r.x + pad, r.y + 3);
       }
     } else if (r.w > 36 && r.h > 16) {
       ctx.fillStyle = textColor;
       ctx.font = "600 12px 'Segoe UI', 'Microsoft YaHei UI', sans-serif";
-      ctx.fillText(fitText(ctx, it.name, r.w - pad * 2), r.x + pad, r.y + 3);
+      ctx.fillText(fitText(ctx, it.name, r.w - pad * 2 - (locked ? 12 : 0)), r.x + pad, r.y + 3);
       if (r.h > 32) {
         ctx.font = "11px 'Segoe UI', 'Microsoft YaHei UI', sans-serif";
         ctx.globalAlpha = 0.9;
@@ -271,6 +294,23 @@ function draw() {
     ctx.lineWidth = lw;
     ctx.strokeRect(r.x + lw / 2, r.y + lw / 2, Math.max(0, r.w - lw), Math.max(0, r.h - lw));
   };
+  // 只高亮可清理：本身不是“可清理”、但里面有可清理内容的块（Temp、各程序的文件夹）描绿边
+  let sv = 0;
+  if (props.highlightSafe) {
+    for (const it of laid) {
+      const n = nodeOf(it);
+      if (!n) continue;
+      if (n.tier === "safe") {
+        sv++;
+        continue;
+      }
+      if (containsSafe(n.path)) {
+        sv++;
+        outline(it, pal.tier.safe, 2);
+      }
+    }
+  }
+  safeVisible.value = sv;
   outline(laid.find((i) => i.key === props.selectedKey), pal.accent, 3);
   outline(hover.value ? laid.find((i) => i.key === hover.value!.key) : null, pal.hover, 2);
   renderMs.value = performance.now() - t0;
@@ -491,7 +531,11 @@ defineExpose({ redraw: schedule });
       <ul class="tm-legend small">
         <li><i class="dot dot-safe"></i>可清理</li>
         <li><i class="dot dot-review"></i>需判断</li>
-        <li><i class="dot dot-keep"></i>保留</li>
+        <li>
+          <i class="dot dot-keep dot-lock" aria-hidden="true">
+            <svg viewBox="0 0 10 10" width="8" height="8"><path d="M2.4 4.6V3.4a2.6 2.6 0 0 1 5.2 0v1.2" fill="none" stroke="#fff" stroke-width="1.4" /><rect x="1.5" y="4.5" width="7" height="5" fill="#fff" /></svg>
+          </i>保留（带锁）
+        </li>
         <li><i class="dot dot-unknown"></i>未认出</li>
         <li><i class="dot dot-pseudo"></i>读不了（斜纹）</li>
       </ul>
@@ -522,7 +566,11 @@ defineExpose({ redraw: schedule });
     </div>
     <div class="tm-foot muted small">
       <span>{{ topCount }} 个根层块 · 布局+绘制 {{ renderMs.toFixed(1) }} ms</span>
-      <span v-if="pseudoBlocks.length">斜纹块 = 归属统计里量不到的部分（无权限 / 推算），点一下看解释</span>
+      <span v-if="pseudoBlocks.length">斜纹块 = 读不了的部分（无权限 / 推算），点一下看解释；带锁的是“保留”</span>
+      <span v-if="highlightSafe && !loading && data" class="tm-safe-hint">
+        {{ safeVisible ? "绿色 = 可清理；绿框 = 里面有可清理的东西。" : "这一层没有可清理的块，可清理的都在更深的文件夹里。" }}
+        <button type="button" class="linkish" @click="emit('showSafe')">看全盘可清理清单</button>
+      </span>
       <span v-if="summary.buckets.dedup_enabled && summary.buckets.hardlink_dedup + summary.buckets.mapped_dedup > 0">
         已去重 {{ humanBytes(summary.buckets.hardlink_dedup + summary.buckets.mapped_dedup) }}（硬链接 / 商店应用目录映射，只算一次）
       </span>

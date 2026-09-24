@@ -55,6 +55,8 @@ export interface Explanation {
   verified_on: string | null;
   notes: string[];
   clues: string[];
+  /** 护栏：这一整项不能整块删的原因（里面混着像是你的数据的东西 / 没看全等）。阶段 D 的删除必须看它 */
+  hold?: string | null;
 }
 
 export interface RuleBytes {
@@ -66,6 +68,21 @@ export interface RuleBytes {
   /** 这条规则命中的最大一处（界面副标题用它的文件夹名） */
   top_path?: string;
   top_path_bytes?: number;
+}
+
+/** 全盘可清理清单里的一项（一条 safe 规则命中的一处） */
+export interface SafeItem {
+  path: string;
+  is_dir: boolean;
+  /** 这一处里算“可清理”的字节（护栏挑出来的已经扣掉） */
+  bytes: number;
+  rule_id: string;
+  owner: string;
+  what: string;
+  /** 要用写明的工具清，别直接删文件夹 */
+  tool_only?: boolean;
+  /** 里面还混着别的东西，所以这一处在列表里整体显示成“需判断” */
+  mixed?: boolean;
 }
 
 export interface TierSummary {
@@ -82,6 +99,9 @@ export interface TierSummary {
   top_safe: RuleBytes[];
   top_review: RuleBytes[];
   top_keep: RuleBytes[];
+  /** 全盘可清理清单（按字节从大到小，最多几百项） */
+  safe_items?: SafeItem[];
+  safe_items_total?: number;
   duration_ms: number;
 }
 

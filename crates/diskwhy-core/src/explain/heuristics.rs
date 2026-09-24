@@ -581,6 +581,7 @@ fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explan
         confidence: h.confidence,
         refs: Vec::new(),
         observed_only: false,
+        hold: None,
         verified_on: None,
         notes,
         clues: h.clues,
@@ -624,6 +625,7 @@ pub fn link_item(_t: &Target) -> Explanation {
         confidence: 0.9,
         refs: Vec::new(),
         observed_only: false,
+        hold: None,
         verified_on: None,
         notes: Vec::new(),
         clues: vec!["文件系统标记它是重解析点（链接 / 挂载点），DiskWhy 没有跟进去统计，避免重复计算".into()],
@@ -649,6 +651,7 @@ fn empty_item(t: &Target) -> Explanation {
         confidence: 0.9,
         refs: Vec::new(),
         observed_only: false,
+        hold: None,
         verified_on: None,
         notes: Vec::new(),
         clues: Vec::new(),
@@ -1319,29 +1322,46 @@ fn registry_owner(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
     })
 }
 
-// ───────────────────────── 用户数据陷阱（第 1 轮安全评审第 1 条） ─────────────────────────
+// ───────────────────────── 用户数据陷阱（第 1 轮安全评审第 1 条；第 2 轮 S1、S2） ─────────────────────────
 //
 // safe 规则大多是“整棵子树都按它说明”（%TEMP%、INetCache……）。以前继承命中后就不再看内容，
 // 于是放在 Temp 里的微信聊天、git 仓库、conda 环境、虚拟磁盘、从压缩包里打开的文档都被标成了可放心清理。
 // 现在 safe 规则覆盖的地方先过一遍下面这些内容签名：命中就不按规则的 safe 算。
 // review 规则只查 keep 级的虚拟磁盘（比如商店版 WSL 的 LocalState，规则给的办法“重置”会清空整个发行版）。
+//
+// 第 2 轮安全评审补的三处“看不全”：
+// - 被合并进“其余 N 个文件”的小文件：扫描器合并时按名字记了标志位（`Node::rest_flags`），有文档 / 虚拟磁盘 /
+//   密钥类文件就算陷阱；没有记录（旧快照、别的工具导出的 JSON、手工造的树）按“看不到”处理，也算陷阱（review）。
+// - 往下找超过 [`TRAP_VISIT`] 个节点：返回 truncated，调用方把 safe 降成 review（不再“看不全就放行”）。
+// - 下面有文件夹精确命中了 review / keep 规则（`Temp\Rar$EX*`、`INetCache\Content.Outlook`）：也算陷阱，
+//   上层不能再整块标 safe、也不能把这部分算进“能腾多少”。
 
 /// Office / WPS / PDF 等文档：出现在缓存 / 临时文件夹里时，可能是用户从压缩包或邮件里直接打开、改过还没另存的副本。
 pub const DOC_EXTS: &[&str] =
     &["doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx", "pdf", "wps", "et", "dps", "odt", "ods", "odp", "rtf", "pages", "numbers", "key"];
+/// 密码库 / 私钥 / 证书包一类的扩展名（`.pem` 没放进来：PyInstaller 等程序解压到 Temp 的 cacert.pem 太常见）。
+pub const SECRET_EXTS: &[&str] = &["kdbx", "kdb", "ppk", "pfx", "p12", "jks", "keystore"];
+/// 按文件名认的密钥 / 钱包（小写，完整文件名）。
+const SECRET_NAMES: &[&str] = &["wallet.dat", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
 /// 版本库标记：有它就是一个代码仓库，可能有没提交的改动。
 const VCS_MARKERS: &[&str] = &[".git", ".svn", ".hg"];
-/// 往下找陷阱时最多看多少个节点。
-const TRAP_VISIT: usize = 30_000;
+/// 往下找陷阱时最多看多少个节点；超过就算“没看全”，safe 降为 review。
+/// （每个目录只存前 50 个文件，100 万个节点大约对应几万到几十万个文件夹；遍历一次几十毫秒。）
+pub const TRAP_VISIT: usize = 1_000_000;
 
 /// 一处看起来是用户数据的地方。
 #[derive(Debug, Clone)]
 pub struct Trap {
-    /// chat-data / conda-env / virtual-disk / source-repo / user-document
+    /// chat-data / conda-env / virtual-disk / source-repo / user-document / secret-key /
+    /// hidden-files（被合并的小文件里有这些）/ unchecked-files（被合并的小文件没记名字）/ nested-rule（下层命中 review / keep 规则）
     pub name: &'static str,
     pub tier: Tier,
     pub path: String,
     pub bytes: u64,
+    /// `nested-rule` 时是命中的那条规则（`RuleSet::rules` 的下标）。
+    pub rule: Option<usize>,
+    /// 补充说明（`hidden-files` 时写里面有哪几类，比如“文档、密钥 / 密码库”）。
+    pub note: String,
 }
 
 fn in_program_files(path: &str, ctx: &ExplainCtx) -> bool {
@@ -1356,74 +1376,263 @@ fn path_has_chat_dir(path: &str, ctx: &ExplainCtx) -> bool {
     }) && !in_program_files(path, ctx)
 }
 
+/// 是不是密钥 / 密码库 / 钱包文件（只看名字）。
+pub fn is_secret_file(name: &str) -> bool {
+    let l = name.to_lowercase();
+    SECRET_EXTS.contains(&ext_of(name).as_str()) || SECRET_NAMES.contains(&l.as_str())
+}
+
+/// 单个文件在 `rule_tier` 规则下是不是陷阱：返回 (陷阱名, 改记到的档)。
+/// safe：虚拟磁盘、密钥 → keep，文档 → review；review：只有虚拟磁盘 → keep；keep：不查。
+pub fn file_trap(name: &str, rule_tier: Tier) -> Option<(&'static str, Tier)> {
+    let e = ext_of(name);
+    let vd = VDISK_EXTS.contains(&e.as_str());
+    match rule_tier {
+        Tier::Keep => None,
+        Tier::Review => vd.then_some(("virtual-disk", Tier::Keep)),
+        Tier::Safe => {
+            if vd {
+                Some(("virtual-disk", Tier::Keep))
+            } else if is_secret_file(name) {
+                Some(("secret-key", Tier::Keep))
+            } else if DOC_EXTS.contains(&e.as_str()) {
+                Some(("user-document", Tier::Review))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// 扫描器把小文件合并成 Rest 时调用：按名字记下里面有没有文档 / 虚拟磁盘 / 密钥类文件。
+pub fn rest_flags_of<'a>(names: impl Iterator<Item = &'a str>) -> u8 {
+    use crate::model::{REST_CHECKED, REST_DOC, REST_SECRET, REST_VDISK};
+    let mut f = REST_CHECKED;
+    for n in names {
+        f |= match file_trap(n, Tier::Safe) {
+            Some(("virtual-disk", _)) => REST_VDISK,
+            Some(("secret-key", _)) => REST_SECRET,
+            Some(_) => REST_DOC,
+            None => 0,
+        };
+    }
+    f
+}
+
+/// Rest（其余小文件合计）在 `rule_tier` 规则下是不是陷阱：返回 (陷阱名, 改记到的档, 里面有什么)。
+pub fn rest_trap(node: &Node, rule_tier: Tier) -> Option<(&'static str, Tier, String)> {
+    use crate::model::{REST_CHECKED, REST_DOC, REST_SECRET, REST_VDISK};
+    if node.kind != NodeKind::Rest || node.files == 0 {
+        return None;
+    }
+    let f = node.rest_flags;
+    let mut kinds = Vec::new();
+    if f & REST_DOC != 0 {
+        kinds.push("文档");
+    }
+    if f & REST_VDISK != 0 {
+        kinds.push("虚拟磁盘");
+    }
+    if f & REST_SECRET != 0 {
+        kinds.push("密钥 / 密码库");
+    }
+    let kinds = kinds.join("、");
+    match rule_tier {
+        Tier::Keep => None,
+        Tier::Review => (f & REST_CHECKED != 0 && f & REST_VDISK != 0).then(|| ("hidden-files", Tier::Keep, kinds)),
+        Tier::Safe => {
+            if f & REST_CHECKED == 0 {
+                Some(("unchecked-files", Tier::Review, String::new()))
+            } else if f & (REST_VDISK | REST_SECRET) != 0 {
+                Some(("hidden-files", Tier::Keep, kinds))
+            } else if f & REST_DOC != 0 {
+                Some(("hidden-files", Tier::Review, kinds))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// 只看这一项本身（不往下找）是不是用户数据。`rule_tier` 是覆盖它的规则的档位：
 /// safe 查全部；review 只查虚拟磁盘文件；keep 不查。
 pub fn trap_here(path: &str, node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> Option<Trap> {
-    let mk = |name, tier| Some(Trap { name, tier, path: path.trim_end_matches('\\').to_string(), bytes: node.allocated });
-    match rule_tier {
-        Tier::Keep => None,
-        Tier::Review => match node.kind {
-            NodeKind::File if VDISK_EXTS.contains(&ext_of(&node.name).as_str()) => mk("virtual-disk", Tier::Keep),
-            _ => None,
-        },
-        Tier::Safe => match node.kind {
-            NodeKind::Rest => None,
-            _ if path_has_chat_dir(path, ctx) => mk("chat-data", Tier::Keep),
-            NodeKind::File => {
-                let e = ext_of(&node.name);
-                if VDISK_EXTS.contains(&e.as_str()) {
-                    mk("virtual-disk", Tier::Keep)
-                } else if DOC_EXTS.contains(&e.as_str()) {
-                    mk("user-document", Tier::Review)
-                } else {
-                    None
-                }
+    let mk = |name: &'static str, tier: Tier, note: String| {
+        Some(Trap { name, tier, path: path.trim_end_matches('\\').to_string(), bytes: node.allocated, rule: None, note })
+    };
+    if rule_tier == Tier::Keep {
+        return None;
+    }
+    match node.kind {
+        NodeKind::Rest => rest_trap(node, rule_tier).and_then(|(n, t, k)| mk(n, t, k)),
+        NodeKind::File => {
+            if rule_tier == Tier::Safe && path_has_chat_dir(path, ctx) {
+                return mk("chat-data", Tier::Keep, String::new());
             }
-            NodeKind::Dir => {
-                if has_child(node, "conda-meta") {
-                    mk("conda-env", Tier::Keep)
-                } else if VCS_MARKERS.iter().any(|m| has_child(node, m)) {
-                    mk("source-repo", Tier::Review)
-                } else {
-                    None
-                }
+            file_trap(&node.name, rule_tier).and_then(|(n, t)| mk(n, t, String::new()))
+        }
+        NodeKind::Dir => {
+            if rule_tier != Tier::Safe {
+                None
+            } else if path_has_chat_dir(path, ctx) {
+                mk("chat-data", Tier::Keep, String::new())
+            } else if has_child(node, "conda-meta") {
+                mk("conda-env", Tier::Keep, String::new())
+            } else if VCS_MARKERS.iter().any(|m| has_child(node, m)) {
+                mk("source-repo", Tier::Review, String::new())
+            } else {
+                None
             }
-        },
+        }
     }
 }
 
 /// 往下找（不含自己）所有陷阱。找到的文件夹陷阱不再往里走。返回 (陷阱列表, 是否只看了一部分)。
+///
+/// safe 规则下还查“下层文件夹精确命中了 review / keep 规则”（第 2 轮安全评审 S2）：只拿能在这棵子树里
+/// 命中的非 safe 模式去比，每往下一层再按前缀剪一次，大多数缓存目录一个候选都没有。
 pub fn traps_below(node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> (Vec<Trap>, bool) {
     let mut out = Vec::new();
     if rule_tier == Tier::Keep || node.kind != NodeKind::Dir {
         return (out, false);
     }
+    let mut segs = split_lower(&node.path);
+    let nested: Vec<u32> = if rule_tier == Tier::Safe {
+        (0..ctx.rules.patterns.len() as u32)
+            .filter(|&i| {
+                let (ri, p) = &ctx.rules.patterns[i as usize];
+                ctx.rules.rules[*ri].tier != Tier::Safe && p.could_match_below(&segs)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut visited = 0usize;
-    let mut stack: Vec<&Node> = vec![node];
-    while let Some(d) = stack.pop() {
-        for c in &d.children {
-            visited += 1;
-            if visited > TRAP_VISIT {
-                return (out, true);
-            }
-            let p = if c.kind == NodeKind::Dir && !c.path.is_empty() {
-                c.path.clone()
-            } else {
-                format!("{}\\{}", d.path.trim_end_matches('\\'), c.name)
-            };
-            if let Some(t) = trap_here(&p, c, rule_tier, ctx) {
-                out.push(t);
-            } else if c.kind == NodeKind::Dir {
-                stack.push(c);
+    let truncated = walk_traps(node, rule_tier, ctx, &mut segs, &nested, &mut visited, &mut out);
+    (out, truncated)
+}
+
+/// [`traps_below`] 的递归部分。返回 true 表示超过了 `ctx.trap_visit`（没看全）。
+fn walk_traps(d: &Node, rule_tier: Tier, ctx: &ExplainCtx, segs: &mut Vec<String>, nested: &[u32], visited: &mut usize, out: &mut Vec<Trap>) -> bool {
+    for c in &d.children {
+        *visited += 1;
+        if *visited > ctx.trap_visit {
+            return true;
+        }
+        let p = if c.kind == NodeKind::Dir && !c.path.is_empty() {
+            c.path.clone()
+        } else {
+            format!("{}\\{}", d.path.trim_end_matches('\\'), c.name)
+        };
+        let track = !nested.is_empty() && c.kind != NodeKind::Rest;
+        if track {
+            segs.push(c.name.to_lowercase());
+            // 候选里有命中的，再用全部规则确认这一项最终确实归一条非 safe 规则（被更具体的 safe 规则盖住的不算）。
+            let hit = ctx
+                .rules
+                .best_exact_among(nested, segs, Some(c))
+                .and_then(|_| ctx.rules.best_exact(segs, Some(c)))
+                .filter(|&ri| ctx.rules.rules[ri].tier != Tier::Safe);
+            if let Some(ri) = hit {
+                segs.pop();
+                out.push(Trap {
+                    name: "nested-rule",
+                    tier: ctx.rules.rules[ri].tier,
+                    path: p.trim_end_matches('\\').to_string(),
+                    bytes: c.allocated,
+                    rule: Some(ri),
+                    note: String::new(),
+                });
+                continue;
             }
         }
+        let over = if let Some(t) = trap_here(&p, c, rule_tier, ctx) {
+            out.push(t);
+            false
+        } else if c.kind == NodeKind::Dir {
+            if track {
+                let child_nested: Vec<u32> = nested.iter().copied().filter(|&i| ctx.rules.patterns[i as usize].1.could_match_below(segs)).collect();
+                walk_traps(c, rule_tier, ctx, segs, &child_nested, visited, out)
+            } else {
+                walk_traps(c, rule_tier, ctx, segs, &[], visited, out)
+            }
+        } else {
+            false
+        };
+        if track {
+            segs.pop();
+        }
+        if over {
+            return true;
+        }
     }
-    (out, false)
+    false
 }
 
 fn trap_hint(tr: &Trap, ctx: &ExplainCtx, rule_what: &str) -> Hint {
     let clue = format!("上层按规则是“{rule_what}”，但这里看起来是你的数据，所以不按那条规则算");
     match tr.name {
+        "secret-key" => {
+            let name = tr.path.rsplit('\\').next().unwrap_or(&tr.path).to_string();
+            Hint {
+                name: "secret-key",
+                tier: Tier::Keep,
+                category: Category::Userdata,
+                what: format!("密钥 / 密码库文件「{name}」（在缓存 / 临时文件夹里）"),
+                why: "从邮件、聊天或压缩包里直接打开这类文件时，程序会先把它放到临时文件夹里".into(),
+                lose: "如果这是唯一的一份（服务器登录密钥、密码库、数字钱包），删了就再也进不去对应的服务器或账户。".into(),
+                how: vec![How::Manual],
+                how_detail: "先确认它是什么：有用就挪到安全的地方并备份；确认是多余的副本再删。".into(),
+                confidence: 0.6,
+                owner: None,
+                clues: vec![clue, "文件名 / 扩展名是密钥、证书包、密码库或钱包一类".into()],
+            }
+        }
+        "hidden-files" => {
+            let kinds = if tr.note.is_empty() { "像是你的文件的东西".to_string() } else { tr.note.clone() };
+            Hint {
+                name: "hidden-files",
+                tier: tr.tier,
+                category: Category::Userdata,
+                what: format!("被合并显示的小文件，里面有{kinds}"),
+                why: format!("为了省内存，每个文件夹只单独列出最大的几十个文件，其余合并成一项；扫描时看过这些文件的名字，里面有{kinds}"),
+                lose: "如果其中有你从邮件、聊天或压缩包里直接打开、改过还没另存的文件，删了就没了。".into(),
+                how: vec![How::Manual],
+                how_detail: "在资源管理器里打开这个文件夹，按“类型”排序，把要的文件另存到“文档”里，剩下的再清理。".into(),
+                confidence: 0.5,
+                owner: None,
+                clues: vec![clue],
+            }
+        }
+        "unchecked-files" => Hint {
+            name: "unchecked-files",
+            tier: Tier::Review,
+            category: Category::Unknown,
+            what: "被合并显示的小文件（这份扫描结果没记下它们叫什么）".into(),
+            why: "这份结果来自旧版本的快照或别的工具导出的文件，没有记录被合并的小文件的名字，DiskWhy 没法确认里面全是临时文件".into(),
+            lose: "说不准：可能全是临时文件，也可能混着你的文件。".into(),
+            how: vec![How::Manual],
+            how_detail: "重新扫描一次就能看清；或者在资源管理器里打开这个文件夹自己看一眼。".into(),
+            confidence: 0.3,
+            owner: None,
+            clues: vec![clue],
+        },
+        "nested-rule" => {
+            let r = tr.rule.and_then(|i| ctx.rules.rules.get(i));
+            Hint {
+                name: "nested-rule",
+                tier: tr.tier,
+                category: r.map(|r| r.category).unwrap_or(Category::Userdata),
+                what: r.map(|r| r.what.clone()).unwrap_or_default(),
+                why: r.map(|r| r.why.clone()).unwrap_or_default(),
+                lose: r.map(|r| r.lose.clone()).unwrap_or_default(),
+                how: r.map(|r| r.how.clone()).unwrap_or_else(|| vec![How::Manual]),
+                how_detail: r.map(|r| r.how_detail.clone()).unwrap_or_default(),
+                confidence: 0.8,
+                owner: r.map(|r| r.owner.clone()),
+                clues: vec![clue, format!("里面的「{}」按规则库是“{}”", tr.path, r.map(|r| r.what.as_str()).unwrap_or(""))],
+            }
+        }
         "chat-data" => {
             let app = segments(&tr.path)
                 .iter()
@@ -1575,6 +1784,7 @@ pub fn unknown(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Explanation {
         confidence: 0.0,
         refs: Vec::new(),
         observed_only: false,
+        hold: None,
         verified_on: None,
         notes: Vec::new(),
         clues,

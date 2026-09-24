@@ -34,8 +34,9 @@ import SettingsDialog from "./components/SettingsDialog.vue";
 import TreemapView from "./components/TreemapView.vue";
 import ExplainLegend from "./components/ExplainLegend.vue";
 import TierGuide from "./components/TierGuide.vue";
+import SafeListDialog from "./components/SafeListDialog.vue";
 import { pseudoView } from "./pseudo";
-import type { TierKey } from "./api";
+import type { SafeItem, TierKey } from "./api";
 
 type Phase = "idle" | "scanning" | "done";
 type ViewMode = "split" | "map" | "list";
@@ -74,6 +75,22 @@ const overviewCollapsed = ref(false);
 const tierFilter = ref<TierKey | null>(null);
 /** 方块图只高亮“可清理”的块，其余变淡 */
 const highlightSafe = ref(false);
+/** 全盘可清理清单（点“可清理”卡片打开） */
+const showSafeList = ref(false);
+
+/** 从可清理清单跳过去：打开它所在的文件夹并选中它 */
+async function revealSafe(it: SafeItem) {
+  showSafeList.value = false;
+  const p = it.path.replace(/\\+$/, "");
+  const i = p.lastIndexOf("\\");
+  const parent = i > 2 ? p.slice(0, i) : p.slice(0, 3);
+  await open(parent);
+  try {
+    select(await nodeInfo(p, it.is_dir ? "Dir" : "File"));
+  } catch (e) {
+    message.value = String(e);
+  }
+}
 watch(viewMode, (v) => {
   try {
     localStorage.setItem("diskwhy.view", v);
@@ -304,7 +321,13 @@ async function doOpenSnapshot(path?: string) {
       <template v-if="phase === 'done' && summary">
         <div v-if="!overviewCollapsed" class="summary-row">
           <AttributionBar :summary="summary" />
-          <TierSummaryCard :tiers="summary.tiers" :used-bytes="summary.used_bytes" :filter="tierFilter" @filter="(t) => (tierFilter = t)" />
+          <TierSummaryCard
+            :tiers="summary.tiers"
+            :used-bytes="summary.used_bytes"
+            :filter="tierFilter"
+            @filter="(t) => (tierFilter = t)"
+            @show-safe="showSafeList = true"
+          />
         </div>
         <ExplainLegend :listing="listing" />
         <div class="split">
@@ -330,6 +353,7 @@ async function doOpenSnapshot(path?: string) {
               :loading="tmLoading"
               :highlight-safe="highlightSafe"
               @select="onTmSelect"
+              @show-safe="showSafeList = true"
               @open="open"
               @up="goUp"
             />
@@ -348,5 +372,6 @@ async function doOpenSnapshot(path?: string) {
       </template>
     </main>
     <SettingsDialog v-if="showSettings" @close="showSettings = false" @saved="onSettingsSaved" />
+    <SafeListDialog v-if="showSafeList && summary" :tiers="summary.tiers" @close="showSafeList = false" @reveal="revealSafe" />
   </div>
 </template>

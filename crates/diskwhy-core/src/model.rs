@@ -59,6 +59,11 @@ pub struct Node {
     /// 空间记在另一边，这里 allocated 记 0、子项不再展开；对应关系见 `ScanResult.mapped_dirs`。
     #[serde(default, skip_serializing_if = "is_false")]
     pub mapped: bool,
+    /// 只对 Rest 节点有意义：被合并的那些文件里有没有“像用户数据”的文件（扫描时按文件名顺手记下，
+    /// 不打开文件）。位含义见 [`REST_CHECKED`] 等常量。0 = 没记录（旧快照 / 旧 JSON / 手工造的树），
+    /// 解释引擎按“看不到里面有什么”处理（第 2 轮安全评审 S1）。
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub rest_flags: u8,
     /// 子树中文件数（Rest 节点为被合并的文件数；File 节点为 1）。
     pub files: u64,
     /// 子树中目录数（不含自身）。
@@ -74,6 +79,18 @@ fn is_false(b: &bool) -> bool {
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+/// `rest_flags`：扫描器看过被合并文件的名字（有这一位，其余位才可信）。
+pub const REST_CHECKED: u8 = 0x80;
+/// `rest_flags`：里面有文档（Office / WPS / PDF 等，见 `heuristics::DOC_EXTS`）。
+pub const REST_DOC: u8 = 0x01;
+/// `rest_flags`：里面有虚拟磁盘文件。
+pub const REST_VDISK: u8 = 0x02;
+/// `rest_flags`：里面有密钥 / 密码库 / 钱包一类文件。
+pub const REST_SECRET: u8 = 0x04;
 
 impl Node {
     pub fn is_dir(&self) -> bool {

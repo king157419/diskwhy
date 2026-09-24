@@ -64,6 +64,7 @@ fn leaf(name: &str, size: u64, mtime: i64) -> Node {
         system_reserved: false,
         hardlink_dup: false,
         mapped: false,
+        rest_flags: 0,
         files: 1,
         dirs: 0,
         children: vec![],

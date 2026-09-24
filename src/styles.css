@@ -1455,3 +1455,103 @@ button.tier-cell:hover {
   background: repeating-linear-gradient(45deg, #ffffff, #ffffff 2px, var(--tm-pseudo-line) 2px, var(--tm-pseudo-line) 4px);
   box-shadow: inset 0 0 0 1px var(--tm-pseudo-line);
 }
+
+/* ───── 第 2 轮评审：保留用锁（不用斜纹）、全盘可清理清单 ───── */
+.dot-lock {
+  display: inline-grid;
+  place-items: center;
+  width: 12px;
+  height: 12px;
+}
+.dot-lock svg {
+  display: block;
+}
+.tc-more {
+  margin-top: 2px;
+  color: var(--t-safe-fg);
+  font-weight: 600;
+}
+.tm-safe-hint {
+  color: var(--t-safe-fg);
+}
+.linkish {
+  border: none;
+  background: none;
+  padding: 0;
+  margin-left: 4px;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.safe-list {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 60px);
+  display: flex;
+  flex-direction: column;
+}
+.safe-rows {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  border-top: 1px solid var(--line);
+}
+.safe-rows li {
+  border-bottom: 1px solid var(--line);
+}
+.safe-row {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 6px;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.safe-row:hover,
+.safe-row:focus-visible {
+  background: var(--bar-bg);
+}
+.sr-size {
+  flex: 0 0 78px;
+  font-weight: 700;
+  color: var(--t-safe-fg);
+  font-variant-numeric: tabular-nums;
+}
+.sr-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sr-name {
+  font-weight: 600;
+}
+.sr-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sr-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.sr-mixed {
+  border-color: var(--t-review);
+  color: var(--warn-text);
+}
+.sr-note {
+  color: var(--warn-text);
+}

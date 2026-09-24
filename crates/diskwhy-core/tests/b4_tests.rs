@@ -49,6 +49,7 @@ fn node(name: &str, path: &str, kind: NodeKind, size: u64, children: Vec<Node>) 
         system_reserved: false,
         hardlink_dup: false,
         mapped: false,
+        rest_flags: 0,
         files: 1,
         dirs: 0,
         children,

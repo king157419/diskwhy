@@ -513,6 +513,7 @@ pub fn to_explanation(a: LlmAnswer, model: &str, allocated: u64) -> Explanation 
         confidence: LLM_CONFIDENCE,
         refs: Vec::new(),
         observed_only: false,
+        hold: None,
         verified_on: None,
         notes: vec!["AI 推测：只发送了名字、最近两层位置、子文件夹名和各类文件的个数、总大小（用户名、邮箱、长数字已打码），没有发送文件名和文件内容。".into()],
         clues: Vec::new(),

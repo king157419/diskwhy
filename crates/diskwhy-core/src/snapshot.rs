@@ -49,7 +49,7 @@ struct SnapNode<'a> {
 impl Serialize for SnapNode<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let n = self.n;
-        let mut st = s.serialize_struct("Node", 20)?;
+        let mut st = s.serialize_struct("Node", 21)?;
         st.serialize_field("name", &n.name)?;
         if self.root {
             st.serialize_field("path", &n.path)?;
@@ -82,6 +82,9 @@ impl Serialize for SnapNode<'_> {
         }
         if n.mapped {
             st.serialize_field("mapped", &true)?;
+        }
+        if n.rest_flags != 0 {
+            st.serialize_field("rest_flags", &n.rest_flags)?;
         }
         st.serialize_field("files", &n.files)?;
         st.serialize_field("dirs", &n.dirs)?;

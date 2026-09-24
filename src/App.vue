@@ -33,7 +33,9 @@ import TierSummaryCard from "./components/TierSummaryCard.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import TreemapView from "./components/TreemapView.vue";
 import ExplainLegend from "./components/ExplainLegend.vue";
+import TierGuide from "./components/TierGuide.vue";
 import { pseudoView } from "./pseudo";
+import type { TierKey } from "./api";
 
 type Phase = "idle" | "scanning" | "done";
 type ViewMode = "split" | "map" | "list";
@@ -68,6 +70,10 @@ function loadViewMode(): ViewMode {
 }
 const viewMode = ref<ViewMode>(loadViewMode());
 const overviewCollapsed = ref(false);
+/** 点汇总卡：列表只看这一档 */
+const tierFilter = ref<TierKey | null>(null);
+/** 方块图只高亮“可清理”的块，其余变淡 */
+const highlightSafe = ref(false);
 watch(viewMode, (v) => {
   try {
     localStorage.setItem("diskwhy.view", v);
@@ -272,13 +278,20 @@ async function doOpenSnapshot(path?: string) {
     <main class="content">
       <div v-if="phase === 'idle' && !summary" class="welcome card">
         <h1>看看 {{ selectedDrive || "磁盘" }} 的空间都去哪了</h1>
-        <p>选好磁盘，点“开始扫描”。DiskWhy 只读取文件夹和文件的属性，不会改动、不会上传任何东西。也可以“打开快照”复核以前的扫描结果。</p>
-        <ul class="muted">
-          <li>大小按“实际占用”算：按簇取整，压缩文件按压缩后算。</li>
-          <li>链接和挂载点不会跟进去；硬链接、商店应用的目录映射只算一次；云端占位文件只看属性，绝不打开（不会触发下载）。</li>
-          <li>读不到的地方会明确标成“无权限 / 系统保留 / 未归属”，不会悄悄少算。</li>
-        </ul>
+        <p>
+          扫完后，每个文件夹都会标上颜色，告诉你它是什么、能不能删、删了会怎样。点右上角“开始扫描”，大约一分钟。
+          DiskWhy 只读文件夹和文件的属性，不改动、不上传任何东西。
+        </p>
+        <details class="welcome-more muted">
+          <summary>大小是怎么算的</summary>
+          <ul>
+            <li>按“实际占用”算：按簇取整，压缩文件按压缩后算。</li>
+            <li>链接和挂载点不跟进去；硬链接、商店应用的目录映射只算一次；云端占位文件只看属性，绝不打开（不会触发下载）。</li>
+            <li>读不到的地方会明确标成“无权限 / 系统保留 / 未归属”，不会悄悄少算。</li>
+          </ul>
+        </details>
       </div>
+      <TierGuide v-if="(phase === 'idle' && !summary) || phase === 'scanning'" />
 
       <ScanProgressPanel
         v-if="phase === 'scanning'"
@@ -291,7 +304,7 @@ async function doOpenSnapshot(path?: string) {
       <template v-if="phase === 'done' && summary">
         <div v-if="!overviewCollapsed" class="summary-row">
           <AttributionBar :summary="summary" />
-          <TierSummaryCard :tiers="summary.tiers" :used-bytes="summary.used_bytes" />
+          <TierSummaryCard :tiers="summary.tiers" :used-bytes="summary.used_bytes" :filter="tierFilter" @filter="(t) => (tierFilter = t)" />
         </div>
         <ExplainLegend :listing="listing" />
         <div class="split">
@@ -300,6 +313,9 @@ async function doOpenSnapshot(path?: string) {
               <button :aria-pressed="viewMode === 'split'" :class="{ on: viewMode === 'split' }" @click="viewMode = 'split'">方块图 + 列表</button>
               <button :aria-pressed="viewMode === 'map'" :class="{ on: viewMode === 'map' }" @click="viewMode = 'map'">只看方块图</button>
               <button :aria-pressed="viewMode === 'list'" :class="{ on: viewMode === 'list' }" @click="viewMode = 'list'">只看列表</button>
+              <label v-if="viewMode !== 'list'" class="hl-toggle" title="方块图里只把“可清理”的块画成绿色，其余变淡，一眼看出能清的在哪">
+                <input type="checkbox" v-model="highlightSafe" /> 只高亮可清理
+              </label>
               <button class="collapse-btn" :title="overviewCollapsed ? '显示顶部的归属条和各档合计' : '收起顶部的归属条和各档合计，给方块图和列表腾地方'" @click="overviewCollapsed = !overviewCollapsed">
                 {{ overviewCollapsed ? "展开概览 ▾" : "收起概览 ▴" }}
               </button>
@@ -312,11 +328,20 @@ async function doOpenSnapshot(path?: string) {
               :selected-key="selectedKey"
               :crumbs="listing.breadcrumb"
               :loading="tmLoading"
+              :highlight-safe="highlightSafe"
               @select="onTmSelect"
               @open="open"
               @up="goUp"
             />
-            <DirList v-if="viewMode !== 'map' && listing" :listing="listing" :selected-path="selectedKey" @open="open" @select="select" />
+            <DirList
+              v-if="viewMode !== 'map' && listing"
+              :listing="listing"
+              :selected-path="selectedKey"
+              :filter="tierFilter"
+              @open="open"
+              @select="select"
+              @clear-filter="tierFilter = null"
+            />
           </div>
           <DetailPanel :node="detailNode" :llm-ready="llmReady" @open-settings="showSettings = true" @open-path="open" />
         </div>

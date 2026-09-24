@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { sourceKey, tierKey, tmKey, type DirListing, type NodeView } from "../api";
-import { SOURCE_HINT, SOURCE_SHORT, humanBytes, pct } from "../format";
+import { computed } from "vue";
+import { sourceKey, tierKey, tmKey, type DirListing, type NodeView, type TierKey } from "../api";
+import { SOURCE_HINT, SOURCE_SHORT, TIER_SHORT, humanBytes, pct } from "../format";
 import TierChip from "./TierChip.vue";
 
-defineProps<{ listing: DirListing; selectedPath: string | null }>();
-const emit = defineEmits<{ open: [path: string]; select: [node: NodeView] }>();
+const props = defineProps<{ listing: DirListing; selectedPath: string | null; filter?: TierKey | null }>();
+const emit = defineEmits<{ open: [path: string]; select: [node: NodeView]; clearFilter: [] }>();
+
+/** 点了顶部某张汇总卡时，只看这一档（按大小排，列表本来就是按大小排的） */
+const rows = computed(() => (props.filter ? props.listing.children.filter((n) => tierKey(n.explanation) === props.filter) : props.listing.children));
 
 function icon(n: NodeView): string {
   if (n.kind === "Rest") return "ico-rest";
@@ -54,15 +58,19 @@ function rowKey(n: NodeView): string {
         <span class="c-pct">占比</span>
         <span class="c-act"></span>
       </div>
+      <div v-if="filter" class="filter-bar">
+        只看「{{ TIER_SHORT[filter] }}」：这一层 {{ rows.length }} 项
+        <button class="mini" @click="emit('clearFilter')">看全部</button>
+      </div>
       <div class="tbody">
         <div
-          v-for="n in listing.children"
+          v-for="n in rows"
           :key="rowKey(n)"
           class="row"
           :class="{
             selected: selectedPath === rowKey(n),
             clickable: canOpen(n),
-            dim: n.inaccessible || n.reparse_skipped || n.cloud_placeholder || n.mapped || n.hardlink_dup,
+            dim: n.inaccessible || n.reparse_skipped || n.cloud_placeholder || n.mapped || n.hardlink_dup || tierKey(n.explanation) === 'zero',
           }"
           role="button"
           tabindex="0"
@@ -100,6 +108,7 @@ function rowKey(n: NodeView): string {
           </span>
         </div>
         <div v-if="listing.children.length === 0" class="empty muted">这个文件夹是空的</div>
+        <div v-else-if="rows.length === 0" class="empty muted">这一层没有「{{ TIER_SHORT[filter!] }}」的项，可以点上面的文件夹进去看，或者“看全部”。</div>
         <div v-if="listing.total_children > listing.children.length" class="empty muted">
           只显示前 {{ listing.children.length }} 项（共 {{ listing.total_children }} 项）
         </div>

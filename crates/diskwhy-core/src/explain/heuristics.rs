@@ -945,6 +945,25 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
         });
     }
 
+    // 4c. 文件夹里几乎全是一个单独放置的 cargo 编译目录（比如专门建来放 CARGO_TARGET_DIR 的 xxx-build）。
+    if is_dir && n.allocated > 0 {
+        if let Some(tc) = n.children.iter().find(|c| is_cargo_target_node(c) && c.allocated.saturating_mul(10) >= n.allocated.saturating_mul(9)) {
+            return Some(Hint {
+                name: "rust-target",
+                tier: Tier::Review,
+                category: Category::Build,
+                what: "放 Rust 编译产物的文件夹（里面几乎全是 cargo 的 target）".into(),
+                why: "有人用 CARGO_TARGET_DIR 或 --target-dir 把编译输出放到了这里".into(),
+                lose: "删了只是下次要重新编译（可能要几分钟到几十分钟），不丢源代码。如果正在编译，先等它结束。".into(),
+                how: vec![How::Delete],
+                how_detail: format!("在没有编译进行时删掉里面的 {}（或整个文件夹）。", tc.name),
+                confidence: 0.65,
+                owner: None,
+                clues: vec![format!("子文件夹 {} 里有 CACHEDIR.TAG 和 .rustc_info.json（cargo 编译目录的标记），占了这里 {}", tc.name, pct(tc.allocated as f64 / n.allocated as f64))],
+            });
+        }
+    }
+
     // 6. .NET bin/obj（旁边有 *.csproj，且 bin 和 obj 同时存在）。
     if is_dir && (name == "bin" || name == "obj") {
         let other = if name == "bin" { "obj" } else { "bin" };

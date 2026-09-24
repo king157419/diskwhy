@@ -15,6 +15,8 @@ const props = defineProps<{
   selectedKey: string | null;
   crumbs: Crumb[];
   loading: boolean;
+  /** 只把“可清理”画成彩色，其余变淡 */
+  highlightSafe?: boolean;
 }>();
 const emit = defineEmits<{ select: [s: TmSelect]; open: [path: string]; up: [] }>();
 
@@ -121,10 +123,11 @@ function palette(): Palette {
     tier: {
       safe: cssVar("--t-safe", "#1f9d55"),
       review: cssVar("--t-review", "#e0a100"),
-      keep: cssVar("--t-keep", "#6b7587"),
+      keep: cssVar("--t-keep", "#5a7394"),
       unknown: cssVar("--t-unknown", "#9ea2d8"),
+      zero: cssVar("--tm-other", "#dde1e7"),
     },
-    text: { safe: "#ffffff", review: "#2b1d00", keep: "#ffffff", unknown: "#23264f" },
+    text: { safe: "#ffffff", review: "#2b1d00", keep: "#ffffff", unknown: "#23264f", zero: "#3b4252" },
     other: cssVar("--tm-other", "#c9ced8"),
     otherText: cssVar("--tm-other-text", "#3b4252"),
     pseudoBg: cssVar("--tm-pseudo", "#4a5160"),
@@ -198,7 +201,8 @@ function draw() {
     return;
   }
   const pal = palette();
-  hatch = makeHatch(ctx, pal.pseudoBg, pal.pseudoLine);
+  // 无权限 / 推算的块：白底斜纹（不再用深灰，免得和“保留”“合并的小块”三种灰分不开）
+  hatch = makeHatch(ctx, "#ffffff", pal.pseudoLine);
   hatchLight = makeHatch(ctx, "", "rgba(255,255,255,0.35)");
   const laid = layoutTreemap(root, { x: 0, y: 0, w, h });
   items.value = laid;
@@ -214,14 +218,19 @@ function draw() {
     let textColor = pal.otherText;
     if (pseudo) {
       fill = hatch ?? pal.pseudoBg;
-      textColor = "#ffffff";
+      textColor = "#3b4252";
     } else if (it.kind === "node") {
       fill = shade(pal.tier[tk], it.depth);
       textColor = pal.text[tk];
+      if (props.highlightSafe && tk !== "safe") {
+        fill = "#eceef1";
+        textColor = "#8a909c";
+      }
     }
     ctx.fillStyle = fill;
     ctx.fillRect(r.x, r.y, r.w, r.h);
-    if (node?.system_reserved && hatchLight) {
+    // 保留档加一层淡斜纹（“锁纹”），和其他颜色一眼分开
+    if ((node?.system_reserved || (tk === "keep" && !props.highlightSafe && it.kind === "node")) && hatchLight) {
       ctx.fillStyle = hatchLight;
       ctx.fillRect(r.x, r.y, r.w, r.h);
     }
@@ -294,7 +303,7 @@ watch(
   },
 );
 watch(
-  () => props.selectedKey,
+  () => [props.selectedKey, props.highlightSafe],
   () => schedule(),
 );
 watch(hover, () => schedule());
@@ -483,8 +492,8 @@ defineExpose({ redraw: schedule });
         <li><i class="dot dot-safe"></i>可清理</li>
         <li><i class="dot dot-review"></i>需判断</li>
         <li><i class="dot dot-keep"></i>保留</li>
-        <li><i class="dot dot-unknown"></i>未知</li>
-        <li><i class="dot dot-pseudo"></i>无权限/推算</li>
+        <li><i class="dot dot-unknown"></i>未认出</li>
+        <li><i class="dot dot-pseudo"></i>读不了（斜纹）</li>
       </ul>
     </div>
     <div ref="wrap" class="tm-canvas-wrap" @mouseleave="onLeave">

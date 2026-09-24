@@ -11,20 +11,27 @@ const ratio = computed(() => {
   if (!p || !p.used_bytes) return 0;
   return Math.min(1, p.bytes / p.used_bytes);
 });
+/** 已量出的字节到 90% 以后，剩下的多是读不了的系统目录和去重、归档，进度条不再往前走，
+ *  改成“正在收尾”并加走动动画，不然看起来像卡住了（第 1 轮冷启动评审）。 */
+const finishing = computed(() => ratio.value >= 0.9);
 </script>
 
 <template>
   <section class="progress card">
     <div class="progress-head">
       <div>
-        <span class="attr-title">正在扫描 {{ root }}</span>
-        <span class="muted">只读取目录和文件属性，不会修改任何东西</span>
+        <span class="attr-title">{{ finishing ? `正在收尾：${root}` : `正在扫描 ${root}` }}</span>
+        <span class="muted">{{
+          finishing ? "大部分已经量完，剩下的是读不了的系统目录、去重和给每块空间归档，通常还要十几到几十秒" : "只读取目录和文件属性，不会修改任何东西"
+        }}</span>
       </div>
       <button class="btn" :disabled="cancelling" @click="$emit('cancel')">
         {{ cancelling ? "正在取消…" : "取消扫描" }}
       </button>
     </div>
-    <div class="bar"><div class="bar-fill" :style="{ width: ratio * 100 + '%' }"></div></div>
+    <div class="bar" :class="{ 'bar-finishing': finishing }">
+      <div class="bar-fill" :style="{ width: (finishing ? 100 : ratio * 100) + '%' }"></div>
+    </div>
     <div class="progress-stats">
       <div><span class="muted">已扫文件</span><b>{{ fmtInt(progress?.files ?? 0) }}</b></div>
       <div><span class="muted">已扫目录</span><b>{{ fmtInt(progress?.dirs ?? 0) }}</b></div>

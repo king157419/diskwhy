@@ -22,8 +22,9 @@ export interface EnvInfo {
 
 // ───── 阶段 B：解释 ─────
 export type Tier = "safe" | "review" | "keep";
-/** 界面上的四种颜色：safe 绿 / review 琥珀 / keep 灰（带锁）/ 未知淡紫（带问号；后端 tier 仍是 review） */
-export type TierKey = Tier | "unknown";
+/** 界面上的四种颜色：safe 绿 / review 琥珀 / keep 蓝灰（带锁）/ 未认出淡紫（带问号；后端 tier 仍是 review）；
+ *  另有 zero：空的、链接（后端是启发式 empty / reparse-link），显示“不占空间” */
+export type TierKey = Tier | "unknown" | "zero";
 export type How = "delete" | "builtin_tool" | "migrate" | "manual" | "none";
 export type Source =
   | { kind: "rule"; id: string; group: string; inherited_from: string | null }
@@ -49,6 +50,8 @@ export interface Explanation {
   source: Source;
   confidence: number;
   refs: string[];
+  /** 规则没有官方出处、只在本机观察过 */
+  observed_only?: boolean;
   verified_on: string | null;
   notes: string[];
   clues: string[];
@@ -60,6 +63,9 @@ export interface RuleBytes {
   what: string;
   tier: Tier;
   bytes: number;
+  /** 这条规则命中的最大一处（界面副标题用它的文件夹名） */
+  top_path?: string;
+  top_path_bytes?: number;
 }
 
 export interface TierSummary {
@@ -67,6 +73,10 @@ export interface TierSummary {
   review_bytes: number;
   keep_bytes: number;
   uncovered_bytes: number;
+  /** safe 里要用工具清、不能直接删文件夹的部分 */
+  safe_tool_bytes?: number;
+  /** 护栏从 safe / review 改记到 review / keep 的部分 */
+  guarded_bytes?: number;
   rules_hit: number;
   rules_total: number;
   top_safe: RuleBytes[];
@@ -92,7 +102,14 @@ export function sourceKey(e: Explanation | null | undefined): SourceKey {
 
 export function tierKey(e: Explanation | null | undefined): TierKey {
   if (!e) return "unknown";
+  if (e.source.kind === "heuristic" && (e.source.name === "empty" || e.source.name === "reparse-link")) return "zero";
   return e.source.kind === "unknown" ? "unknown" : e.tier;
+}
+
+/** 能不能问 AI：只有“未认出”的、读得到、有内容的项（后端也会再挡一次） */
+export function askable(n: { kind: NodeKind; inaccessible: boolean; allocated: number; pseudo?: unknown }, e: Explanation | null | undefined): boolean {
+  if (!e || n.pseudo || n.kind === "Rest" || n.inaccessible || n.allocated === 0) return false;
+  return e.source.kind === "unknown";
 }
 
 export interface ScanProgress {

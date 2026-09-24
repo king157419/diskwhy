@@ -55,40 +55,45 @@ export function attrText(a: number): string {
 // ───── 阶段 B：解释相关的中文标签 ─────
 import type { Explanation, How, SourceKey, TierKey } from "./api";
 
+// 第 1 轮冷启动评审：每一档只用一个名字（可清理 / 需判断 / 保留 / 未认出），列表、图例、汇总卡、详情都一样。
 export const TIER_SHORT: Record<TierKey, string> = {
   safe: "可清理",
   review: "需判断",
   keep: "保留",
-  unknown: "未知",
+  unknown: "未认出",
+  zero: "不占空间",
 };
 
 export const TIER_BIG: Record<TierKey, string> = {
-  safe: "可以放心清理",
-  review: "需要你来判断",
-  keep: "建议保留，别删",
-  unknown: "还没认出来，先别删",
+  safe: "可清理",
+  review: "需判断",
+  keep: "保留",
+  unknown: "未认出",
+  zero: "不占空间",
 };
 
+/** 每一档一句大白话（图例、颜色说明卡、详情里都用这一句） */
 export const TIER_HINT: Record<TierKey, string> = {
-  safe: "缓存一类的东西，删了会自动重新生成，不丢你的数据。",
-  review: "删了有代价，下面写清楚了会失去什么，由你决定。",
-  keep: "是你的数据或系统需要的东西；想腾空间请看“该怎么腾”，用迁移或系统工具。",
-  unknown: "规则库里没有，看内容也没认出来。先别删，看看下面的线索，或者问问 AI。",
+  safe: "缓存、临时文件一类，删了会自己长回来，不丢你的数据",
+  review: "删了有代价，看“删了会失去什么”再决定",
+  keep: "你的数据或系统要用的，别删；想腾地方可以迁走或用自带工具",
+  unknown: "还没认出来。先不动它不会有任何损失",
+  zero: "空的或只是个链接，不占空间，不用管",
 };
 
-/** 解释来源：列表每行的小标签和顶部图例 */
+/** 解释来源：列表每行的小标签和顶部图例（“未认出”已经是档位，不再当来源重复出现） */
 export const SOURCE_SHORT: Record<SourceKey, string> = {
-  rule: "规则",
+  rule: "规则库",
   heuristic: "推测",
   llm: "AI",
-  unknown: "未知",
+  unknown: "",
 };
 
 export const SOURCE_HINT: Record<SourceKey, string> = {
   rule: "规则库里查得到，写明了出处",
   heuristic: "规则库里没有，按里面的文件特征推测",
   llm: "AI 根据名字猜的，只当参考",
-  unknown: "没认出来，只列线索",
+  unknown: "还没认出来，只列线索",
 };
 
 export const HOW_LABEL: Record<How, string> = {
@@ -96,16 +101,19 @@ export const HOW_LABEL: Record<How, string> = {
   builtin_tool: "用系统或软件自带的工具清理",
   migrate: "迁到别的盘",
   manual: "需要手动处理",
-  none: "不需要处理",
+  none: "先不用管",
 };
 
 export function sourceLabel(e: Explanation): string {
   const s = e.source;
   switch (s.kind) {
     case "rule":
-      return s.inherited_from ? `规则库：${s.id}（按上层文件夹「${s.inherited_from}」的规则）` : `规则库：${s.id}（分组 ${s.group}）`;
+      return (
+        (s.inherited_from ? `规则库：${s.id}（按上层文件夹「${s.inherited_from}」的规则）` : `规则库：${s.id}（分组 ${s.group}）`) +
+        (e.observed_only ? " · 本机观察，没找到官方出处" : "")
+      );
     case "heuristic":
-      return `启发式推测：${s.name}`;
+      return `推测：${s.name}`;
     case "llm":
       return `AI 推测（模型 ${s.model}）`;
     case "attribution":

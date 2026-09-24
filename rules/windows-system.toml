@@ -644,6 +644,23 @@ how_detail = "要腾 C 盘就把发行版迁到别的盘：WSL 2.3.11 及以上�
 refs = ["https://learn.microsoft.com/en-us/windows/wsl/basic-commands", "https://github.com/microsoft/WSL/releases/tag/2.3.11"]
 verified_on = "2026-09-23"
 
+[[rule]]
+id = "store-app-localcache"
+owner = "Microsoft Store 应用"
+category = "userdata"
+tier = "review"
+scope = "self"
+kind = "dir"
+owner_from_path = true
+match = ['%LOCALAPPDATA%\Packages\*\LocalCache']
+what = "商店应用的 LocalCache：应用自己的缓存，加上它（和它启动的程序）写到 AppData 的东西"
+why = "打包成 MSIX 的应用在 AppData 里新建的文件会被 Windows 放到这里的 Local / Roaming / LocalLow 子文件夹；应用自己不想被备份的缓存也放在这里"
+lose = "这一层本身不是某一样东西，要点进去按子文件夹分别看；里面可能有别的程序的数据，不一定都是这个应用的。"
+how = "none"
+how_detail = "点进去逐个看；卸载这个应用时 Windows 会把这里一起删掉。"
+refs = ["https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes", "https://learn.microsoft.com/en-us/windows/apps/develop/data/store-and-retrieve-app-data"]
+verified_on = "2026-09-23"
+
 # 第 1 轮评审（产品）第 1 条：LocalCache\Local 这一层本身。
 [[rule]]
 id = "store-app-sandbox-appdata"

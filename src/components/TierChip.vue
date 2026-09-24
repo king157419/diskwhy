@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 档位小标签：可清理（绿）/ 需判断（琥珀）/ 保留（灰 + 锁）/ 未知（淡紫 + 问号）。
+// 档位小标签：可清理（绿 + 对勾）/ 需判断（琥珀 + 三角）/ 保留（蓝灰 + 锁）/ 未认出（淡紫 + 问号）/ 不占空间（虚线圈）。
 import type { TierKey } from "../api";
 import { TIER_SHORT } from "../format";
 
@@ -18,6 +18,9 @@ withDefaults(defineProps<{ tier: TierKey; big?: boolean; text?: string }>(), { b
       <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5" />
       <path d="M6.2 6.3a1.9 1.9 0 1 1 2.6 1.8c-.5.2-.8.6-.8 1.1v.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
       <circle cx="8" cy="11.6" r=".9" fill="currentColor" />
+    </svg>
+    <svg v-else-if="tier === 'zero'" class="chip-ico" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2.4 2" />
     </svg>
     <svg v-else-if="tier === 'safe'" class="chip-ico" viewBox="0 0 16 16" aria-hidden="true">
       <path d="M3.5 8.5 6.5 11.5 12.5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />

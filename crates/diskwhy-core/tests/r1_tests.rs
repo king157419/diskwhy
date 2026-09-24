@@ -431,3 +431,27 @@ fn links_empty_and_unknown_wording() {
     assert_eq!(e.what.matches("不确定").count() + e.why.matches("不确定").count() + e.lose.matches("不确定").count(), 0, "不要一直说“不确定”");
     assert!(e.clues[0].contains("程序文件") && e.clues[0].contains("Codex"), "线索要替用户总结一句：{:?}", e.clues);
 }
+
+/// 第 1 轮产品评审第 1 条：沙箱这几层不再沿用“Claude 的登录信息”；只装着 cargo 编译目录的外层文件夹也认得出。
+#[test]
+fn sandbox_layers_and_build_container() {
+    let (c, _) = ctx(r"C:\Users\bob\AppData\Local\Temp");
+    let pkg = r"C:\Users\bob\AppData\Local\Packages\Claude_pzs8sxrjxfjjc";
+    let t = tree(
+        "C:",
+        &[
+            (format!(r"{pkg}\LocalCache\Local\DiskWhy-build\target\CACHEDIR.TAG"), 177),
+            (format!(r"{pkg}\LocalCache\Local\DiskWhy-build\target\.rustc_info.json"), 1_111),
+            (format!(r"{pkg}\LocalCache\Local\DiskWhy-build\target\debug\x.rlib"), 9_000_000),
+            (format!(r"{pkg}\Settings\settings.dat"), 8_000),
+        ],
+    );
+    let lc = ex(&t, &c, &format!(r"{pkg}\LocalCache"));
+    assert!(matches!(&lc.source, Source::Rule { id, .. } if id == "store-app-localcache"), "{}", src(&lc));
+    assert!(!lc.what.contains("登录信息"));
+    let local = ex(&t, &c, &format!(r"{pkg}\LocalCache\Local"));
+    assert!(matches!(&local.source, Source::Rule { id, .. } if id == "store-app-sandbox-appdata"), "{}", src(&local));
+    let b = ex(&t, &c, &format!(r"{pkg}\LocalCache\Local\DiskWhy-build"));
+    assert!(matches!(&b.source, Source::Heuristic { name } if name == "rust-target"), "{}", src(&b));
+    assert!(b.notes.iter().any(|n| n.contains("沙箱")), "{:?}", b.notes);
+}

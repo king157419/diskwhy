@@ -11,11 +11,12 @@
   --warn-bg: #fff6e0;
   --warn-line: #f1d38a;
   --warn-text: #7a5300;
-  --c-scanned: #3b7bf0;
-  --c-sys: #8b5cf6;
-  --c-inacc: #9aa3b2;
-  --c-cloud: #22b3a6;
-  --c-unattr: #f59e0b;
+  /* 归属条：只用深浅不同的石板色 + 纹理，彩色只留给档位（第 1 轮冷启动评审：两套颜色撞车） */
+  --c-scanned: #8e99aa;
+  --c-sys: #4f5a6b;
+  --c-inacc: #c4cad4;
+  --c-cloud: #d7dce3;
+  --c-unattr: #b3bbc7;
   --bar-bg: #eff0ec;
   /* 档位色：safe 绿 / review 琥珀 / keep 灰（带锁）/ 未知 淡紫（带问号） */
   --t-safe: #1f9d55;
@@ -24,15 +25,15 @@
   --t-review: #e0a100;
   --t-review-bg: #fff4d6;
   --t-review-fg: #7a5300;
-  --t-keep: #6b7587;
-  --t-keep-bg: #eceef2;
-  --t-keep-fg: #3a4252;
+  --t-keep: #5a7394;
+  --t-keep-bg: #e6edf5;
+  --t-keep-fg: #2f4560;
   --t-unknown: #9ea2d8;
   --t-unknown-bg: #f1f1fb;
   --t-unknown-fg: #4a4e8c;
   /* 解释来源标签 */
   --s-rule: #2f6fed;
-  --s-heur: #8a5a00;
+  --s-heur: #3d7a86;
   --s-llm: #7a4fd0;
   font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
   font-size: 14px;
@@ -287,13 +288,14 @@ select {
   background: var(--c-sys);
 }
 .seg-inacc {
-  background: repeating-linear-gradient(45deg, var(--c-inacc), var(--c-inacc) 4px, #b8bfcb 4px, #b8bfcb 8px);
+  background: repeating-linear-gradient(45deg, #ffffff, #ffffff 3px, var(--c-inacc) 3px, var(--c-inacc) 6px);
+  box-shadow: inset 0 0 0 1px var(--c-inacc);
 }
 .seg-cloud {
   background: var(--c-cloud);
 }
 .seg-unattr {
-  background: var(--c-unattr);
+  background: radial-gradient(circle, #8e99aa 1px, transparent 1.3px) 0 0 / 5px 5px, var(--c-unattr);
 }
 .legend {
   display: flex;
@@ -1301,4 +1303,155 @@ select {
 }
 .explain .ex-grid dd {
   margin: 1px 0 0;
+}
+
+
+/* ───── 第 1 轮评审修复：颜色说明卡、汇总卡可点、图例常驻一句话、收尾动画 ───── */
+:root {
+  --tm-pseudo-line: #aeb6c3;
+}
+.guide {
+  padding: 12px 16px;
+}
+.guide-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.guide-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 18px;
+}
+.guide-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.welcome-more {
+  margin-top: 6px;
+  font-size: 12.5px;
+}
+.welcome-more summary {
+  cursor: pointer;
+}
+.bar-finishing .bar-fill {
+  background: repeating-linear-gradient(-45deg, var(--accent), var(--accent) 10px, #6f9cf5 10px, #6f9cf5 20px);
+  background-size: 28px 28px;
+  animation: bar-walk 0.9s linear infinite;
+}
+@keyframes bar-walk {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 28px 0;
+  }
+}
+button.tier-cell {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  border-top: none;
+  border-right: none;
+  border-bottom: none;
+  cursor: pointer;
+}
+button.tier-cell:hover {
+  filter: brightness(0.97);
+}
+.tc-on {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.tc-dim {
+  opacity: 0.55;
+}
+.tc-top {
+  white-space: normal;
+  overflow: visible;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.tc-label .chip {
+  font-size: 12px;
+}
+.lg-tiers {
+  gap: 6px 16px;
+}
+.lg-tiers .lg-desc {
+  display: inline;
+  font-size: 12px;
+}
+.lg-n {
+  color: var(--muted);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.lg-small {
+  color: var(--muted);
+  font-size: 12px;
+}
+@media (max-width: 1360px) {
+  .lg-tiers .lg-desc {
+    display: inline;
+  }
+  .lg-tiers .lg-item {
+    max-width: 100%;
+  }
+}
+.chip-zero {
+  background: #f3f4f6;
+  color: #6b7280;
+  border: 1px dashed #c3c8d0;
+  line-height: 16px;
+}
+.tb-zero,
+.tier-bar.tb-zero {
+  background: #d7dbe1;
+}
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  font-size: 12.5px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--line);
+}
+.hl-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+/* “用这个工具”只是文字，不是按钮（第 1 轮冷启动评审） */
+.how-tool {
+  display: inline;
+  padding: 0;
+  background: none;
+  color: var(--text);
+  font-weight: 600;
+}
+.observed-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  border: 1px dashed var(--muted);
+  color: var(--muted);
+  font-size: 11px;
+}
+.dot-pseudo {
+  background: repeating-linear-gradient(45deg, #ffffff, #ffffff 2px, var(--tm-pseudo-line) 2px, var(--tm-pseudo-line) 4px);
+  box-shadow: inset 0 0 0 1px var(--tm-pseudo-line);
 }

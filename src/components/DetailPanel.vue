@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { askAi, explainPath, sourceKey, tierKey, type Explanation, type NodeView } from "../api";
+import { askAi, askable, explainPath, sourceKey, tierKey, type Explanation, type NodeView } from "../api";
 import { HOW_LABEL, SOURCE_HINT, SOURCE_SHORT, TIER_BIG, TIER_HINT, attrText, fmtInt, fmtTime, humanBytes, sourceLabel } from "../format";
 import TierChip from "./TierChip.vue";
 
@@ -43,11 +43,8 @@ const ex = computed(() => props.node?.explanation ?? fetched.value ?? null);
 const sk = computed(() => sourceKey(ex.value));
 const isUnknown = computed(() => sk.value === "unknown");
 const tk = computed(() => tierKey(ex.value));
-const canAsk = computed(() => {
-  const e = ex.value;
-  if (!e || !props.node || props.node.kind === "Rest" || props.node.pseudo) return false;
-  return e.source.kind === "unknown" || e.source.kind === "heuristic";
-});
+/** 只有“未认出”、读得到、有内容的项才能问 AI（第 1 轮安全评审：规则 / 推测认出来的不再发出去；后端也会再挡） */
+const canAsk = computed(() => !!props.node && askable(props.node, ex.value));
 
 const status = computed(() => {
   const n = props.node;
@@ -130,7 +127,7 @@ async function copy(text: string) {
       <section v-if="ex" class="explain" :class="'ex-' + tk">
         <div class="ex-head">
           <TierChip :tier="tk" big :text="TIER_BIG[tk]" />
-          <span class="src-tag" :class="'src-' + sk" :title="SOURCE_HINT[sk]">{{ SOURCE_SHORT[sk] }}</span>
+          <span v-if="SOURCE_SHORT[sk]" class="src-tag" :class="'src-' + sk" :title="SOURCE_HINT[sk]">{{ SOURCE_SHORT[sk] }}</span>
         </div>
         <p class="ex-hint muted small">{{ TIER_HINT[tk] }}</p>
         <div v-if="isUnknown && ex.clues.length" class="ex-clues">
@@ -174,6 +171,7 @@ async function copy(text: string) {
         </div>
         <div class="ex-source small">
           <span class="muted">来源：</span>{{ sourceLabel(ex) }}
+          <span v-if="ex.observed_only" class="observed-tag" title="这条规则没有找到官方出处，是在本机上观察到的">本机观察</span>
           <span v-if="ex.verified_on" class="muted"> · 核对于 {{ ex.verified_on }}</span>
         </div>
         <div v-if="ex.refs.length" class="ex-refs small">
@@ -190,7 +188,7 @@ async function copy(text: string) {
             {{ aiLoading ? "AI 正在推测…" : llmReady ? "问 AI 这是什么" : "问 AI（先去设置里启用）" }}
           </button>
           <p class="muted small">
-            只发送名字、位置（用户名换成 ~）、最大的 20 个子项的名字和总大小，不发送任何文件内容。
+            只发送名字、最近两层位置、子文件夹的名字和各类文件的个数、总大小；用户名、邮箱、长数字会打码；不发送文件名和文件内容。
           </p>
           <p v-if="aiError" class="ai-error small">AI 这次没答上来：{{ aiError }}（不影响其他功能，可以稍后再试或检查设置）</p>
         </div>

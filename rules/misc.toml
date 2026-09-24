@@ -333,7 +333,7 @@ why = "Battle.net 和它的更新程序（Agent）把临时数据放在这里"
 lose = "暴雪官方客服文章说删掉它不会影响游戏数据和账号信息；缓存坏了反而会让游戏出问题。"
 how = "delete"
 how_detail = "先关掉所有暴雪程序，并在任务管理器里结束 Agent.exe（Blizzard Update Agent），再删 %ProgramData%\\Blizzard Entertainment，然后重新打开 Battle.net。"
-refs = ["https://us.support.blizzard.com/en/article/34721"]
+refs = ["https://us.support.blizzard.com/en/help/article/34721"]
 verified_on = "2026-09-23"
 
 [[rule]]

@@ -334,6 +334,14 @@ fn strict_chromium_cache(t: &Target) -> Option<String> {
     None
 }
 
+/// 路径在 Program Files / Program Files (x86) / AppData\Local\Programs 下面（程序安装目录）。
+fn in_program_dir(path: &str, ctx: &ExplainCtx) -> bool {
+    let segs = split_lower(path);
+    [("ProgramFiles", ""), ("ProgramFiles(x86)", ""), ("LOCALAPPDATA", "\\Programs")]
+        .iter()
+        .any(|(v, sub)| ctx.env.get(v).is_some_and(|base| under(&segs, &split_lower(&format!("{base}{sub}")))))
+}
+
 /// 聊天软件的数据（不在规则库覆盖的默认位置时）：keep + 迁移。
 fn chat_data(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
     let segs = segments(t.path);
@@ -587,6 +595,22 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
         // conda 的 envs 目录（或其中一个环境）装在规则库不认识的位置（比如 D:\conda\envs）：和规则 conda-envs 一样 keep + 迁移。
         let parent_is_envs = t.parent.is_some_and(|p| p.name.eq_ignore_ascii_case("envs"));
         let envs_root = name == "envs" && sibling_exists(t, "conda-meta");
+        // conda 的包缓存（pkgs_dirs 改到了规则库不认识的位置）：规则 conda-pkgs 是 safe，启发式最多 review。
+        if name == "pkgs" && has_child(n, "cache") && (has_child(n, "urls.txt") || has_child(n, "urls")) {
+            return Some(Hint {
+                name: "conda-pkgs",
+                tier: Tier::Review,
+                category: Category::Cache,
+                what: "conda 下载的安装包缓存（pkgs）".into(),
+                why: "conda 装库时先把包下载、解压到这里，再链接进各个环境".into(),
+                lose: "用 conda 自己的命令清理不影响已经建好的环境；以后装同样的库要重新下载。直接在资源管理器里删有风险：有的环境可能是用硬链接指到这里的文件。".into(),
+                how: vec![How::BuiltinTool],
+                how_detail: "打开 Anaconda Prompt 运行 conda clean --all（会先列出要删的东西让你确认），不要直接删文件夹。".into(),
+                confidence: 0.7,
+                owner: Some("conda（Anaconda / Miniconda）".into()),
+                clues: vec!["文件夹叫 pkgs，里面有 urls.txt 和 cache（conda 包缓存的标志）".into()],
+            });
+        }
         if (conda && parent_is_envs) || envs_root {
             return Some(Hint {
                 name: "conda-env",
@@ -655,35 +679,80 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
     // 3. node_modules：本身叫 node_modules，或者在某个 node_modules 里面。提示是哪个项目的。
     if let Some(i) = first_segment(t.path, "node_modules") {
         let project = prefix_path(t.path, i);
+        // 软件自带的依赖（Electron 程序的 resources\app.asar.unpacked\node_modules、装在 Program Files /
+        // AppData\Local\Programs / 注册表安装目录下的）：删了软件就坏，不是“开发项目的依赖”。
+        // 本机全量对照时 Typeless、Notion 的 app.asar.unpacked\node_modules 被误说成“遗留的”，所以加了这一条。
+        let before: Vec<String> = segments(t.path)[..i].iter().map(|s| s.to_lowercase()).collect();
+        let electron_layout = before.last().is_some_and(|s| s.ends_with(".asar.unpacked"))
+            || (before.len() >= 2 && before[before.len() - 1] == "app" && before[before.len() - 2] == "resources");
+        let bundled = electron_layout
+            || in_program_dir(t.path, ctx)
+            || owner_from_path(t.path, ctx).is_some_and(|o| o.via == "安装目录");
+        if bundled {
+            let app = owner_from_path(t.path, ctx).filter(|o| o.installed).map(|o| o.name);
+            let who = app.clone().map(|a| format!("「{a}」")).unwrap_or_else(|| "某个已安装软件".into());
+            return Some(Hint {
+                name: "app-bundled-modules",
+                tier: Tier::Keep,
+                category: Category::App,
+                what: format!("{who}自带的 JavaScript 依赖（软件本体的一部分）"),
+                why: "用 Electron / Node.js 做的桌面软件会把运行要用的库一起装进安装目录".into(),
+                lose: "删了这个软件就打不开或功能出错，而且不会自己恢复，只能重装。".into(),
+                how: vec![How::Manual],
+                how_detail: "不用这个软件了就在“设置 > 应用”里卸载它；还要用就别动。".into(),
+                confidence: 0.7,
+                owner: app,
+                clues: vec![format!("node_modules 在软件的安装目录里（{project}），不是开发项目")],
+            });
+        }
         let project_name = project.trim_end_matches('\\').rsplit('\\').next().unwrap_or(&project).to_string();
         let own = i + 1 == seg_count(t.path);
         let has_pkg = if own { sibling_exists(t, "package.json") } else { Path::new(&project).join("package.json").exists() };
-        let (hname, what, clue, conf) = if has_pkg {
+        if has_pkg {
+            return Some(Hint {
+                name: "node-modules",
+                tier: Tier::Review,
+                category: Category::Build,
+                what: if own { format!("项目「{project_name}」下载的 JavaScript 依赖包") } else { format!("项目「{project_name}」的 JavaScript 依赖包里的一部分") },
+                why: "运行 npm / pnpm / yarn install 时把项目需要的包全部下载到这里".into(),
+                lose: "删了对应项目暂时跑不起来，在项目目录里重新 npm install 就能装回来（要联网、要等一会儿），不丢你写的代码。".into(),
+                how: vec![How::Delete],
+                how_detail: format!("确认项目不在运行，删掉整个 {project}\\node_modules（不要只删一部分）；要用时在项目目录执行 npm install（或 pnpm install / yarn）。"),
+                confidence: 0.75,
+                owner: Some(format!("项目「{project_name}」（{project}）")),
+                clues: vec![format!("在 node_modules 里；对应的项目是 {project}（那里有 package.json）")],
+            });
+        }
+        // 旁边没有 package.json：在 AppData 里多半是某个软件自己放的；在别处可能是打包输出带的，也可能是项目删了留下的。
+        let in_appdata = split_lower(t.path).iter().any(|s| s == "appdata");
+        let (what, lose, how, how_detail, clue) = if in_appdata {
             (
-                "node-modules",
-                if own { format!("项目「{project_name}」下载的 JavaScript 依赖包") } else { format!("项目「{project_name}」的 JavaScript 依赖包里的一部分") },
-                format!("在 node_modules 里；对应的项目是 {project}（那里有 package.json）"),
-                0.75,
+                "某个软件放在 AppData 里的 JavaScript 依赖包".to_string(),
+                "旁边没有 package.json，看不出是哪个项目的；在 AppData 里通常是某个软件运行要用的，删了那个软件可能出错。".to_string(),
+                vec![How::Manual],
+                "先看上一层文件夹是哪个软件的；不用那个软件了就卸载它，别单独删这里。".to_string(),
+                format!("在 {project} 下面（AppData 里），那里没有 package.json"),
             )
         } else {
             (
-                "node-modules-orphan",
-                format!("一个 JavaScript 依赖包文件夹（node_modules），原来应该属于「{project_name}」"),
-                format!("在 {project} 下面，但那里没有 package.json：对应的项目可能已经删了或挪走了，这可能是遗留下来的"),
-                0.5,
+                format!("一个 JavaScript 依赖包文件夹（node_modules），在「{project_name}」里"),
+                "旁边没有 package.json：可能是打包输出（dist / build）里带的依赖，也可能是项目删了留下的。前一种删了打包结果就跑不起来，后一种删了没影响。".to_string(),
+                vec![How::Manual],
+                format!("看一眼 {project} 是什么：是打包输出就重新打包或整个删掉输出目录；是没用的旧项目就整个删。"),
+                format!("在 {project} 下面，但那里没有 package.json"),
             )
         };
         return Some(Hint {
-            name: hname,
+            name: "node-modules-orphan",
             tier: Tier::Review,
             category: Category::Build,
             what,
-            why: "运行 npm / pnpm / yarn install 时把项目需要的包全部下载到这里".into(),
-            lose: "删了对应项目暂时跑不起来，在项目目录里重新 npm install 就能装回来（要联网、要等一会儿），不丢你写的代码。".into(),
-            how: vec![How::Delete],
-            how_detail: format!("确认项目不在运行，删掉整个 {project}\\node_modules（不要只删一部分）；要用时在项目目录执行 npm install（或 pnpm install / yarn）。"),
-            confidence: conf,
-            owner: Some(format!("项目「{project_name}」（{project}）")),
+            why: "npm / pnpm / yarn 装依赖时会建 node_modules".into(),
+            lose,
+            how,
+            how_detail,
+            confidence: 0.45,
+            owner: None,
             clues: vec![clue],
         });
     }

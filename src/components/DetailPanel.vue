@@ -150,7 +150,7 @@ async function copy(text: string) {
             {{ aiLoading ? "AI 正在推测…" : llmReady ? "问 AI 这是什么" : "问 AI（先去设置里启用）" }}
           </button>
           <p class="muted small">
-            只发送名字、位置（用户名换成 ~）、前 10 大子项名、文件类型分布、大小和修改日期，不发送任何文件内容。
+            只发送名字、位置（用户名换成 ~）、最大的 20 个子项的名字和总大小，不发送任何文件内容。
           </p>
           <p v-if="aiError" class="ai-error small">AI 这次没答上来：{{ aiError }}（不影响其他功能，可以稍后再试或检查设置）</p>
         </div>
@@ -165,7 +165,7 @@ async function copy(text: string) {
           <dt>这是什么</dt>
           <dd><b>{{ aiResult.what }}</b></dd>
           <dt>属于</dt>
-          <dd>{{ aiResult.owner ?? "AI 也说不准" }}</dd>
+          <dd>{{ aiResult.owner ?? "没查到（归属只看注册表，不让 AI 猜）" }}</dd>
           <dt>为什么会有</dt>
           <dd>{{ aiResult.why }}</dd>
           <dt>删了会失去什么</dt>

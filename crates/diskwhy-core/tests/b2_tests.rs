@@ -397,6 +397,10 @@ fn b2_heuristics_project_hints_chat_data_conda_and_inheritance() {
     put(&root, r"proj\web\node_modules\lodash\index.js", &[0u8; 4000]);
     put(&root, r"proj\web\node_modules\lodash\node_modules\tiny\i.js", &[0u8; 1000]);
     put(&root, r"old\gone\node_modules\left-pad\index.js", b"x");
+    // 软件自带的依赖（本机对照时 Typeless / Notion 的 app.asar.unpacked\node_modules 曾被误说成“遗留的”）
+    put(&root, r"Local\Programs\Typeless\resources\app.asar.unpacked\node_modules\koffi\k.node", &[0u8; 3000]);
+    put(&root, r"elsewhere\Tool\resources\app\package.json", b"{}");
+    put(&root, r"elsewhere\Tool\resources\app\node_modules\x\i.js", &[0u8; 3000]);
     // Rust target 里面的子目录
     put(&root, r"proj\rs\Cargo.toml", b"[package]");
     put(&root, r"proj\rs\target\debug\deps\libx.rlib", &[0u8; 9000]);
@@ -411,6 +415,10 @@ fn b2_heuristics_project_hints_chat_data_conda_and_inheritance() {
     put(&root, r"conda\conda-meta\history", b"h");
     put(&root, r"conda\envs\d2l\conda-meta\history", b"h");
     put(&root, r"conda\envs\d2l\python.exe", &[0u8; 5000]);
+    // 改过位置的 conda 包缓存（本机就是 D:\conda\pkgs）
+    put(&root, r"conda2\pkgs\urls.txt", b"u");
+    put(&root, r"conda2\pkgs\cache\x.json", b"{}");
+    put(&root, r"conda2\pkgs\numpy-1.0-py\info\index.json", &[0u8; 5000]);
 
     let ctx = empty_rules_ctx(&root);
     let fx = Fixture::scan(root.clone(), ctx);
@@ -426,6 +434,16 @@ fn b2_heuristics_project_hints_chat_data_conda_and_inheritance() {
     let orphan = fx.explain(r"old\gone\node_modules");
     assert_eq!(heur_name(&orphan), Some("node-modules-orphan"));
     assert!(orphan.clues.iter().any(|c| c.contains("没有 package.json")), "{:?}", orphan.clues);
+    for rel in [
+        r"Local\Programs\Typeless\resources\app.asar.unpacked\node_modules",
+        r"Local\Programs\Typeless\resources\app.asar.unpacked\node_modules\koffi",
+        r"elsewhere\Tool\resources\app\node_modules",
+    ] {
+        let e = fx.explain(rel);
+        assert_eq!(heur_name(&e), Some("app-bundled-modules"), "{rel}: {:?} {}", e.source, e.what);
+        assert_eq!(e.tier, Tier::Keep, "{rel}：软件自带的依赖删了软件就坏");
+        assert!(!e.how.contains(&How::Delete), "{rel}");
+    }
 
     let rt = fx.explain(r"proj\rs\target\debug");
     assert_eq!(heur_name(&rt), Some("rust-target"), "{:?}", rt.source);
@@ -450,6 +468,10 @@ fn b2_heuristics_project_hints_chat_data_conda_and_inheritance() {
     let envs = fx.explain(r"conda\envs");
     assert_eq!(heur_name(&envs), Some("conda-env"), "{:?}", envs.source);
     assert_eq!(envs.tier, Tier::Keep);
+    let pkgs = fx.explain(r"conda2\pkgs");
+    assert_eq!(heur_name(&pkgs), Some("conda-pkgs"), "{:?}", pkgs.source);
+    assert_eq!(pkgs.tier, Tier::Review, "规则里的 conda-pkgs 是 safe，但启发式最多 review");
+    assert_eq!(pkgs.how, vec![How::BuiltinTool]);
 }
 
 #[test]
@@ -695,4 +717,87 @@ fn b2_enforce_guards_on_every_source() {
     assert_eq!(enforce_guards(with(rule(), Tier::Safe), docs, &ctx).tier, Tier::Review);
     assert_eq!(enforce_guards(with(rule(), Tier::Safe), plain, &ctx).tier, Tier::Safe);
     assert_eq!(enforce_guards(with(rule(), Tier::Keep), docs, &ctx).tier, Tier::Keep);
+}
+
+// ───────────────────────── 5. 手动对照：真实目录全量扫一遍 ─────────────────────────
+
+/// 手动跑：`DISKWHY_SWEEP_DIR=C:\Users\me\AppData\Local cargo test -p diskwhy-core --test b2_tests -- --ignored --nocapture`
+/// 用本机真实环境变量 + 内置规则 + 真实注册表，把目录下每个文件夹都解释一遍，统计来源，
+/// 列出启发式判成 safe 的全部路径（人工抽查有没有误判），并断言护栏成立。
+#[test]
+#[ignore]
+fn b2_manual_real_dir_sweep() {
+    let Ok(dir) = std::env::var("DISKWHY_SWEEP_DIR") else {
+        println!("没设 DISKWHY_SWEEP_DIR，跳过");
+        return;
+    };
+    let (ctx, warnings) = ExplainCtx::load_default();
+    let mut ctx = ctx;
+    ctx.settings = LlmSettings::default(); // 手动对照不联网
+    println!("规则 {} 条，警告 {:?}，注册表软件 {} 个", ctx.rules.rules.len(), warnings, ctx.registry.apps.len());
+    let cancel = AtomicBool::new(false);
+    let t0 = std::time::Instant::now();
+    let r = scan(&dir, &ScanOptions::default(), &cancel, |_| {}).expect("扫描失败");
+    println!("扫描 {:.1} 秒", t0.elapsed().as_secs_f64());
+    let t1 = std::time::Instant::now();
+    let mut by_source: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+    let mut safe_heur: Vec<(u64, String)> = Vec::new();
+    let mut picks: BTreeMap<String, Vec<(u64, String, String)>> = BTreeMap::new();
+    let mut stack: Vec<(Vec<&Node>, &Node)> = vec![(Vec::new(), &r.tree)];
+    let mut n = 0usize;
+    while let Some((chain, node)) = stack.pop() {
+        if node.kind != NodeKind::Dir {
+            continue;
+        }
+        let tg = Target { node, path: &node.path, parent: chain.last().copied(), ancestors: &chain };
+        let e = explain_full(&tg, &ctx, None);
+        n += 1;
+        let key = match &e.source {
+            Source::Rule { inherited_from: None, .. } => "规则（精确）".to_string(),
+            Source::Rule { .. } => "规则（继承）".to_string(),
+            Source::Heuristic { name } => format!("启发式 {name}"),
+            Source::Llm { .. } => "LLM".to_string(),
+            Source::Unknown => "未知".to_string(),
+        };
+        let ent = by_source.entry(key.clone()).or_default();
+        ent.0 += 1;
+        ent.1 += node.allocated;
+        if let Source::Heuristic { name } = &e.source {
+            if e.tier == Tier::Safe {
+                assert_eq!(name, "chromium-cache", "{} 被启发式 {name} 判成 safe", node.path);
+                // 只记“最上层”的那个（Cache 里的 Cache_Data 不重复记）
+                if !chain.last().is_some_and(|p| {
+                    let pt = Target { node: p, path: &p.path, parent: None, ancestors: &[] };
+                    heur_name(&diskwhy_core::explain::explain(&pt, &ctx)) == Some("chromium-cache")
+                }) {
+                    safe_heur.push((node.allocated, node.path.clone()));
+                }
+            }
+            if ["chromium-cache-mixed", "chat-data", "conda-env", "node-modules-orphan", "app-bundled-modules", "conda-pkgs"].contains(&name.as_str()) {
+                picks.entry(name.clone()).or_default().push((node.allocated, node.path.clone(), e.what.clone()));
+            }
+        }
+        for c in &node.children {
+            let mut ch = chain.clone();
+            ch.push(node);
+            stack.push((ch, c));
+        }
+    }
+    println!("解释 {n} 个文件夹用时 {:.1} 秒", t1.elapsed().as_secs_f64());
+    for (k, (c, b)) in &by_source {
+        println!("  {k:<32} {c:>7} 个  {:>12}", view::human_bytes(*b));
+    }
+    safe_heur.sort_by(|a, b| b.0.cmp(&a.0));
+    let total: u64 = safe_heur.iter().map(|x| x.0).sum();
+    println!("启发式判成 safe（chromium-cache，最上层）{} 处，合计 {}：", safe_heur.len(), view::human_bytes(total));
+    for (b, p) in safe_heur.iter().take(25) {
+        println!("  {:>10}  {p}", view::human_bytes(*b));
+    }
+    for (k, v) in picks.iter_mut() {
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        println!("{k} {} 处（前 8）：", v.len());
+        for (b, p, w) in v.iter().take(8) {
+            println!("  {:>10}  {p}  —— {w}", view::human_bytes(*b));
+        }
+    }
 }

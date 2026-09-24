@@ -507,3 +507,36 @@ fn delete_gate_temp_at_drive_root() {
     }
     assert_eq!(tier_summary(&t, &c).safe_bytes, 0);
 }
+
+/// 包管理器缓存里包自带的 PDF、测试证书不算“你的文件”（真实 C 盘上 cargo registry、uv cache 被误判过，决定 70）；
+/// 但虚拟磁盘、聊天数据照样拦。Temp 不在这个名单里，照查。
+#[test]
+fn package_caches_ignore_bundled_docs_and_test_keys() {
+    let c = ctx_default();
+    let cargo = format!(r"{U}\.cargo\registry");
+    let uv = format!(r"{U}\AppData\Local\uv\cache");
+    let npm = format!(r"{U}\AppData\Local\npm-cache");
+    let files = vec![
+        (format!(r"{cargo}\src\index.crates.io-x\openssl-0.10.81\test\identity.p12"), 4_000u64),
+        (format!(r"{cargo}\src\index.crates.io-x\openssl-0.10.81\src\lib.rs"), 40_000),
+        (format!(r"{uv}\archive-v0\abc\matplotlib\mpl-data\images\hand.pdf"), 8_000),
+        (format!(r"{uv}\archive-v0\abc\matplotlib\<rest:129:80>"), 90_000),
+        (format!(r"{uv}\archive-v0\abc\matplotlib\__init__.py"), 50_000),
+        (format!(r"{npm}\_cacache\content-v2\x\data"), 60_000),
+        // uv 放的空 .git 文件（让 git 别把缓存当仓库），不是代码仓库
+        (format!(r"{uv}\sdists-v9\.git"), 0),
+        (format!(r"{uv}\sdists-v9\.gitignore"), 0),
+        (format!(r"{npm}\vm\disk.vhdx"), 1_000),
+    ];
+    let t = tree("C:", &files);
+    assert_eq!(ex(&t, &c, &cargo).tier, Tier::Safe, "{:?}", ex(&t, &c, &cargo).notes);
+    assert_eq!(ex(&t, &c, &uv).tier, Tier::Safe, "{:?}", ex(&t, &c, &uv).notes);
+    let en = ex(&t, &c, &npm);
+    assert_eq!(en.tier, Tier::Review, "npm-cache 里的虚拟磁盘仍要拦：{}", src(&en));
+    let s = tier_summary(&t, &c);
+    assert_eq!(s.safe_bytes, 4_000 + 40_000 + 8_000 + 90_000 + 50_000 + 60_000);
+    assert_eq!(s.keep_bytes, 1_000);
+    for p in [&cargo, &uv] {
+        assert!(!s.safe_items.iter().find(|i| i.path.eq_ignore_ascii_case(p)).unwrap().mixed, "{p}");
+    }
+}

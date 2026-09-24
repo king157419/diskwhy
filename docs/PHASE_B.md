@@ -2,7 +2,7 @@
 
 # 阶段 B 验证记录：解释引擎
 
-> 第 1 节是**现在的状态**（第 1 轮评审修复之后）；第 7 节是全部决定（1–42 是 B-1~B-4，43 起是第 1 轮评审修复）；第 8–11 节是 B-1~B-4 各自的记录；第 12 节是第 1 轮评审与修复。第一次做阶段 B 时的旧记录（原第 1–6 节）挪到了文末「历史」，里面的数字和说法已经过时。
+> 第 1 节是**现在的状态**（第 2 轮评审严重项修复之后）；第 7 节是全部决定（1–42 是 B-1~B-4，43–59 是第 1 轮评审修复，60–70 是第 2 轮）；第 8–11 节是 B-1~B-4 各自的记录（里面的数字已过时，以第 1 节为准）；第 12 节是评审与修复（12.1–12.3 第 1 轮，12.4 合并前的逐文件清单，12.5 第 2 轮）。第一次做阶段 B 时的旧记录（原第 1–6 节）挪到了文末「历史」，里面的数字和说法已经过时。
 
 日期：2026-09-23　机器：Windows 11 Pro 10.0.26200，C 盘 NTFS 199 GB，**普通用户权限（未提权）**
 工具链：rustc/cargo 1.93.0，node 22，Tauri 2，windows-sys 0.61.2，toml 0.9，ureq 3.4.2（native-tls）
@@ -10,7 +10,9 @@
 
 ---
 
-## 1. 当前状态（第 1 轮评审修复之后，2026-09-23 夜，分支 `phase-b`）
+## 1. 当前状态（第 2 轮评审严重项修复之后，2026-09-24 凌晨，分支 `phase-b`）
+
+> **用户醒来后第一件事：决定是否批准把 phase-b 合并到 master。** master 上的阶段 D 已经能删东西，但用的是没有护栏的旧解释引擎。合并办法和 9 个文件的冲突处理见 12.4。
 
 > 这一节是现在的样子。第一次做阶段 B 时的记录（179 条规则、47 个测试、“启发式永不 safe”、LLM 发 9 个字段等）已经过时，整段挪到了文末的「历史」一节；中间的决定、B-1~B-4 各小节保留原样，读的时候以本节和第 12 节为准。
 
@@ -39,9 +41,11 @@
 1. `verify = "chromium-disk-cache"` 的通配规则（`**\Cache`、`**\Code Cache`、`**\GPUCache` 等），命中的那个文件夹必须通过和启发式同样严格的签名检查，否则 safe → review；有“其余小文件”合并时回磁盘把全部文件名读一遍再核（只读名字）。
 2. safe 规则覆盖的地方先看内容：聊天软件的数据文件夹（路径里有 WeChat Files / xwechat_files / Tencent Files / WXWork）→ keep；有 `conda-meta` 的文件夹 → keep；虚拟磁盘文件 → keep；有 `.git` / `.svn` / `.hg` 的文件夹 → review；Office / WPS / PDF 等文档 → review。自己是、上层（到规则命中的那层为止）是、下面有这些东西，分别处理：自己或上层是 → 改用对应说明；下面有且 keep 级的占一半以上 → 整个 keep；否则 safe → review，“能腾多少”写成“其中约 X 可以清理，另有 N 处看起来是你的数据”。
 3. review 规则只查虚拟磁盘，而且只对“继承来的、不是专门讲虚拟机的规则”查（商店版 WSL 的 `LocalState` 挂在 `store-app-package` 下面，规则给的办法是“重置”，重置会清空整个发行版）。
-4. `enforce_guards`：AI / 未认出一律 review；启发式的 safe 只认 `chromium-cache`；任何来源的 safe 落在个人文件夹下 → review。个人文件夹除了 `%USERPROFILE%\Documents` 这类默认位置，还用 `SHGetKnownFolderPath` 读真实位置（“文档”被移到 D 盘也保护）。
+4. 第 2 轮评审后补的三处“看不全”（12.5）：被合并进“其余 N 个文件”的小文件按扫描时记的名字标志判断（`Node.rest_flags`：文档 / 虚拟磁盘 / 密钥；没记录的按“看不到”→ review）；往下找超过 100 万个节点就 safe → review；下层文件夹精确命中 review / keep 规则（`Temp\Rar$EX*`、`INetCache\Content.Outlook`）也算陷阱。新增密钥类陷阱（kdbx、ppk、pfx、p12、jks、keystore、wallet.dat、id_rsa 等，keep）。包管理器缓存（npm / pip / uv / cargo 等 14 条规则）里不查按文件名认的陷阱；空的 `.git` 文件不算代码仓库（决定 70）。
+5. 删除闸门（给阶段 D 合并用）：`Explanation.hold` 写“这一整项不能整块删”的原因（护栏降档、没看全、格式不对）；`explain::delete_block_reason` 拦下 AI / 未认出 / 保留 / 没有 delete / 有 hold 的项，`batch_deletable` = safe + delete + 没有 hold。
+6. `enforce_guards`：AI / 未认出一律 review；启发式的 safe 只认 `chromium-cache`；任何来源的 safe 落在个人文件夹下 → review。个人文件夹除了 `%USERPROFILE%\Documents` 这类默认位置，还用 `SHGetKnownFolderPath` 读真实位置（“文档”被移到 D 盘也保护）。
 
-`tier_summary`（全盘各档合计）走同一套护栏：陷阱字节改记到 review / keep（`guarded_bytes`、`guard_items`），verify 核不过的记到 review，商店沙箱里的东西按原位置找规则，认不出记“规则没覆盖”，不再算到包规则上；另外单独给出 safe 里“要用工具清、不能直接删文件夹”的字节（`safe_tool_bytes`，给阶段 D 的批量删除用）。
+`tier_summary`（全盘各档合计）走同一套护栏：陷阱字节改记到 review / keep（`guarded_bytes`、`guard_items`），verify 核不过的记到 review，商店沙箱里的东西按原位置找规则，认不出记“规则没覆盖”，不再算到包规则上；另外单独给出 safe 里“要用工具清、不能直接删文件夹”的字节（`safe_tool_bytes`，给阶段 D 的批量删除用）；第 2 轮后多给一份全盘可清理清单 `safe_items`（每条 safe 规则的每一处命中，按字节排，最多 300 项，标 `mixed`：这一处里混着别的东西、在列表里整体显示“需判断”）。
 
 ### 1.3 启发式（规则没命中时，按顺序）
 
@@ -55,11 +59,11 @@ chat-data（keep）→ chromium-cache（**唯一能 safe 的**，签名严格）
 
 ### 1.5 界面
 
-欢迎页和扫描中常驻“四种颜色是什么意思”卡；口径说明折叠；进度过 90% 显示“正在收尾”和走动条纹。结果页：归属条改成中性的石板色 + 纹理（彩色只留给档位）；汇总卡叫“这些空间分别是什么”，副标题写规则命中的最大文件夹名，点卡片让列表只看这一档；图例每档常驻一句话 + “这一层 N 项”，小于 1 MB 的未认出项合并成“另有 N 个没认出来的小文件夹”，说明来源只分“规则库 / 推测”（有 AI 结果时多一个 AI）。每档只用一个名字：**可清理 / 需判断 / 保留 / 未认出**（另有灰色虚线的“不占空间”）。保留改成蓝灰色 + 锁，方块图里保留块加淡斜纹、“读不了”改成白底斜纹、可选“只高亮可清理”。详情里“用这个工具”是普通文字不是按钮；来源后面标“本机观察”。仍然没有删除按钮。
+欢迎页和扫描中常驻“四种颜色是什么意思”卡；口径说明折叠；进度过 90% 显示“正在收尾”和走动条纹。结果页：归属条改成中性的石板色 + 纹理（彩色只留给档位）；汇总卡叫“这些空间分别是什么”，副标题写规则命中的最大文件夹名，点卡片让列表只看这一档；图例每档常驻一句话 + “这一层 N 项”，小于 1 MB 的未认出项合并成“另有 N 个没认出来的小文件夹”，说明来源只分“规则库 / 推测”（有 AI 结果时多一个 AI）。每档只用一个名字：**可清理 / 需判断 / 保留 / 未认出**（另有灰色虚线的“不占空间”）。保留改成蓝灰色 + 锁；方块图里保留块是纯色 + 右上角小锁（第 2 轮改，不再用斜纹），斜纹只给“读不了 / 推算”；“只高亮可清理”时含可清理内容的块描绿边。点“可清理”卡片打开全盘可清理清单（按大小、带路径，点一行跳过去），副标题把整体标“需判断”的写成“Temp 里的缓存 X”；其余三张卡还是筛当前这一层。详情里“用这个工具”是普通文字不是按钮；来源后面标“本机观察”。仍然没有删除按钮。
 
 ### 1.6 测试
 
-`cargo test -p diskwhy-core -p diskwhy-cli`：**87 个通过，0 失败，2 个忽略（B-4 时 79 个；忽略的两个要设环境变量才跑）**。第 1 轮评审后新增 `crates/diskwhy-core/tests/r1_tests.rs`（6 个，其中 `safety_trap_corpus` 把安全评审探针 A、C 两节的陷阱原样搬进来，TEMP 取默认、`D:\`、`C:\Users\bob`、`C:\`、`C:\Users\bob\AppData\Local` 五种）和 CLI 单元测试 2 个；前端 `vue-tsc` 通过、`vitest` 7 个通过。
+`cargo test -p diskwhy-core -p diskwhy-cli`：**97 个通过，0 失败，2 个忽略（第 1 轮后 87 个，B-4 时 79 个；忽略的两个要设环境变量才跑）**。第 2 轮新增 `crates/diskwhy-core/tests/r2_tests.rs`（10 个：探针 R / T / N 节、Temp 里只有 Rar$EX + .psd、删除闸门覆盖陷阱语料、包管理器缓存不误判）。第 1 轮评审后新增 `crates/diskwhy-core/tests/r1_tests.rs`（6 个，其中 `safety_trap_corpus` 把安全评审探针 A、C 两节的陷阱原样搬进来，TEMP 取默认、`D:\`、`C:\Users\bob`、`C:\`、`C:\Users\bob\AppData\Local` 五种）和 CLI 单元测试 2 个；前端 `vue-tsc` 通过、`vitest` 7 个通过。
 
 ---
 
@@ -126,6 +130,17 @@ chat-data（keep）→ chromium-cache（**唯一能 safe 的**，签名严格）
 | 57 | 阶段 D 的“批量删 safe”怎么避开只能用工具清的 | 不加新的档位；汇总里单独给 `safe_tool_bytes`，12.4 写明阶段 D 批量删只选 `tier = safe && how 含 delete` | 阶段 D 代码在 master 上，这条分支不改删除逻辑 |
 | 58 | 驱动解压目录（`C:\AMD` 等）、`C:\Temp`、`C:\tmp` | 都是 review；`C:\tmp` 按“可能是你自己放的”写 | 查了 AMD、NVIDIA 的支持页，没找到“这个文件夹能删”的官方说法（搜到的都是论坛和第三方文章）；本机 `C:\tmp` 里确实有用户自己的东西 |
 | 59 | 截图怎么拍、怎么打码 | 用 WebView2 远程调试端口（CDP）点界面按钮、`Page.captureScreenshot` 截页面（视口 1280×800 × 1.25，和冷启动评审一样）；截图前把页面文字里的用户名换成 `<用户>`；canvas 上画的用户名和扫描中实时刷新的“当前路径”用图片打码；旧截图挪到 `old/` 并打码 | 上一轮的 UI Automation + PrintWindow 脚本在临时目录里已经没了；CDP 能直接读 DOM 确认页面里还有没有用户名（脚本每张都检查并打印） |
+| 60 | （第 2 轮修复）被合并进“其余 N 个文件”的小文件，护栏怎么看 | 扫描器合并时按**文件名**记标志位（`Node.rest_flags`：看过 / 文档 / 虚拟磁盘 / 密钥），解释时据此判；**没记录的按“看不到”处理**（safe → review） | 评审给了两个办法：记标志位，或者遇到 Rest 回磁盘读名字。选前者：快照和 CLI JSON 里也有，解释时不多做磁盘读；不改文件内容、不多占内存（1 个字节）。代价：旧版本存的快照里，凡是有“其余小文件”的 Temp 都会变成“需判断”，重新扫一次就好 |
+| 61 | 密钥类算什么档 | `kdbx / kdb / ppk / pfx / p12 / jks / keystore` 和 `wallet.dat / id_rsa / id_ed25519 / id_ecdsa / id_dsa` → keep；`.pem` **不算** | 评审 G5 建议 keep。`.pem` 没放：PyInstaller 打包的程序每次运行都会往 Temp 解压 `certifi\cacert.pem`，算进来 Temp 几乎总是“需判断”（这是推断，没在本机统计过） |
+| 62 | 往下找陷阱的 3 万节点上限 | 上限提到 **100 万**（`ctx.trap_visit`，测试可调小），**超过就 safe → review**，并记 `hold`；没做“扫完后自下而上给每个目录算一次子树有没有陷阱”的 O(n) 方案 | O(n) 方案要把结果挂在扫描结果旁边、改 Tauri 状态和 CLI，和 master 上阶段 D 的冲突面更大。100 万节点在每个目录只存 50 个文件的前提下已经很少见，超过时往保守的方向走。`tier_summary` 是整棵树走一遍，本来就没有上限，所以它是准的 |
+| 63 | safe 规则下面有 review / keep 规则（S2） | 往下找陷阱时，只拿“在这棵子树里可能命中的非 safe 模式”去比，命中后再用全部规则裁决一次，确认它最终确实归一条非 safe 规则，才算陷阱（`nested-rule`） | 评审用脚本核过 222 条规则只有 `user-temp ⊃ temp-opened-from-archive`、`inetcache ⊃ outlook-attachment-temp` 两处；做成通用的，以后新加规则不用再记得这件事。汇总本来就把下层字节记给了下层规则，只把上层那一处标成 `mixed` |
+| 64 | 阶段 D 的删除闸门放在哪 | phase-b 里加 `Explanation.hold`（整块删会碰到用户数据的原因）和 `explain::delete_block_reason` / `batch_deletable`；**不改 master**，合并时由 master 的 `tier_gate` 和前端 `cartEligibility` 调它（12.4） | 护栏把 Temp 降成 review 后，`how` 里仍有 delete（意思是“挑出可清理的再删”），master 现在的 `tier_gate` 会放行“review + delete”。只看档位不够，必须有一个字段说“别整块删”。`plan.rs` 调的 `explain::explain` 合并后就是带护栏的链，不需要改走 `explain_full` |
+| 65 | “可清理 23.83 GB”在根目录找不到 | `tier_summary` 多给一份全盘可清理清单 `safe_items`（每条 safe 规则的每一处命中，按字节排，最多 300 项，标 `mixed` / `tool_only`）；点“可清理”卡片打开这份清单，点一行跳到它所在的文件夹并选中；其余三张卡还是只筛这一层 | 冷启动评审的原话“点卡片打开全盘可清理清单”。其余三张卡没改，是因为评审只点了“可清理”这张；保留 / 需判断的全盘清单会很长，意义也小 |
+| 66 | 被护栏降档的文件夹在副标题里怎么写 | `mixed = true` 的写成“Temp 里的缓存 5.14 GB”，清单里再标“整个文件夹标‘需判断’”并写一句“别整个删，可清理的是其中这 X” | 评审给的写法。“缓存”对 Temp 不完全准（Temp 里是临时文件），为了短没区分 |
+| 67 | 方块图里“保留”和“读不了”都用斜纹 | 保留改**纯色 + 右上角小锁**（块至少 26×16 像素才画锁），系统保留同样；斜纹只留给“读不了 / 推算”；图例分别画“保留（带锁）”“读不了（斜纹）” | 冷启动评审严重项的第一个改法 |
+| 68 | “只高亮可清理”时整张图变灰 | 本身不是可清理、但里面有可清理内容的块描**绿边**（按全盘清单的路径前缀判断）；图下写“绿色 = 可清理；绿框 = 里面有可清理的东西”，这一层一个都没有时写“可清理的都在更深的文件夹里”，都带“看全盘可清理清单”链接 | 清单只有前 300 项，更小的那些所在的块可能不描边（这些合起来字节很少） |
+| 69 | 产品评审要求“先把 phase-b 合进 master” | **仍不合并**（任务硬约束：不合并、不进主目录，另一个会话正在 master 上做阶段 D）。把“批准合并”写成用户醒来第一件事；合并前能做的都做了：删除闸门（决定 64）、`git merge-tree` 试合并写出 9 个文件的逐个处理办法（12.4） | — |
+| 70 | 修完拿真实 C 盘一跑，`cargo-registry`、`uv-cache` 也变成了“需判断” | 两处误判都修掉：① 包管理器缓存（`PACKAGE_CACHE_RULES`：npm / pnpm / yarn / bun / pip / uv / conda pkgs / cargo / go / gradle / nuget / playwright / electron 下载缓存 / VS Code 扩展包缓存）里，**按文件名认的陷阱**（文档、密钥、合并的小文件）不算，聊天数据、conda 环境、虚拟磁盘、代码仓库照查；② 版本库标记只认 `.git` 文件夹或**非空**的 `.git` 文件 | 实测原因：openssl 源码包里的测试证书 `test\identity.p12`、`intermediate-ca.key`，matplotlib 包里的 `mpl-data\images\*.pdf`；uv 在 `sdists-v9` 里放了一个**空的** `.git` 文件，专门让 git 不把缓存当仓库。Temp、INetCache 不在名单里，照查 |
 
 ## 8. B-1：规则库骨架 + 首批规则（S22 补做，分支 `phase-b`）
 
@@ -419,7 +434,7 @@ C:\Windows (Rest)           => 错误“在扫描结果里找不到：C:\Windows
 - 合并：master 现在是另一轮会话提交的阶段 D（eb911fb），也改了 `DetailPanel.vue`、`App.vue`、`styles.css`、`lib.rs`；`git merge phase-b` 这几个文件**一定会冲突**，要手动合：保留阶段 D 的清理按钮 / 抽屉，同时保留 B-4 的六项标签、工具名、图例、浅色主题和 `explain` 命令。
 - 规则库：`AppData\Local` 里大量小的未知项、coverage.md 末尾的待办。
 
-## 12. 评审与修复（第 1 轮：产品 39 分、安全 31 分、冷启动 31 分）
+## 12. 评审与修复（第 1 轮：产品 39、安全 31、冷启动 31；第 2 轮：产品 42、安全 36、冷启动 36）
 
 三份评审原文在 `D:\desk\claudex\_ops\S22\评审-r1-{product,safety,cold-start}.md`。先严重后一般。提交：a4383f6（安全核心）、53c27b7（AI 脱敏 / 已知文件夹 / 未认出文案 / CLI）、8d944a9（界面）、以及本节所在的提交（截图、文档、覆盖率）。
 
@@ -516,9 +531,76 @@ C:\Windows (Rest)           => 错误“在扫描结果里找不到：C:\Windows
 
 ### 12.4 下一阶段从哪接
 
-1. 用户确认后合并 phase-b → master（冲突见 12.1 产品第 7 条），合完在 master 上重新跑全部测试、发布版构建、截图、覆盖率，并核对阶段 D 的删除按钮：keep 没有按钮；护栏降级后的 review 不进批量删；批量删只选 safe + delete。
-2. 覆盖率：给前 50 里的容器补“里面主要是什么”的动态说明，或补更具体的规则，把叶子覆盖率提上去。
-3. 让第 2 轮评审复跑安全探针 `D:\desk\claudex\_ops\S22\r1-safety-probe`（它依赖的 API 没变）。
+**用户醒来后第一件事：决定是否批准“把 phase-b 合并到 master”。** 第 2 轮产品评审的严重项就是这个：master 上已经提交了阶段 D（eb911fb），能删东西，可它用的是没有护栏的旧解释引擎（master 上 grep `guard_rule_hit` / `enforce_guards` 都是 0 处）。第 1 轮安全评审的两条严重问题在 master 上都还在：Temp / INetCache 里的微信、git、conda、vhdx 继承成 safe；TEMP=`D:\` 时整个 D 盘 safe。这一轮任务仍然规定“不合并、不动主目录”（另一个会话正在 master 上做阶段 D），所以只做了合并前能做的准备（决定 64、68）。
+
+**合并时要改的三处（都在 master 那边的文件里）**
+
+1. `crates/diskwhy-core/src/action/preflight.rs` 的 `tier_gate`：在现有判断前加 `if let Some(why) = crate::explain::delete_block_reason(e) { return Some(why) }`。`delete_block_reason` 拦下：AI / 未认出、保留、how 里没有 delete、护栏标了 `hold` 的项（“里面混着像是你的数据的东西 / 下层有需判断的规则 / 内容太多没看全 / 名字像缓存但格式不对”）。现在 master 的 `tier_gate` 会放行“review 且 how 含 delete”，合并后被护栏降成 review 的 Temp 仍有 delete，不加这一句就能整块删掉里面的文档。
+2. `action/plan.rs` **不用**改走 `explain_full`：它调的 `explain::explain` 合并后就是带护栏的那条链（`explain` → `explain_with_inherited` → `guard_rule_hit` → `enforce_guards`），`explain_full` 只多一步问 AI，而 AI 的结果本来就不能删。要核对的是 `rule_consistent`：护栏把某一项改成“启发式陷阱说明”后，`expect_rule` 对不上会拒绝，这是想要的结果。
+3. 前端 `src/api.ts` 的 `cartEligibility`（master 新加的）：在 `e.how.includes("delete")` 判断前加 `if (e.hold) return { ok: false, reason: e.hold }`。以后如果做“一键加入全部可清理”，只选 `explain::batch_deletable` 为真的项（= safe、how 含 delete、没有 hold），全盘清单里 `mixed = true` 的那几处不能整块加。
+
+合并后还要：把 `r2_tests::delete_gate_blocks_every_item_touching_a_trap` 的陷阱语料原样喂给 `action::plan::build_plan`（用 `ScanResult` 包一下内存树），断言碰到陷阱的每一项都是 `blocked`；跑 master 的 `action_tests`（它们的测试树里如果 Temp 下面有文档，预期会变）；重新跑发布版构建、截图、覆盖率。
+
+**9 个两边都改了的文件，逐个怎么处理**（`git merge-tree --write-tree --name-only master phase-b`，只算不写，任何分支和工作区都没动；以 phase-b @ 9b8940f、master @ eb911fb 为准）
+
+| # | 文件 | 试合结果 | 怎么处理 |
+|---|---|---|---|
+| 1 | `Cargo.toml` | **冲突**（windows-sys 的 features 列表） | 取并集：master 的 `Win32_System_RestartManager`、`Win32_System_Diagnostics_Debug` 加 phase-b 的 `Win32_System_Com`（两边都有 Com，保留一个）。合完 `cargo check` 全部 crate |
+| 2 | `README.md` | **冲突**（两处：开头功能介绍、命令行参数一行） | 开头按“扫描 → 解释 → 清理（阶段 D）”重写一段，两边的内容都留；命令行那行用 phase-b 的（多了 `--report`、`--redact`、叶子覆盖率），再补回 master 那行里 phase-b 没有的 `--json-depth`、`--mode`、`--threads`、`--keep-files`、`--snapshot`、`--from` |
+| 3 | `crates/diskwhy-core/src/win.rs` | 自动合并 | master 只是把 `wide` / `long_path` / `from_wide_nul` / `file_key` 改成 `pub(crate)` 给阶段 D 用；phase-b 加了 `known_personal_folders`（`SHGetKnownFolderPath`）。合完核对 `use windows_sys::…` 没有重复导入 |
+| 4 | `src-tauri/src/lib.rs` | 自动合并 | master 加了清理相关的命令，phase-b 加了 `explain` / `ask_ai` 等。合完核对 `invoke_handler!` 列表两边的命令都在、没有重名；`ScanSummary.tiers` 现在多了 `safe_items`，阶段 D 不受影响 |
+| 5 | `src/App.vue` | **冲突**（三处：import、欢迎页、页面底部的对话框） | import：两边都留（`CleanupDrawer` / `PreviewDialog` / `QuarantineDialog` 和 `SafeListDialog`、`SafeItem` 类型）。欢迎页：用 phase-b 的“扫完后每个文件夹都会标上颜色……”加折叠的口径说明，再把 master 那句“只有你把东西加入清理清单、看过预览并确认之后才会删除（默认进回收站）”接在第一段后面。底部：两边的对话框都留。另外核对 `SafeListDialog` 的“跳过去”和购物车抽屉不会同时占住右侧 |
+| 6 | `src/api.ts` | 自动合并 | 合完手动加 `cartEligibility` 里的 `hold` 判断（见上面第 3 条）。`Explanation.hold`、`SafeItem`、`TierSummary.safe_items` 是 phase-b 新加的类型，master 没碰 |
+| 7 | `src/components/DetailPanel.vue` | **冲突**（两处：import、面板底部） | import 取并集（master 的 `cartEligibility` / `getGuidance` / `openSystemSettings` / `Guidance`，phase-b 的 `askable` / `explainPath` / `sourceKey` / `SOURCE_HINT` / `SOURCE_SHORT` / `TierChip`）。底部：**删掉** phase-b 那句“这里只解释、不删除：没有删除按钮”（合并后有删除了），保留 phase-b 的 `fetchError` 提示；有 `hold` 的项在“加入清理清单”按钮旁边写出 `hold` 原因 |
+| 8 | `src/components/TreemapView.vue` | 自动合并 | master 只改了一处（扫描根不是卷根时不画“未归属”块），和 phase-b 的改动不在一起。合完核对这一处还在；方块图“保留”是纯色 + 小锁、斜纹只给“读不了”（第 2 轮冷启动严重项），别被 master 的样式盖回去 |
+| 9 | `src/styles.css` | **冲突**（一大块：两边都在文件末尾追加了几百行） | 两块都保留，phase-b 的放后面；然后查重名选择器：`.modal*`、`.chip-*`、`.dot-*`、`.tier-cell`、`.linkish`。phase-b 删过深色主题（决定 38），master 的 styles.css 里还有 3 处 `prefers-color-scheme`（其中有原来的深色段），合并后按 phase-b 删掉，并看阶段 D 的抽屉、预览对话框在浅色下对比度够不够 |
+
+其他没冲突、但合并后要看一眼的：master 新增的 `action/*.rs` 用到 `Explanation` 的地方（phase-b 给它加了 `hold` 字段，只有字面量构造会编译失败，master 里没有这种写法）；`Node` 加了 `rest_flags` 字段（master 里没有 `Node { … }` 字面量，已核对 14 个文件）。
+
+**之后**
+
+1. 覆盖率：给前 50 里的容器补“里面主要是什么”的动态说明，或补更具体的规则，把叶子覆盖率提上去。
+2. 第 2 轮三份评审里的一般项和建议（12.5 最后一段列了没做的）。
+3. 让第 3 轮评审复跑探针 `D:\desk\claudex\_ops\S22\r2-safety-probe`（R、T、N 三节现在应该都不是 safe）。
+
+### 12.5 第 2 轮评审（产品 42、安全 36、冷启动 36）：严重项修复
+
+三份评审原文：`D:\desk\claudex\_ops\S22\评审-r2-{product,safety,cold-start}.md`；安全探针输出 `R2-safety-probe.txt`。这一轮只修严重项（5 条），一般项和建议没动，列在最后。决定 60–70。提交：9b8940f（代码）和本节所在的提交（误判修正、截图、文档）。
+
+| # | 来源 | 问题 | 怎么改的 | 怎么验证 |
+|---|---|---|---|---|
+| 1 | 产品 严重 1 | master 上的阶段 D 能删东西，但用的是没有护栏的旧引擎；两边都改了 9 个文件 | **没合并**（任务硬约束，决定 69）。做了合并前能做的：① `Explanation.hold` + `explain::delete_block_reason` / `batch_deletable`，合并时 master 的 `tier_gate` 和前端 `cartEligibility` 调它（决定 64）；② 12.4 写了逐文件的冲突处理清单和合并后要改的三处 | `r2_tests::delete_gate_blocks_every_item_touching_a_trap`：第 1 轮陷阱语料 + 这一轮的 R / N 类陷阱，树里**每一项**（文件夹、文件、其余小文件合计）只要整块删会碰到陷阱，`delete_block_reason` 必须给原因、`batch_deletable` 必须是 false（核对了 40 多项）；真正的缓存 / 临时文件仍能批量删。`delete_gate_temp_at_drive_root`：TEMP=`D:\` 时 D 盘上的微信、虚拟机、代码仓库、文档一律不能整块删，D 盘 safe = 0。**没做**：把语料喂给 master 的 `action::plan::build_plan`（phase-b 里没有这个模块，合并后做） |
+| 2 | 安全 严重 S1 | 护栏看不全时直接放行：(A) 文档被合并进“其余 N 个文件”看不见；(B) 往下找超过 3 万节点就不找了，照样 safe | (A) 扫描器合并时按名字记 `Node.rest_flags`（决定 60），新增密钥类陷阱（决定 61）；(B) 上限提到 100 万，超过就 safe → review 并记 `hold`（决定 62）。`tier_summary` 同步把这些字节改记 | `s1a_real_scan_docx_in_rest_is_not_safe`：探针 R 节原样（60 个 64 KB 的 .tmp + 1 个 20 KB 的 docx），**真实扫描**，docx 确实被合并进其余；Temp 现在是“需判断”、`hold` 有值、汇总 `guard:hidden-files` = 其余那一项的字节；对照组（没有 docx）Temp 仍是 safe。`s1a_unchecked_rest_is_review`：没记名字的其余 → review；只有“看过”标志 → safe；有密钥 / 虚拟磁盘 → keep。`s1b_truncated_search_demotes_safe`：探针 T 节，上限调成 3 万时 Temp 是 review 并写明“太多”；默认上限能看全，能腾多少扣掉陷阱；原样的 1 GB vhdx + WeChat Files → 整个 Temp 按保留，汇总 safe 正好 3500 万字节 |
+| 3 | 安全 严重 S2 | safe 的上层吞掉下层 review 规则的字节：Temp 里的 `Rar$EX…\设计稿-改.psd`、INetCache 里的 `Content.Outlook` | 往下找陷阱时查“下层精确命中了非 safe 规则”（决定 63）：上层降 review、能腾多少扣掉、列出路径、记 `hold`；汇总里把上层那一处标 `mixed` | `s2_temp_with_only_rar_psd`（任务点名的例子：Temp 里只有 Rar$EX + .psd 和一个普通 .tmp）：Temp 是 review、能腾 = 只有那个 .tmp、说明里列出 `Rar$EXa77.888`、`hold` 有值；.tmp 本身仍 safe 且能批量删；汇总 safe = 10,000,000、review = 30,000,000。`s2_probe_n_nested_rules`：探针 N 节原样，Temp 和 INetCache 都是 review，汇总 safe = 8,100,000、review = 42,000,000（和评审算的一致） |
+| 4 | 冷启动 严重 1 | 方块图里“保留”的斜纹和“读不了（斜纹）”撞了，AppData 95 GB 像是读不了 | 保留改纯色 + 右上角小锁，斜纹只留给读不了 / 推算；图例分开画“保留（带锁）”“读不了（斜纹）”（决定 67） | 截图 `r2/phaseB-r2-1`：Users / AppData 等保留块是纯蓝灰 + 锁，只有“无权限（推算）”是斜纹；图例两项分开 |
+| 5 | 冷启动 严重 2 | “可清理 23.83 GB”在根目录找不到；卡片写“最大：Temp”，列表里 Temp 却是“需判断” | `tier_summary.safe_items`：全盘可清理清单；点“可清理”卡片打开清单（按大小、带路径，点一行跳过去）；副标题写“Temp 里的缓存 X”；“只高亮可清理”时含可清理内容的块描绿边并提示（决定 65、66、68） | 截图 `r2/phaseB-r2-2`（根目录描绿边 + 提示放在最前面）、`r2-3`（清单：第一行“Temp 里的缓存 5.99 GB · 整个文件夹标‘需判断’”并写明别整个删）、`r2-4`（点第一行后跳到 `AppData\Local` 并选中 Temp）。测试里对 R / T / N 三种情况断言 Temp 在清单里 `mixed = true` |
+
+**修的过程中在真实 C 盘上发现、一起修掉的误判**（决定 70）：第一版修完拿真实 C 盘一跑，`cargo-registry`（openssl 源码包里的测试证书 `.p12`）、`uv-cache`（matplotlib 包里的 PDF 图标，以及 uv 放的**空** `.git` 文件）也变成了“需判断”。改成：包管理器缓存里不查按文件名认的陷阱；版本库标记只认 `.git` 文件夹或非空 `.git` 文件。测试 `package_caches_ignore_bundled_docs_and_test_keys`（同时断言 npm-cache 里的虚拟磁盘照样拦）。
+
+**变异检查**（改坏一处，看测试能不能抓到，改完即恢复）：去掉“下层非 safe 规则”检查 → `s2_*` 两个失败；去掉“其余小文件”陷阱 → `s1a_*` 两个 + 删除闸门测试失败；看不全时不降档 → `s1b_*` 失败；空 `.git` 也算仓库 → `package_caches_*` 失败。
+
+**怎么验证的**
+
+- `cargo test -p diskwhy-core -p diskwhy-cli`：**97 个通过，0 失败，2 个忽略**（第 1 轮后 87 个；新增 `crates/diskwhy-core/tests/r2_tests.rs` 10 个）。日志 `D:\desk\claudex\_ops\S22\R2fix-test.log`。`cargo check -p diskwhy`（Tauri 壳）通过；`vue-tsc --noEmit` 通过；`vitest run` 7 个通过。
+- 发布版：`npm run tauri build -- --no-bundle` 通过（2 分 25 秒），`cargo build --release -p diskwhy-cli` 通过；这一轮的两个 exe 另存在 `target\tmp\r2fix\`。
+- 真实 C 盘（普通权限，只读）：`diskwhy-cli explain C:\ --top 50 --report R2fix-report.json --redact`，现扫 54.6 秒。全盘各档：可清理 **24.73 GB** ｜ 需判断 58.47 GB ｜ 保留 67.56 GB ｜ 规则没覆盖 20.97 GB；护栏改记 1.60 GB（1.57 GB 是格式不对的“像 Chromium 缓存”的文件夹，30.11 MB 是 Temp 里的文档，1.93 MB 是“其余小文件”里有文档；后两类最大的一处分别在本会话和上一轮评审探针放在 Temp 里的临时目录里）。可清理一共 501 处，整体标“需判断”的只有 Temp（5.95 GB）。可清理比第 1 轮的 23.83 GB 多了约 0.9 GB：这一轮没有规则改档，是这几个小时里 Temp 等缓存本身长了（Temp 从 5.14 GB 涨到 5.95 GB）。汇总文件 `R2fix-report.json`（已脱敏）、`R2fix-tiers.txt`。
+- 截图：发布版 GUI，用 WebView2 远程调试端口（CDP）点按钮截图，视口 1280×800 × 1.25（脚本 `_ops/S22/R2fix-shots.mjs`，日志 `R2fix-shots.log`）。页面文字里的用户名换成 `<用户>`（每张都检查过页面里不再含用户名）；方块图 canvas 上 `Users` 下一层的用户名方块标题用马赛克盖住（`r2-1`～`r2-3`）。这次 WebView2 用单独的数据目录（`WEBVIEW2_USER_DATA_FOLDER` 指到 scratchpad），exe 改了名字启动，因为另一个会话的阶段 D 程序同时在跑，第一次截图时我的窗口被一起关掉了。`%LOCALAPPDATA%\DiskWhy\settings.json` 不存在（没保存过设置）。
+
+| 文件（`docs/screenshots/r2/`） | 内容 |
+|---|---|
+| `phaseB-r2-1-root-keep-lock.png` | 默认视图：保留块纯色 + 小锁，只有“无权限（推算）”是斜纹；图例“保留（带锁）”“读不了（斜纹）”分开；可清理卡片副标题“最大：Temp 里的缓存 5.99 GB、…”和“看全盘清单 ›” |
+| `phaseB-r2-2-root-highlight-safe.png` | 勾“只高亮可清理”：Users、AppData、Windows 等含可清理内容的块描绿边；图下第一句“绿色 = 可清理；绿框 = 里面有可清理的东西。看全盘可清理清单” |
+| `phaseB-r2-3-safe-list.png` | 点“可清理”卡片：全盘清单，500 多处里列出最大的 300 处；Temp 那行标“整个文件夹标‘需判断’”，写明别整个删 |
+| `phaseB-r2-4-reveal-temp.png` | 点清单第一行：跳到 `AppData\Local`、选中 Temp，右侧详情“其中约 6.00 GB 可以清理；另有 23 处（共 32.05 MB）看起来是你的数据” |
+
+**没做 / 没验证的**
+
+- **没合并到 master**，所以阶段 D 的删除按钮实际会不会被 `hold` 拦住，没法在真实界面上验证；只在 phase-b 里用 `delete_block_reason` 测了闸门本身。
+- S1(B) 没做评审说的“更好的办法”（扫完自下而上算一次子树陷阱、去掉上限），只把上限提到 100 万并在超过时降档（决定 62）。没有统计真实 C 盘上各个 safe 目录的节点数；“超过上限降档”这条只在测试里跑过（真实 C 盘上整体降档的只有 Temp，原因是里面有文档，不是超过上限）。
+- 旧版本存的快照里没有 `rest_flags`，打开后凡是有“其余小文件”的 safe 目录都会变成“需判断”（按“看不到”处理）；重新扫描就好。没专门拿旧快照实测。
+- 包管理器缓存的名单（决定 70）是按本机见到的两处误判加上同类规则列的，不是逐条核过每种包管理器的目录结构。
+- 全盘清单只列前 300 处；“只高亮可清理”的绿边也只按这 300 处判断，更小的可清理项所在的块可能不描边。其余三张卡片还是只筛当前这一层。
+- 第 2 轮三份评审的一般项和建议这一轮都没动，包括：安全 G1（TEMP 设在个人文件夹里时汇总仍算 safe）、G2（AI 地址用 `@` 能绕过 https 检查，**这条有真实风险，建议下一轮先修**）、G3（问 AI 问单个文件时会发完整文件名）、G4（Dropbox / iCloud / SharePoint 同步盘没保护）、G5（`Temp12_*.zip`、`Rar$DR*` 等签名）、G6（规则正好命中一个链接时显示“可清理 0 B”）、G7（用户规则目录能放进范围很大的 safe 模式）、J1–J5；冷启动 3（“正在收尾”出现太早）、4（“保留”和“系统保留”名字、颜色太近）、5（副标题只写一个）；产品 2（第四张卡的口径）、4（叶子覆盖率 58.9%）、5（hiberfil 规则的大小和后果）及建议 6–10。
 
 ---
 

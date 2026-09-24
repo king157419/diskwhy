@@ -1343,6 +1343,32 @@ pub const DOC_EXTS: &[&str] =
 pub const SECRET_EXTS: &[&str] = &["kdbx", "kdb", "ppk", "pfx", "p12", "jks", "keystore"];
 /// 按文件名认的密钥 / 钱包（小写，完整文件名）。
 const SECRET_NAMES: &[&str] = &["wallet.dat", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
+/// 包管理器的缓存（里面全是下载来的第三方包）：包里自带的 PDF 图标、测试用的证书 / 密钥（比如 openssl 的
+/// `test\identity.p12`、matplotlib 的 `mpl-data\images\*.pdf`）不是用户的文件，按文件名认的陷阱（文档、密钥、
+/// 其余小文件里有这些）在这些规则下不算；聊天数据、conda 环境、虚拟磁盘、代码仓库照查。
+/// 真实 C 盘上这几条规则被文件名陷阱误判过（第 2 轮修复时发现，见 PHASE_B.md 决定 70）。
+pub const PACKAGE_CACHE_RULES: &[&str] = &[
+    "npm-cache",
+    "pnpm-store",
+    "yarn-cache",
+    "bun-cache",
+    "playwright-browsers",
+    "electron-download-cache",
+    "pip-cache",
+    "uv-cache",
+    "conda-pkgs",
+    "cargo-registry",
+    "go-cache",
+    "gradle-cache",
+    "nuget-cache",
+    "vscode-family-cached",
+];
+
+/// 这条规则覆盖的地方要不要查“按文件名认的陷阱”（文档、密钥、合并的小文件）。
+pub fn name_traps_apply(rule_id: &str) -> bool {
+    !PACKAGE_CACHE_RULES.contains(&rule_id)
+}
+
 /// 版本库标记：有它就是一个代码仓库，可能有没提交的改动。
 const VCS_MARKERS: &[&str] = &[".git", ".svn", ".hg"];
 /// 往下找陷阱时最多看多少个节点；超过就算“没看全”，safe 降为 review。
@@ -1376,6 +1402,12 @@ fn path_has_chat_dir(path: &str, ctx: &ExplainCtx) -> bool {
     }) && !in_program_files(path, ctx)
 }
 
+/// 版本库标记是不是真的：`.git` 文件夹，或者非空的 `.git` 文件（git worktree / 子模块里写着 gitdir: 指向真正的库）。
+/// uv 等工具会在缓存目录里放一个**空的** `.git` 文件，专门让 git 不把它当仓库，那不算（真实 C 盘上的 uv cache 被这样误判过）。
+fn is_vcs_marker(n: &Node) -> bool {
+    n.kind == NodeKind::Dir || n.logical > 0
+}
+
 /// 是不是密钥 / 密码库 / 钱包文件（只看名字）。
 pub fn is_secret_file(name: &str) -> bool {
     let l = name.to_lowercase();
@@ -1384,7 +1416,8 @@ pub fn is_secret_file(name: &str) -> bool {
 
 /// 单个文件在 `rule_tier` 规则下是不是陷阱：返回 (陷阱名, 改记到的档)。
 /// safe：虚拟磁盘、密钥 → keep，文档 → review；review：只有虚拟磁盘 → keep；keep：不查。
-pub fn file_trap(name: &str, rule_tier: Tier) -> Option<(&'static str, Tier)> {
+/// `names = false`（包管理器缓存，见 [`name_traps_apply`]）时只查虚拟磁盘。
+pub fn file_trap(name: &str, rule_tier: Tier, names: bool) -> Option<(&'static str, Tier)> {
     let e = ext_of(name);
     let vd = VDISK_EXTS.contains(&e.as_str());
     match rule_tier {
@@ -1393,6 +1426,8 @@ pub fn file_trap(name: &str, rule_tier: Tier) -> Option<(&'static str, Tier)> {
         Tier::Safe => {
             if vd {
                 Some(("virtual-disk", Tier::Keep))
+            } else if !names {
+                None
             } else if is_secret_file(name) {
                 Some(("secret-key", Tier::Keep))
             } else if DOC_EXTS.contains(&e.as_str()) {
@@ -1409,7 +1444,7 @@ pub fn rest_flags_of<'a>(names: impl Iterator<Item = &'a str>) -> u8 {
     use crate::model::{REST_CHECKED, REST_DOC, REST_SECRET, REST_VDISK};
     let mut f = REST_CHECKED;
     for n in names {
-        f |= match file_trap(n, Tier::Safe) {
+        f |= match file_trap(n, Tier::Safe, true) {
             Some(("virtual-disk", _)) => REST_VDISK,
             Some(("secret-key", _)) => REST_SECRET,
             Some(_) => REST_DOC,
@@ -1420,7 +1455,8 @@ pub fn rest_flags_of<'a>(names: impl Iterator<Item = &'a str>) -> u8 {
 }
 
 /// Rest（其余小文件合计）在 `rule_tier` 规则下是不是陷阱：返回 (陷阱名, 改记到的档, 里面有什么)。
-pub fn rest_trap(node: &Node, rule_tier: Tier) -> Option<(&'static str, Tier, String)> {
+/// `names = false`（包管理器缓存）时只看虚拟磁盘标志。
+pub fn rest_trap(node: &Node, rule_tier: Tier, names: bool) -> Option<(&'static str, Tier, String)> {
     use crate::model::{REST_CHECKED, REST_DOC, REST_SECRET, REST_VDISK};
     if node.kind != NodeKind::Rest || node.files == 0 {
         return None;
@@ -1440,6 +1476,7 @@ pub fn rest_trap(node: &Node, rule_tier: Tier) -> Option<(&'static str, Tier, St
     match rule_tier {
         Tier::Keep => None,
         Tier::Review => (f & REST_CHECKED != 0 && f & REST_VDISK != 0).then(|| ("hidden-files", Tier::Keep, kinds)),
+        Tier::Safe if !names => (f & REST_CHECKED != 0 && f & REST_VDISK != 0).then(|| ("hidden-files", Tier::Keep, kinds)),
         Tier::Safe => {
             if f & REST_CHECKED == 0 {
                 Some(("unchecked-files", Tier::Review, String::new()))
@@ -1455,8 +1492,8 @@ pub fn rest_trap(node: &Node, rule_tier: Tier) -> Option<(&'static str, Tier, St
 }
 
 /// 只看这一项本身（不往下找）是不是用户数据。`rule_tier` 是覆盖它的规则的档位：
-/// safe 查全部；review 只查虚拟磁盘文件；keep 不查。
-pub fn trap_here(path: &str, node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> Option<Trap> {
+/// safe 查全部；review 只查虚拟磁盘文件；keep 不查。`names` 见 [`name_traps_apply`]。
+pub fn trap_here(path: &str, node: &Node, rule_tier: Tier, names: bool, ctx: &ExplainCtx) -> Option<Trap> {
     let mk = |name: &'static str, tier: Tier, note: String| {
         Some(Trap { name, tier, path: path.trim_end_matches('\\').to_string(), bytes: node.allocated, rule: None, note })
     };
@@ -1464,12 +1501,12 @@ pub fn trap_here(path: &str, node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> 
         return None;
     }
     match node.kind {
-        NodeKind::Rest => rest_trap(node, rule_tier).and_then(|(n, t, k)| mk(n, t, k)),
+        NodeKind::Rest => rest_trap(node, rule_tier, names).and_then(|(n, t, k)| mk(n, t, k)),
         NodeKind::File => {
             if rule_tier == Tier::Safe && path_has_chat_dir(path, ctx) {
                 return mk("chat-data", Tier::Keep, String::new());
             }
-            file_trap(&node.name, rule_tier).and_then(|(n, t)| mk(n, t, String::new()))
+            file_trap(&node.name, rule_tier, names).and_then(|(n, t)| mk(n, t, String::new()))
         }
         NodeKind::Dir => {
             if rule_tier != Tier::Safe {
@@ -1478,7 +1515,7 @@ pub fn trap_here(path: &str, node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> 
                 mk("chat-data", Tier::Keep, String::new())
             } else if has_child(node, "conda-meta") {
                 mk("conda-env", Tier::Keep, String::new())
-            } else if VCS_MARKERS.iter().any(|m| has_child(node, m)) {
+            } else if VCS_MARKERS.iter().any(|m| child(node, m).is_some_and(is_vcs_marker)) {
                 mk("source-repo", Tier::Review, String::new())
             } else {
                 None
@@ -1491,7 +1528,7 @@ pub fn trap_here(path: &str, node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> 
 ///
 /// safe 规则下还查“下层文件夹精确命中了 review / keep 规则”（第 2 轮安全评审 S2）：只拿能在这棵子树里
 /// 命中的非 safe 模式去比，每往下一层再按前缀剪一次，大多数缓存目录一个候选都没有。
-pub fn traps_below(node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> (Vec<Trap>, bool) {
+pub fn traps_below(node: &Node, rule_tier: Tier, names: bool, ctx: &ExplainCtx) -> (Vec<Trap>, bool) {
     let mut out = Vec::new();
     if rule_tier == Tier::Keep || node.kind != NodeKind::Dir {
         return (out, false);
@@ -1508,12 +1545,13 @@ pub fn traps_below(node: &Node, rule_tier: Tier, ctx: &ExplainCtx) -> (Vec<Trap>
         Vec::new()
     };
     let mut visited = 0usize;
-    let truncated = walk_traps(node, rule_tier, ctx, &mut segs, &nested, &mut visited, &mut out);
+    let truncated = walk_traps(node, rule_tier, names, ctx, &mut segs, &nested, &mut visited, &mut out);
     (out, truncated)
 }
 
 /// [`traps_below`] 的递归部分。返回 true 表示超过了 `ctx.trap_visit`（没看全）。
-fn walk_traps(d: &Node, rule_tier: Tier, ctx: &ExplainCtx, segs: &mut Vec<String>, nested: &[u32], visited: &mut usize, out: &mut Vec<Trap>) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn walk_traps(d: &Node, rule_tier: Tier, names: bool, ctx: &ExplainCtx, segs: &mut Vec<String>, nested: &[u32], visited: &mut usize, out: &mut Vec<Trap>) -> bool {
     for c in &d.children {
         *visited += 1;
         if *visited > ctx.trap_visit {
@@ -1546,15 +1584,15 @@ fn walk_traps(d: &Node, rule_tier: Tier, ctx: &ExplainCtx, segs: &mut Vec<String
                 continue;
             }
         }
-        let over = if let Some(t) = trap_here(&p, c, rule_tier, ctx) {
+        let over = if let Some(t) = trap_here(&p, c, rule_tier, names, ctx) {
             out.push(t);
             false
         } else if c.kind == NodeKind::Dir {
             if track {
                 let child_nested: Vec<u32> = nested.iter().copied().filter(|&i| ctx.rules.patterns[i as usize].1.could_match_below(segs)).collect();
-                walk_traps(c, rule_tier, ctx, segs, &child_nested, visited, out)
+                walk_traps(c, rule_tier, names, ctx, segs, &child_nested, visited, out)
             } else {
-                walk_traps(c, rule_tier, ctx, segs, &[], visited, out)
+                walk_traps(c, rule_tier, names, ctx, segs, &[], visited, out)
             }
         } else {
             false

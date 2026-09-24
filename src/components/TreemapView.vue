@@ -565,12 +565,13 @@ defineExpose({ redraw: schedule });
       <div v-else-if="!data" class="tm-loading muted">没有数据</div>
     </div>
     <div class="tm-foot muted small">
-      <span>{{ topCount }} 个根层块 · 布局+绘制 {{ renderMs.toFixed(1) }} ms</span>
-      <span v-if="pseudoBlocks.length">斜纹块 = 读不了的部分（无权限 / 推算），点一下看解释；带锁的是“保留”</span>
+      <!-- 只高亮可清理时这句最要紧，放最前面，窄窗口也不会被截掉 -->
       <span v-if="highlightSafe && !loading && data" class="tm-safe-hint">
         {{ safeVisible ? "绿色 = 可清理；绿框 = 里面有可清理的东西。" : "这一层没有可清理的块，可清理的都在更深的文件夹里。" }}
         <button type="button" class="linkish" @click="emit('showSafe')">看全盘可清理清单</button>
       </span>
+      <span>{{ topCount }} 个根层块 · 布局+绘制 {{ renderMs.toFixed(1) }} ms</span>
+      <span v-if="pseudoBlocks.length">斜纹块 = 读不了的部分（无权限 / 推算），点一下看解释；带锁的是“保留”</span>
       <span v-if="summary.buckets.dedup_enabled && summary.buckets.hardlink_dedup + summary.buckets.mapped_dedup > 0">
         已去重 {{ humanBytes(summary.buckets.hardlink_dedup + summary.buckets.mapped_dedup) }}（硬链接 / 商店应用目录映射，只算一次）
       </span>

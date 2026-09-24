@@ -389,6 +389,7 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
     }
     let Some(rule) = ctx.rules.by_id(id) else { return e };
     let rule_what = rule.what.clone();
+    let names = heuristics::name_traps_apply(&rule.id);
     let from = inherited_from.clone();
     // review 规则只在“继承来的、而且不是专门讲虚拟机的规则”时才查（商店版 WSL 的 LocalState 挂在
     // store-app-package 下面）；专门为这个位置写的 review 规则（比如 Claude 的虚拟机镜像）已经考虑过里面有什么。
@@ -397,7 +398,7 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
     }
     // “其余小文件合计”：扫描时记下的名字标志里有文档 / 虚拟磁盘 / 密钥，或者根本没记（第 2 轮安全评审 S1）。
     if t.node.kind == NodeKind::Rest {
-        if let Some(tr) = heuristics::trap_here(t.path, t.node, e.tier, ctx) {
+        if let Some(tr) = heuristics::trap_here(t.path, t.node, e.tier, names, ctx) {
             let mut x = heuristics::trap_explanation(&tr, t, &rule_what, ctx);
             x.hold = Some("被合并显示的小文件里可能有你的文件".into());
             return x;
@@ -429,14 +430,14 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
     }
 
     // 2. 自己就是用户数据
-    if let Some(tr) = heuristics::trap_here(t.path, t.node, e.tier, ctx) {
+    if let Some(tr) = heuristics::trap_here(t.path, t.node, e.tier, names, ctx) {
         return heuristics::trap_explanation(&tr, t, &rule_what, ctx);
     }
     // 3. 规则范围内的上层文件夹是用户数据
     if let Some(f) = &from {
         let root_len = seg_len(f);
         for a in t.ancestors.iter().filter(|a| !a.path.is_empty() && seg_len(&a.path) >= root_len) {
-            if let Some(tr) = heuristics::trap_here(&a.path, a, e.tier, ctx) {
+            if let Some(tr) = heuristics::trap_here(&a.path, a, e.tier, names, ctx) {
                 let mut x = heuristics::trap_explanation(&tr, t, &rule_what, ctx);
                 x.notes.insert(0, format!("它在「{}」里面，那里看起来是你的数据。", a.path));
                 return x;
@@ -445,7 +446,7 @@ fn guard_rule_hit(mut e: Explanation, t: &Target, ctx: &ExplainCtx) -> Explanati
     }
     // 4. 下面有用户数据
     if t.node.kind == NodeKind::Dir {
-        let (traps, truncated) = heuristics::traps_below(t.node, e.tier, ctx);
+        let (traps, truncated) = heuristics::traps_below(t.node, e.tier, names, ctx);
         if traps.is_empty() {
             if truncated && e.tier == Tier::Safe {
                 // 看不全就往保守的方向走（第 2 轮安全评审 S1）：不再只加一句提示照样标“可清理”。
@@ -952,21 +953,22 @@ fn guarded(r: &Rule) -> bool {
 
 /// safe / review 规则覆盖、又没有更具体规则的子树：整块记给这条规则，但先把像用户数据的部分挑出来。
 fn settle_guarded(node: &Node, hit: (usize, usize), tier: Tier, acc: &mut SumAcc) {
+    let names = heuristics::name_traps_apply(&acc.rs.rules[hit.0].id);
     for c in &node.children {
         match c.kind {
-            NodeKind::Rest => match heuristics::rest_trap(c, tier) {
+            NodeKind::Rest => match heuristics::rest_trap(c, tier, names) {
                 Some((name, to, _)) => acc.guard_in(hit.1, name, to, c.allocated, &node.path),
                 None => acc.add(Some(hit), c.allocated),
             },
             NodeKind::File => {
                 // 文件的陷阱只看名字（聊天文件夹在上面的文件夹那一层就会被认出来）。
-                match heuristics::file_trap(&c.name, tier) {
+                match heuristics::file_trap(&c.name, tier, names) {
                     Some((name, to)) => acc.guard_in(hit.1, name, to, c.allocated, &format!("{}\\{}", node.path.trim_end_matches('\\'), c.name)),
                     None => acc.add(Some(hit), c.allocated),
                 }
             }
             NodeKind::Dir => {
-                if let Some(tr) = heuristics::trap_here(&c.path, c, tier, acc.ctx) {
+                if let Some(tr) = heuristics::trap_here(&c.path, c, tier, names, acc.ctx) {
                     acc.guard_in(hit.1, tr.name, tr.tier, c.allocated, &c.path);
                 } else if c.children.is_empty() {
                     acc.add(Some(hit), c.allocated);
@@ -992,7 +994,7 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
     for c in &node.children {
         match c.kind {
             NodeKind::Rest => match child_inherited {
-                Some((i, r)) if guarded(&rs.rules[i]) => match heuristics::rest_trap(c, rs.rules[i].tier) {
+                Some((i, r)) if guarded(&rs.rules[i]) => match heuristics::rest_trap(c, rs.rules[i].tier, heuristics::name_traps_apply(&rs.rules[i].id)) {
                     Some((name, to, _)) => acc.guard_in(r, name, to, c.allocated, &node.path),
                     None => acc.add(child_inherited, c.allocated),
                 },
@@ -1013,7 +1015,7 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
                     Some((i, r)) if guarded(&rs.rules[i]) => {
                         // 单个文件：按名字认的陷阱（虚拟磁盘、密钥、文档）
                         let p = format!("{}\\{}", node.path.trim_end_matches('\\'), c.name);
-                        match heuristics::file_trap(&c.name, rs.rules[i].tier) {
+                        match heuristics::file_trap(&c.name, rs.rules[i].tier, heuristics::name_traps_apply(&rs.rules[i].id)) {
                             Some((name, to)) => acc.guard_in(r, name, to, c.allocated, &p),
                             None => acc.add(hit, c.allocated),
                         }
@@ -1069,7 +1071,7 @@ fn walk_summary(node: &Node, segs: &mut Vec<String>, active: &[u32], inherited: 
                 if let Some((i, _)) = eff {
                     let tier = rs.rules[i].tier;
                     if guarded(&rs.rules[i]) {
-                        if let Some(tr) = heuristics::trap_here(&c.path, c, tier, acc.ctx) {
+                        if let Some(tr) = heuristics::trap_here(&c.path, c, tier, heuristics::name_traps_apply(&rs.rules[i].id), acc.ctx) {
                             let root = match own {
                                 Some(o) if rs.rules[o].scope == Scope::Tree => usize::MAX,
                                 _ => child_inherited.map(|h| h.1).unwrap_or(usize::MAX),

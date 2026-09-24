@@ -70,6 +70,59 @@ struct Counts {
     unknown_pct: f64,
     /// (规则 + 启发式) / 总数
     coverage_pct: f64,
+    /// 叶子覆盖率（按字节，第 1 轮产品评审第 3 条）：每一行只算“没被更具体的行覆盖”的那部分字节，
+    /// 看其中多少得到了非容器的说明（规则的非容器命中、继承、启发式；容器规则、AI、未知不算）。
+    leaf_bytes_total: u64,
+    leaf_bytes_covered: u64,
+    leaf_coverage_pct: f64,
+}
+
+/// 按字节的叶子覆盖率：`rows` 是参与统计的行（路径 + 大小 + 解释）。
+/// 每行的“独占字节” = 自己的大小 − 直接嵌在它里面的其他行（最近的那一层）的大小。
+fn leaf_coverage(rows: &[&Row], ctx: &ExplainCtx) -> (u64, u64) {
+    let lower: Vec<String> = rows.iter().map(|r| r.path.trim_end_matches('\\').to_lowercase()).collect();
+    let mut exclusive: Vec<i128> = rows.iter().map(|r| r.allocated as i128).collect();
+    for (j, pj) in lower.iter().enumerate() {
+        // 找最近的上层行（路径最长的那个前缀）
+        let parent = lower
+            .iter()
+            .enumerate()
+            .filter(|(i, pi)| *i != j && pj.len() > pi.len() && pj.starts_with(pi.as_str()) && (pi.ends_with(':') || pj.as_bytes()[pi.len()] == b'\\'))
+            .max_by_key(|(_, pi)| pi.len())
+            .map(|(i, _)| i);
+        if let Some(i) = parent {
+            exclusive[i] -= rows[j].allocated as i128;
+        }
+    }
+    let mut total = 0u64;
+    let mut covered = 0u64;
+    for (k, r) in rows.iter().enumerate() {
+        let x = exclusive[k].max(0) as u64;
+        total += x;
+        let e = &r.explanation;
+        let ok = match &e.source {
+            Source::Rule { .. } => !is_container(e, ctx),
+            Source::Heuristic { .. } => true,
+            Source::Llm { .. } | Source::Unknown => false,
+        };
+        if ok {
+            covered += x;
+        }
+    }
+    (total, covered)
+}
+
+fn pretty_json<T: Serialize>(v: &T, redact: bool, user: &str) -> Result<String, String> {
+    let s = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+    Ok(if redact { redact_json(&s, user) } else { s })
+}
+
+/// `--redact`：把 JSON 文本里的 `\\Users\\<用户名>`（JSON 里反斜杠是转义过的）换成 `\\Users\\<用户>`。
+fn redact_json(s: &str, user: &str) -> String {
+    if user.chars().count() < 2 {
+        return s.to_string();
+    }
+    replace_ci(s, &format!("\\\\Users\\\\{user}"), "\\\\Users\\\\<用户>")
 }
 
 fn tier_key(e: &Explanation) -> &'static str {
@@ -241,6 +294,10 @@ pub fn run(r: &ScanResult, args: &Args, target: Option<&str>) {
     c.llm_pct = p(c.llm);
     c.unknown_pct = p(c.unknown);
     c.coverage_pct = p(c.rule_exact + c.rule_inherited + c.heuristic);
+    let (lt, lc) = leaf_coverage(&stat_rows, &ctx);
+    c.leaf_bytes_total = lt;
+    c.leaf_bytes_covered = lc;
+    c.leaf_coverage_pct = if lt > 0 { lc as f64 * 100.0 / lt as f64 } else { 0.0 };
     let tiers = (target_node.kind == NodeKind::Dir).then(|| tier_summary(target_node, &ctx));
 
     // ── 人看的输出 ──
@@ -274,6 +331,12 @@ pub fn run(r: &ScanResult, args: &Args, target: Option<&str>) {
         out.line(format!("{:>17}→ {}{}", "", e.what, e.owner.as_ref().map(|o| format!("（属于：{o}）")).unwrap_or_default()));
     }
     out.line("");
+    out.line(format!(
+        "叶子覆盖率（按字节，只算没被更具体的行覆盖的部分）：{:.1}%（{} / {} 得到了非容器的说明）",
+        c.leaf_coverage_pct,
+        human_bytes(c.leaf_bytes_covered),
+        human_bytes(c.leaf_bytes_total)
+    ));
     out.line(format!(
         "统计（{} 个目录）：规则 {}（精确 {}，其中容器 {}；继承上层 {}）= {:.1}% | 启发式 {} = {:.1}% | AI {} | 未知 {} = {:.1}% | 规则+启发式 {:.1}%",
         c.total,
@@ -318,16 +381,17 @@ pub fn run(r: &ScanResult, args: &Args, target: Option<&str>) {
     }
 
     // ── 文件输出 ──
+    let user = current_user(&ctx);
     if let Some(p) = &args.json {
-        let res = if p == "-" {
-            let stdout = std::io::stdout();
-            let mut lock = stdout.lock();
-            serde_json::to_writer_pretty(&mut lock, &rows).map_err(|e| e.to_string()).and_then(|_| writeln!(lock).map_err(|e| e.to_string()))
-        } else {
-            std::fs::File::create(p)
-                .map_err(|e| e.to_string())
-                .and_then(|f| serde_json::to_writer_pretty(std::io::BufWriter::new(f), &rows).map_err(|e| e.to_string()))
-        };
+        let res = pretty_json(&rows, args.redact, &user).and_then(|s| {
+            if p == "-" {
+                let stdout = std::io::stdout();
+                let mut lock = stdout.lock();
+                writeln!(lock, "{s}").map_err(|e| e.to_string())
+            } else {
+                std::fs::write(p, s).map_err(|e| e.to_string())
+            }
+        });
         match res {
             Ok(()) if p != "-" => out.line(format!("\nExplanation 数组（{} 项）已写入 {p}", rows.len())),
             Ok(()) => {}
@@ -358,10 +422,7 @@ pub fn run(r: &ScanResult, args: &Args, target: Option<&str>) {
         tiers,
     };
     if let Some(p) = &args.report {
-        match std::fs::File::create(p)
-            .map_err(|e| e.to_string())
-            .and_then(|f| serde_json::to_writer_pretty(std::io::BufWriter::new(f), &report).map_err(|e| e.to_string()))
-        {
+        match pretty_json(&report, args.redact, &user).and_then(|s| std::fs::write(p, s).map_err(|e| e.to_string())) {
             Ok(()) => out.line(format!("报告已写入 {p}")),
             Err(e) => {
                 eprintln!("写报告失败：{e}");
@@ -438,6 +499,20 @@ fn markdown(r: &Report, ctx: &ExplainCtx) -> String {
             owner
         );
     }
+    let _ = writeln!(s, "\n### 结论（{} 个目录）\n", c.total);
+    let _ = writeln!(s, "| 叶子覆盖率（按字节） | 规则 + 启发式（按个数） | 不算容器（按个数） | 未知（按个数） |\n|---:|---:|---:|---:|");
+    let non_container = c.rule_exact + c.rule_inherited + c.heuristic - c.rule_container;
+    let _ = writeln!(
+        s,
+        "| **{:.1}%**（{} / {}） | {:.1}% | {:.1}% | {:.1}% |",
+        c.leaf_coverage_pct,
+        human_bytes(c.leaf_bytes_covered),
+        human_bytes(c.leaf_bytes_total),
+        c.coverage_pct,
+        pct(non_container, c.total),
+        c.unknown_pct
+    );
+    let _ = writeln!(s, "\n叶子覆盖率：每一行只算“没被表里更具体的行覆盖”的那部分字节，看其中多少得到了非容器的说明（容器规则只说“这是用户文件夹”这类话，不算）。这是最不容易被层层嵌套抬高的口径。");
     let _ = writeln!(s, "\n### 命中率（{} 个目录）\n", c.total);
     let _ = writeln!(s, "| 来源 | 个数 | 占比 |\n|---|---:|---:|");
     let _ = writeln!(s, "| 规则精确命中 | {} | {:.1}% |", c.rule_exact, pct(c.rule_exact, c.total));
@@ -457,7 +532,14 @@ fn markdown(r: &Report, ctx: &ExplainCtx) -> String {
         let _ = writeln!(s, "| 需判断 review | {} |", human_bytes(t.review_bytes));
         let _ = writeln!(s, "| 保留 keep | {} |", human_bytes(t.keep_bytes));
         let _ = writeln!(s, "| 规则未覆盖 | {} |", human_bytes(t.uncovered_bytes));
-        let _ = writeln!(s, "\n命中过的规则 {}/{}。", t.rules_hit, t.rules_total);
+        let _ = writeln!(
+            s,
+            "\n命中过的规则 {}/{}。safe 里要用工具清（不能直接删文件夹）的有 {}；护栏从 safe / review 改记到 review / keep 的（缓存目录里像用户数据的部分、不合缓存格式的通配命中）有 {}。",
+            t.rules_hit,
+            t.rules_total,
+            human_bytes(t.safe_tool_bytes),
+            human_bytes(t.guarded_bytes)
+        );
     }
     // 没被规则说明的（启发式 + AI + 未知），按大小取前 10。
     let mut missed: Vec<&Row> = r.rows.iter().filter(|x| x.rank > 0 && !x.explanation.is_rule()).collect();
@@ -481,5 +563,50 @@ fn pct(n: usize, total: usize) -> f64 {
         0.0
     } else {
         n as f64 * 100.0 / total as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diskwhy_core::explain::env::EnvMap;
+    use diskwhy_core::explain::llm::LlmSettings;
+    use diskwhy_core::explain::registry::RegistrySnapshot;
+    use diskwhy_core::explain::rules::RuleSet;
+
+    fn row(path: &str, allocated: u64, source: Source) -> Row {
+        let mut e = diskwhy_core::explain::llm::to_explanation(Default::default(), "m", allocated);
+        e.source = source;
+        Row { rank: 1, path: path.into(), allocated, reread: false, explanation: e }
+    }
+
+    #[test]
+    fn leaf_coverage_counts_only_exclusive_bytes() {
+        let env = EnvMap::from_pairs(&[("SystemDrive", "C:"), ("USERPROFILE", r"C:\Users\bob")]);
+        let (rules, _) = RuleSet::embedded(&env);
+        let ctx = ExplainCtx::new(env, rules, RegistrySnapshot::from_apps(Vec::new()), LlmSettings::default());
+        let rule = |id: &str| Source::Rule { id: id.into(), group: "g".into(), inherited_from: None };
+        // C:\Users（容器）100，里面 C:\Users\bob\x（规则）60、C:\Users\bob\y（未知）10、C:\Users\bob\x\z（启发式）20
+        let rows = [
+            row(r"C:\Users", 100, rule("users-root")),
+            row(r"C:\Users\bob\x", 60, rule("npm-cache")),
+            row(r"C:\Users\bob\y", 10, Source::Unknown),
+            row(r"C:\Users\bob\x\z", 20, Source::Heuristic { name: "h".into() }),
+            row(r"C:\Users\bob\xx", 5, rule("npm-cache")),
+        ];
+        let refs: Vec<&Row> = rows.iter().collect();
+        let (total, covered) = leaf_coverage(&refs, &ctx);
+        // 独占：Users 100-60-10-5=25（容器，不算）；x 60-20=40；y 10（未知）；z 20；xx 5（不是 x 的子目录）
+        assert_eq!(total, 25 + 40 + 10 + 20 + 5);
+        assert_eq!(covered, 40 + 20 + 5);
+    }
+
+    #[test]
+    fn redact_json_replaces_user_in_escaped_paths() {
+        let s = serde_json::to_string(&serde_json::json!({"notes": [r"它在「C:\Users\King\AppData」里面"], "path": r"C:\users\king\x"})).unwrap();
+        let r = redact_json(&s, "king");
+        assert!(!r.to_lowercase().contains("king"), "{r}");
+        assert!(r.contains("<用户>"));
+        assert!(serde_json::from_str::<serde_json::Value>(&r).is_ok(), "替换后仍是合法 JSON");
     }
 }

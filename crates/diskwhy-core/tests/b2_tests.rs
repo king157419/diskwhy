@@ -540,11 +540,10 @@ fn b2_llm_input_four_fields_top20_and_username_redacted() {
     let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
     keys.sort();
     assert_eq!(keys, ["children", "name", "parent", "size"], "只发四个字段");
-    assert_eq!(input.children.len(), llm::MAX_CHILDREN, "只发前 20 个子项");
-    assert_eq!(input.parent, r"~\AppData\Local");
+    // 第 1 轮安全评审后：文件不发名字，只发“扩展名 × 个数”；父路径只留最近两层。
+    assert_eq!(input.children, vec!["~\\".to_string(), ".dat 文件 × 30".to_string(), ".txt 文件 × 1".to_string()], "{:?}", input.children);
+    assert_eq!(input.parent, r"…\AppData\Local");
     assert_eq!(input.name, "~tools");
-    assert!(input.children.contains(&"~-Notes.txt".to_string()), "{:?}", input.children);
-    assert!(input.children.contains(&"~\\".to_string()), "{:?}", input.children);
     let body = llm::build_request_body("m", &input).to_string();
     assert!(!body.to_lowercase().contains("bob"), "请求体里还有用户名：{body}");
     assert!(!body.contains("mtime") && !body.contains("extensions") && !body.contains("modified"), "{body}");
@@ -561,8 +560,15 @@ fn b2_llm_input_four_fields_top20_and_username_redacted() {
     let (chain, node) = view::find_node(&t3, r"C:\Profiles\bob\stuff").unwrap();
     let tg3 = Target { node, path: r"C:\Profiles\bob\stuff", parent: chain.last().copied(), ancestors: &chain };
     let i3 = llm::build_input_with(&tg3, &["bob".to_string()]);
-    assert_eq!(i3.parent, r"C:\Profiles\~");
-    assert_eq!(i3.children, vec!["~.cfg".to_string()]);
+    assert_eq!(i3.parent, r"…\Profiles\~");
+    assert_eq!(i3.children, vec![".cfg 文件 × 1".to_string()]);
+    // 子文件夹多于 20 个时只发 20 项
+    let many: Vec<(String, u64)> = (0..30).map(|i| (format!(r"C:\Data\box\d{i:02}\f.bin"), 100 + i as u64)).collect();
+    let refs: Vec<(&str, u64)> = many.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let t4 = tree(&refs);
+    let (chain, node) = view::find_node(&t4, r"C:\Data\box").unwrap();
+    let tg4 = Target { node, path: r"C:\Data\box", parent: chain.last().copied(), ancestors: &chain };
+    assert_eq!(llm::build_input(&tg4).children.len(), llm::MAX_CHILDREN, "只发前 20 项");
 }
 
 #[test]
@@ -654,7 +660,8 @@ fn b2_explain_chain_priority_rule_heuristic_llm_unknown() {
     assert_eq!(a.owner, None, "注册表对不上时不写归属，AI 猜的不用");
     assert!(!a.clues.is_empty(), "保留 DiskWhy 自己看到的线索");
     let sent = o.calls.borrow()[0].clone();
-    assert!(sent.contains("blob.xyz") && sent.contains("sub\\\\"), "应发子项名：{sent}");
+    // 第 1 轮安全评审后：子文件夹发名字，文件只发扩展名和个数，不发文件名
+    assert!(sent.contains(".xyz 文件 × 1") && sent.contains("sub\\\\") && !sent.contains("blob"), "应发子文件夹名和文件类型：{sent}");
     assert!(!sent.to_lowercase().contains("bob"), "发出去的请求里有用户名：{sent}");
 
     // 4. 开关关闭（默认）：不问，结果是未知

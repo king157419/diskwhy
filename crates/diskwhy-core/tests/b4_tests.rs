@@ -119,6 +119,6 @@ fn b4_explanation_carries_tool_only_for_builtin_tool() {
     let e = explain_path(&t, r"C:\zzz-unknown-thing", &c).unwrap().1;
     assert!(e.is_unknown());
     assert!(e.tool.is_none());
-    assert_eq!(e.what, "我也不确定这是什么");
+    assert_eq!(e.what, "还没认出来，先别动");
     assert!(!e.clues.is_empty(), "未知项要列出线索");
 }

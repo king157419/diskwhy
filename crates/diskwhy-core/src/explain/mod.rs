@@ -112,6 +112,9 @@ pub struct Explanation {
     /// 0~1。规则 1.0，启发式 0.5~0.7，未知 0。
     pub confidence: f32,
     pub refs: Vec<String>,
+    /// 规则没有官方出处、只在本机观察过（界面上标“本机观察”）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observed_only: bool,
     pub verified_on: Option<String>,
     /// 附加提示（继承、年龄、档位被下调等）。
     pub notes: Vec<String>,
@@ -198,7 +201,20 @@ impl ExplainCtx {
         }
         let registry = RegistrySnapshot::load();
         let settings = LlmSettings::load();
-        (ExplainCtx::new(env, rules, registry, settings), warnings)
+        let mut ctx = ExplainCtx::new(env, rules, registry, settings);
+        // 个人文件夹的真实位置（被移到 D 盘等别处时也保护）。
+        ctx.add_protected(&crate::win::known_personal_folders());
+        (ctx, warnings)
+    }
+
+    /// 再加几个受保护目录（比如 `SHGetKnownFolderPath` 读到的“文档”真实位置）。
+    pub fn add_protected(&mut self, paths: &[String]) {
+        for p in paths {
+            let segs = split_lower(p);
+            if segs.len() >= 2 && !self.protected.contains(&segs) {
+                self.protected.push(segs);
+            }
+        }
     }
 
     /// 路径是否落在受保护用户目录之下（含自身）。
@@ -289,7 +305,12 @@ pub fn explain_with_inherited(t: &Target, inherited: Option<&InheritedHit>, ctx:
     }
     let segs = split_lower(t.path);
     let redirect = msix_redirect(t.path, ctx);
-    let e = if let Some(idx) = ctx.rules.best_exact(&segs, Some(node)) {
+    let exact = ctx.rules.best_exact(&segs, Some(node));
+    // 链接 / 挂载点：不跟进去，本身不占空间（除非规则库专门写了它）。
+    if node.reparse_skipped && exact.is_none() {
+        return enforce_guards(heuristics::link_item(t), t.path, ctx);
+    }
+    let e = if let Some(idx) = exact {
         from_rule(&ctx.rules.rules[idx], t, &segs, None, ctx)
     } else if let Some(e) = redirect.as_ref().and_then(|r| explain_redirected(t, r, ctx)) {
         e
@@ -574,6 +595,7 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         },
         confidence: 1.0,
         refs: rule.refs.clone(),
+        observed_only: rule.observed_only,
         verified_on: Some(rule.verified_on.clone()),
         notes,
         clues: Vec::new(),

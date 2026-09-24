@@ -4,7 +4,9 @@
 //! - 接口是 OpenAI 兼容的 `POST {base_url}/chat/completions`（本机 Ollama 填 `http://localhost:11434/v1`，
 //!   key 可以留空）。
 //! - **只发送四样东西**（[`LlmInput`]）：名字、父路径（`X:\Users\<用户名>` 换成 `~`，名字里出现的用户名也换掉）、
-//!   前 20 个子项的名字、总大小。**绝不读取、绝不发送文件内容**，也不发扩展名分布、修改时间、文件数。
+//!   最多 20 项“子项摘要”、总大小。**绝不读取、绝不发送文件内容**。第 1 轮安全评审后收紧：父路径只留最近两层；
+//!   子文件夹发名字，文件只发“扩展名 × 个数”不发文件名；名字里的用户名（≥2 个字）、邮箱、wxid_…、5 位以上的数字都打码。
+//! - 只有“规则和启发式都没认出来”的项能问（[`ask`] 会先检查）；远程地址必须 https，只有本机地址允许 http。
 //! - 回复只取 `{what, why, lose}` 三项；模型多给的 tier / owner / confidence 一律丢掉。
 //!   结果 `tier = review`、`source = Llm`、可信度固定 [`LLM_CONFIDENCE`]（低），界面标“AI 推测”。
 //! - 网络部分藏在 [`LlmOracle`] 后面：生产用 [`HttpOracle`]，测试用假的 oracle，不联网。
@@ -84,7 +86,7 @@ pub struct LlmInput {
     pub name: String,
     /// 父路径（用户目录已替换成 `~`）。
     pub parent: String,
-    /// 前 20 个子项的名字（按大小从大到小；文件夹名后面带 `\`；用户名已换成 `~`）。
+    /// 最多 20 项：子文件夹名（按大小，后面带 `\`，已脱敏），再加“.扩展名 文件 × 个数”（文件不发名字）。
     pub children: Vec<String>,
     /// 总大小（如 "1.23 GB"）。
     pub size: String,
@@ -140,18 +142,108 @@ fn usernames(path: &str, extra: &[String]) -> Vec<String> {
     v
 }
 
-/// 名字脱敏：整个名字就是用户名 → `~`；名字里含用户名（用户名 ≥ 3 个字符时）→ 那一段换成 `~`。
+/// 用户名在名字里出现时替换的最短长度：2 个字（两个字的中文名很常见，第 1 轮安全评审第 9 条）。
+/// 1 个字的不替换，否则名字里每个同样的字母都会被换掉。
+const MIN_USER_CHARS: usize = 2;
+
+/// 名字里的敏感片段打码：邮箱 → `<邮箱>`；`wxid_…` → `wxid_<隐藏>`；连续 5 位以上数字（手机号、QQ 号、
+/// 身份证号、企业微信的长编号）→ `<数字>`。
+pub fn mask_sensitive(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // 邮箱：往前后找 [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}
+        if chars[i] == '@' {
+            let is_local = |c: char| c.is_ascii_alphanumeric() || "._%+-".contains(c);
+            let is_dom = |c: char| c.is_ascii_alphanumeric() || ".-".contains(c);
+            let mut back = 0;
+            let out_chars: Vec<char> = out.chars().collect();
+            while back < out_chars.len() && is_local(out_chars[out_chars.len() - 1 - back]) {
+                back += 1;
+            }
+            let mut j = i + 1;
+            while j < chars.len() && is_dom(chars[j]) {
+                j += 1;
+            }
+            let dom: String = chars[i + 1..j].iter().collect();
+            if back > 0 && dom.contains('.') && !dom.starts_with('.') {
+                let keep: String = out_chars[..out_chars.len() - back].iter().collect();
+                out = keep;
+                out.push_str("<邮箱>");
+                // 邮箱后面常跟 .ost / .pst 扩展名：域名里最后一个“.后缀”如果像扩展名就保留
+                if let Some((_, ext)) = dom.rsplit_once('.') {
+                    if ["ost", "pst", "txt", "json", "db", "log"].contains(&ext.to_ascii_lowercase().as_str()) {
+                        out.push('.');
+                        out.push_str(ext);
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        // wxid_xxx
+        if chars[i..].iter().take(5).collect::<String>().eq_ignore_ascii_case("wxid_") && (i == 0 || !chars[i - 1].is_ascii_alphanumeric()) {
+            let mut j = i + 5;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            if j > i + 5 {
+                out.push_str("wxid_<隐藏>");
+                i = j;
+                continue;
+            }
+        }
+        // 连续数字
+        if chars[i].is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j - i >= 5 {
+                out.push_str("<数字>");
+            } else {
+                out.extend(&chars[i..j]);
+            }
+            i = j;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// 名字脱敏：整个名字就是用户名 → `~`；名字里含用户名（≥ 2 个字）→ 那一段换成 `~`；再打码敏感片段。
 fn redact_name(name: &str, users: &[String]) -> String {
     let mut out = name.to_string();
     for u in users {
         if out.to_lowercase() == u.to_lowercase() {
             return "~".into();
         }
-        if u.chars().count() >= 3 {
+        if u.chars().count() >= MIN_USER_CHARS {
             out = replace_ci(&out, u, "~");
         }
     }
-    out
+    mask_sensitive(&out)
+}
+
+/// 父路径只留最近两层（更上面换成 `…`），每一段也脱敏。`~` 开头的保留 `~`。
+fn short_parent(parent: &str, users: &[String]) -> String {
+    let red = redact_path(parent);
+    let segs: Vec<&str> = red.split('\\').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return red;
+    }
+    let tail: Vec<String> = segs.iter().rev().take(2).rev().map(|s| if *s == "~" { "~".to_string() } else { redact_name(s, users) }).collect();
+    if segs.len() <= 2 {
+        let joined = tail.join("\\");
+        if segs.len() == 1 && joined.ends_with(':') {
+            return format!("{joined}\\");
+        }
+        return joined;
+    }
+    format!("…\\{}", tail.join("\\"))
 }
 
 /// 从节点收集要发的信息。只用扫描树里的名字和大小，不碰文件。
@@ -169,31 +261,40 @@ pub fn build_input_with(t: &Target, extra_users: &[String]) -> LlmInput {
         Some((p, _)) => p.to_string(),
         None => String::new(),
     };
-    let mut parent = redact_path(&parent_raw);
-    for u in &users {
-        if u.chars().count() >= 3 {
-            parent = replace_ci(&parent, u, "~");
-        }
-    }
+    let parent = short_parent(&parent_raw, &users);
     let name = if redact_path(trimmed) == "~" { "~".to_string() } else { redact_name(&n.name, &users) };
-    let children = n
+    // 子文件夹发（脱敏后的）名字；文件只发“扩展名 × 个数”，不发文件名（文件名最容易带出个人信息，
+    // 比如“张三的简历.docx”“身份证正反面.jpg”，第 1 轮安全评审第 9 条）。
+    let mut children: Vec<String> = n
         .children
         .iter()
-        .filter(|c| c.kind != NodeKind::Rest)
+        .filter(|c| c.kind == NodeKind::Dir)
         .take(MAX_CHILDREN)
-        .map(|c| {
-            let nm = redact_name(&c.name, &users);
-            if c.kind == NodeKind::Dir {
-                format!("{nm}\\")
-            } else {
-                nm
-            }
-        })
+        .map(|c| format!("{}\\", redact_name(&c.name, &users)))
         .collect();
+    let mut exts: Vec<(String, u64, usize)> = Vec::new();
+    for c in n.children.iter().filter(|c| c.kind == NodeKind::File) {
+        let e = super::heuristics::ext_of(&c.name);
+        let key = if e.is_empty() { "（无扩展名）".to_string() } else { format!(".{}", mask_sensitive(&e)) };
+        match exts.iter_mut().find(|x| x.0 == key) {
+            Some(x) => {
+                x.1 += c.allocated;
+                x.2 += 1;
+            }
+            None => exts.push((key, c.allocated, 1)),
+        }
+    }
+    exts.sort_by(|a, b| b.1.cmp(&a.1));
+    for (k, _, cnt) in exts {
+        if children.len() >= MAX_CHILDREN {
+            break;
+        }
+        children.push(format!("{k} 文件 × {cnt}"));
+    }
     LlmInput { name, parent, children, size: human_bytes(n.allocated) }
 }
 
-pub const SYSTEM_PROMPT: &str = "你是 Windows 磁盘清理助手。用户会给你一个 Windows 上的文件夹或文件的名字、所在位置、最多 20 个子项的名字和总大小（没有文件内容）。\
+pub const SYSTEM_PROMPT: &str = "你是 Windows 磁盘清理助手。用户会给你一个 Windows 上的文件夹或文件的名字、所在位置、最多 20 项子项摘要（子文件夹名；文件只给扩展名和个数）和总大小（没有文件内容，个人信息已打码）。\
 请推断它可能是什么、为什么会有、删了会失去什么。\
 要求：1) 用给普通人看的中文大白话，每项一两句；2) 这是推断不是确认，拿不准就直说“不确定”，并在 lose 里提醒用户先确认再删；3) 不要判断“能不能删”，不要建议直接删除；\
 4) 只输出一个 JSON 对象，不要任何多余文字，只有三个字段：{\"what\":\"这是什么\",\"why\":\"为什么会有\",\"lose\":\"删了会失去什么、会不会丢数据\"}";
@@ -271,12 +372,34 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .new_agent()
 }
 
+/// 地址检查：必须 http(s)；http 只允许本机（localhost / 127.x / [::1]），远程地址必须 https，
+/// 否则 API Key 和请求内容会明文走网络（第 1 轮安全评审第 16 条）。
+pub fn check_url(url: &str) -> Result<(), String> {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return Err("地址要以 https://（或本机的 http://）开头".into());
+    };
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(h) = host_port.strip_prefix('[') {
+        h.split(']').next().unwrap_or("")
+    } else {
+        host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port)
+    };
+    let local = host == "localhost" || host == "::1" || host.starts_with("127.");
+    if local {
+        Ok(())
+    } else {
+        Err(format!("远程地址必须用 https://（现在是 http://{host}，API Key 和请求内容会明文传输）；只有本机地址（localhost / 127.0.0.1）可以用 http://"))
+    }
+}
+
 /// 发一次 chat 请求，返回 assistant 的文本。所有错误都转成中文字符串，不 panic。
 fn chat(settings: &LlmSettings, body: &serde_json::Value, timeout: Duration) -> Result<String, String> {
     let url = chat_url(&settings.base_url);
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("地址要以 http:// 或 https:// 开头".into());
-    }
+    check_url(&url)?;
     let mut req = agent(timeout).post(&url).header("Content-Type", "application/json");
     if !settings.api_key.trim().is_empty() {
         req = req.header("Authorization", &format!("Bearer {}", settings.api_key.trim()));
@@ -337,8 +460,21 @@ impl LlmOracle for HttpOracle<'_> {
 // ───────────────────────── 问 ─────────────────────────
 
 /// 问 AI（走 HTTP）：返回一条 `source = Llm`、`tier = review` 的解释。用户点“问 AI”时调用。
+/// 只有规则和启发式都没认出来的项才能问（界面上也只对这种项显示按钮，这里再挡一次）。
 pub fn ask(t: &Target, ctx: &ExplainCtx) -> Result<Explanation, String> {
+    ensure_askable(t, ctx)?;
     ask_with(t, ctx, &HttpOracle { settings: &ctx.settings })
+}
+
+/// 能不能问 AI：只有“还没认出来”的文件夹 / 文件可以；规则库或启发式已经说明了的不发出去。
+pub fn ensure_askable(t: &Target, ctx: &ExplainCtx) -> Result<(), String> {
+    if t.node.kind == NodeKind::Rest {
+        return Err("“其余小文件”不能问 AI".into());
+    }
+    if !super::explain(t, ctx).is_unknown() {
+        return Err("这一项 DiskWhy 已经认出来了，不需要问 AI（只有“还没认出来”的项才能问，避免把不必要的信息发出去）".into());
+    }
+    Ok(())
 }
 
 /// 问 AI（oracle 由调用方给）。开关没打开时直接返回错误，不会调用 oracle。
@@ -376,8 +512,9 @@ pub fn to_explanation(a: LlmAnswer, model: &str, allocated: u64) -> Explanation 
         source: Source::Llm { model: model.to_string() },
         confidence: LLM_CONFIDENCE,
         refs: Vec::new(),
+        observed_only: false,
         verified_on: None,
-        notes: vec!["AI 推测：只发送了名字、位置（用户名已隐去）、前 20 个子项名和总大小，没有发送任何文件内容。".into()],
+        notes: vec!["AI 推测：只发送了名字、最近两层位置、子文件夹名和各类文件的个数、总大小（用户名、邮箱、长数字已打码），没有发送文件名和文件内容。".into()],
         clues: Vec::new(),
     }
 }

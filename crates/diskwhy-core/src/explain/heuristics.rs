@@ -580,6 +580,7 @@ fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explan
         source: Source::Heuristic { name: h.name.to_string() },
         confidence: h.confidence,
         refs: Vec::new(),
+        observed_only: false,
         verified_on: None,
         notes,
         clues: h.clues,
@@ -597,7 +598,88 @@ pub fn explain_unmatched(t: &Target, ctx: &ExplainCtx) -> Explanation {
     if let Some(h) = registry_owner(t, ctx) {
         return finish(h, t, &stats, ctx);
     }
+    // 空的（0 字节、也不是读不了）：不进“未知”，直接说“不占空间”（第 1 轮冷启动评审）。
+    if t.node.allocated == 0 && !t.node.inaccessible && t.node.kind != NodeKind::Rest {
+        return empty_item(t);
+    }
     unknown(t, &stats, ctx)
+}
+
+/// 链接 / 挂载点（重解析点）：DiskWhy 不跟进去，本身不占空间。
+/// 比如 `C:\Documents and Settings`、`AppData\Local\Application Data` 是 Windows 为老程序留的链接。
+pub fn link_item(_t: &Target) -> Explanation {
+    Explanation {
+        tier: Tier::Keep,
+        owner: None,
+        category: Category::System,
+        what: "链接（指向别的文件夹），本身不占空间，不用管".into(),
+        why: "这是一个链接或挂载点：打开它其实是在看另一个位置。Windows 为了兼容老程序留了一些这样的链接（比如 Documents and Settings、Application Data）。".into(),
+        lose: "它本身不占空间，删了也腾不出地方；删掉系统留的链接反而可能让老程序找不到文件。".into(),
+        how: vec![How::None],
+        how_detail: "不用管。它指向的那个文件夹，DiskWhy 在原来的位置单独算过了。".into(),
+        tool: None,
+        gain_bytes: 0,
+        gain_note: "不占空间".into(),
+        source: Source::Heuristic { name: "reparse-link".into() },
+        confidence: 0.9,
+        refs: Vec::new(),
+        observed_only: false,
+        verified_on: None,
+        notes: Vec::new(),
+        clues: vec!["文件系统标记它是重解析点（链接 / 挂载点），DiskWhy 没有跟进去统计，避免重复计算".into()],
+    }
+}
+
+/// 空文件夹 / 0 字节文件。
+fn empty_item(t: &Target) -> Explanation {
+    let dir = t.node.kind == NodeKind::Dir;
+    Explanation {
+        tier: Tier::Review,
+        owner: None,
+        category: Category::Unknown,
+        what: if dir { "空文件夹，不占空间".into() } else { "空文件（0 字节），不占空间".into() },
+        why: "里面没有占空间的东西（可能是某个软件建了还没用，或者用过后清空了）。".into(),
+        lose: "它不占空间，删不删都腾不出地方；有的软件启动时要找这个文件夹，所以不用去动它。".into(),
+        how: vec![How::None],
+        how_detail: "不用管。".into(),
+        tool: None,
+        gain_bytes: 0,
+        gain_note: "不占空间".into(),
+        source: Source::Heuristic { name: "empty".into() },
+        confidence: 0.9,
+        refs: Vec::new(),
+        observed_only: false,
+        verified_on: None,
+        notes: Vec::new(),
+        clues: Vec::new(),
+    }
+}
+
+/// 未知项的“线索小结”：替用户把线索总结成一句话（不下结论能不能删）。
+fn clue_summary(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<String> {
+    let n = t.node;
+    let prog = s.share(&["exe", "dll", "sys", "node", "pyd", "so"]);
+    let biggest_dir = n.children.iter().filter(|c| c.kind == NodeKind::Dir).max_by_key(|c| c.allocated).filter(|c| n.allocated > 0 && c.allocated * 2 >= n.allocated);
+    let folder = owner_from_path(t.path, ctx).filter(|o| !o.installed).map(|o| o.name).filter(|x| !x.eq_ignore_ascii_case(&n.name));
+    let mut who: Vec<String> = Vec::new();
+    who.push(format!("「{}」", n.name));
+    if let Some(f) = folder {
+        who.insert(0, format!("「{f}」"));
+    }
+    if let Some(b) = biggest_dir {
+        who.push(format!("「{}」", b.name));
+    }
+    let who = who.join(" / ");
+    if prog >= 0.5 {
+        return Some(format!("看线索，这很可能是 {who} 相关的程序文件（.exe / .dll 这类占了 {}），像是某个软件或工具自带的，不像你自己的文档。", pct(prog)));
+    }
+    if s.share(MEDIA_EXTS) >= 0.5 {
+        return Some(format!("看线索，这里主要是图片 / 视频 / 音频（占 {}），可能是 {who} 存的，也可能是你自己的。", pct(s.share(MEDIA_EXTS))));
+    }
+    if s.share(&["json", "db", "sqlite", "dat", "ldb", "log"]) >= 0.5 {
+        return Some(format!("看线索，这里主要是数据库、配置和日志一类的文件，像是 {who} 这个软件自己存的数据。"));
+    }
+    None
 }
 
 /// 目录内容签名，按固定顺序尝试，第一个命中的算数。
@@ -1447,22 +1529,33 @@ pub fn unknown(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Explanation {
             clues.push(format!("所在的软件文件夹叫「{}」，但注册表“已安装的应用”里找不到对得上的软件（可能是绿色版、已卸载的残留，或者名字对不上）", g.name));
         }
     }
-    let how = vec![How::Manual];
+    if n.inaccessible {
+        clues.insert(0, "普通权限读不了它（拒绝访问），里面有什么看不到；以管理员身份重新扫描才能看到".into());
+    } else if let Some(sum) = clue_summary(t, s, ctx) {
+        clues.insert(0, sum);
+    }
+    // 第 1 轮冷启动评审：只说一次“还没认出来”，接着给结论“先不动不会有损失”，不把功课甩给用户。
+    let how = vec![How::None];
     Explanation {
         tier: Tier::Review,
         owner: None,
         category: Category::Unknown,
-        what: "我也不确定这是什么".into(),
-        why: "规则库里没有它，内容上也没看出明显特征。".into(),
-        lose: "不知道。在弄清楚之前请不要删——可以根据下面的线索搜一下文件夹名，或者点“问 AI”让 AI 猜一猜。".into(),
+        what: "还没认出来，先别动".into(),
+        why: "规则库里没有它，看内容也没认出是什么。".into(),
+        lose: "先不动它不会有任何损失。".into(),
         how,
-        how_detail: "先弄清楚是哪个软件的：搜索文件夹名、看看里面的文件，或者问 AI。".into(),
+        how_detail: if n.inaccessible {
+            "先不用管。".into()
+        } else {
+            "先不用管。想弄清楚的话，看上面的线索（最大的子项、文件类型），或者点“问 AI”。".into()
+        },
         tool: None,
         gain_bytes: 0,
-        gain_note: format!("占 {}；弄清楚是什么之前不估算能腾多少", human_bytes(n.allocated)),
+        gain_note: format!("占 {}；还没认出来，先不算能腾多少", human_bytes(n.allocated)),
         source: Source::Unknown,
         confidence: 0.0,
         refs: Vec::new(),
+        observed_only: false,
         verified_on: None,
         notes: Vec::new(),
         clues,

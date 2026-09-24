@@ -311,3 +311,123 @@ fn safe_rules_have_provenance() {
         ]
     );
 }
+
+/// 第 1 轮安全评审第 9、16 条：发给 AI 的东西再收紧；只有认不出的项能问；远程地址必须 https。
+#[test]
+fn llm_redaction_and_gates() {
+    use diskwhy_core::explain::llm;
+    use diskwhy_core::explain::Target;
+    use diskwhy_core::view::find_node;
+    // 评审探针 E 节的原样例子
+    let zs = tree(
+        "C:",
+        &[
+            (r"C:\Users\张三\AppData\Local\Mystery\张三的简历.docx".into(), 9000),
+            (r"C:\Users\张三\AppData\Local\Mystery\13812345678-身份证正反面.jpg".into(), 8000),
+            (r"C:\Users\张三\AppData\Local\Mystery\wxid_q1w2e3r4t5\a".into(), 7000),
+            (r"C:\Users\张三\AppData\Local\Mystery\zhangsan@company.com.ost".into(), 6000),
+            (r"C:\Users\张三\AppData\Local\Mystery\id_rsa".into(), 500),
+            (r"C:\Users\张三\AppData\Local\Mystery\张三备份\x".into(), 500),
+            (r"C:\Users\张三\AppData\Local\Mystery\123456789\y".into(), 500),
+        ],
+    );
+    let (chain, node) = find_node(&zs, r"C:\Users\张三\AppData\Local\Mystery").unwrap();
+    let tg = Target { node, path: &node.path, parent: chain.last().copied(), ancestors: &chain };
+    let inp = llm::build_input_with(&tg, &["张三".to_string()]);
+    let body = serde_json::to_string(&inp).unwrap();
+    for leak in ["张三", "简历", "13812345678", "身份证", "q1w2e3r4t5", "zhangsan", "company", "id_rsa", "123456789"] {
+        assert!(!body.contains(leak), "请求里还有「{leak}」：{body}");
+    }
+    assert!(inp.children.contains(&r"wxid_<隐藏>\".to_string()), "{:?}", inp.children);
+    assert!(inp.children.contains(&r"~备份\".to_string()), "两个字的中文用户名也要换掉：{:?}", inp.children);
+    assert!(inp.children.contains(&r"<数字>\".to_string()), "{:?}", inp.children);
+    assert!(inp.children.iter().any(|c| c.starts_with(".docx 文件 × 1")), "{:?}", inp.children);
+    assert_eq!(inp.parent, r"…\AppData\Local");
+    // 非 Users 路径：只留最近两层
+    let dd = tree("D:", &[(r"D:\李四-个人资料\某某科技有限公司\离职材料\x\a.bin".into(), 100)]);
+    let (chain, node) = find_node(&dd, r"D:\李四-个人资料\某某科技有限公司\离职材料\x").unwrap();
+    let tg = Target { node, path: &node.path, parent: chain.last().copied(), ancestors: &chain };
+    let i2 = llm::build_input_with(&tg, &["bob".to_string()]);
+    assert_eq!(i2.parent, r"…\某某科技有限公司\离职材料");
+    assert!(!serde_json::to_string(&i2).unwrap().contains("李四"));
+    assert_eq!(llm::mask_sensitive("a@b.co"), "<邮箱>");
+    assert_eq!(llm::mask_sensitive("QQ_1234"), "QQ_1234", "4 位以内的数字不打码");
+
+    // 地址：远程 http 拒绝，本机 http / 任意 https 放行
+    assert!(llm::check_url("http://api.example.com/v1/chat/completions").is_err());
+    assert!(llm::check_url("http://192.168.1.5:11434/v1/chat/completions").is_err());
+    for ok in ["https://api.example.com/v1", "http://localhost:11434/v1", "http://127.0.0.1:9/v1", "http://[::1]:8080/v1"] {
+        assert!(llm::check_url(ok).is_ok(), "{ok}");
+    }
+    assert!(llm::check_url("ftp://x").is_err());
+
+    // 只有认不出的项能问：规则认得的（Temp）、启发式认得的（聊天数据）都拒绝
+    let (c, _) = ctx(r"C:\Users\bob\AppData\Local\Temp");
+    let (files, _) = c_drive();
+    let t = tree("C:", &files);
+    for p in [r"C:\Users\bob\AppData\Local\Temp\abc123.tmp", r"C:\Users\bob\Documents\WeChat Files"] {
+        let (chain, node) = find_node(&t, p).unwrap();
+        let tg = Target { node, path: p, parent: chain.last().copied(), ancestors: &chain };
+        assert!(llm::ensure_askable(&tg, &c).is_err(), "{p} 不该能问 AI");
+    }
+    let (chain, node) = find_node(&t, r"C:\Users\bob\.ssh").unwrap();
+    let tg = Target { node, path: r"C:\Users\bob\.ssh", parent: chain.last().copied(), ancestors: &chain };
+    let e = diskwhy_core::explain::explain(&tg, &c);
+    assert_eq!(llm::ensure_askable(&tg, &c).is_ok(), e.is_unknown());
+}
+
+/// 第 1 轮安全评审第 10 条：“文档”被移到 D 盘后，safe 规则 / 启发式落在那里也要降级。
+#[test]
+fn known_folders_are_protected() {
+    // 真实系统：至少读到“文档”和“下载”，而且都是绝对路径、不带结尾反斜杠。
+    let real = diskwhy_core::win::known_personal_folders();
+    assert!(real.len() >= 2, "{real:?}");
+    assert!(real.iter().all(|p| p.len() > 3 && p.chars().nth(1) == Some(':') && !p.ends_with('\\')), "{real:?}");
+    // 假环境：文档在 D:\我的文档
+    let (mut c, _) = ctx(r"C:\Users\bob\AppData\Local\Temp");
+    let segs = diskwhy_core::explain::pattern::split_lower(r"D:\我的文档\Chrome\Cache");
+    assert!(!c.is_protected(&segs));
+    c.add_protected(&[r"D:\我的文档".to_string()]);
+    assert!(c.is_protected(&segs));
+    // 放在那里的 Chromium 缓存（签名严格）也只能是 review
+    let files: Vec<(String, u64)> = vec![
+        (r"D:\我的文档\Chrome\Cache\Cache_Data\index".into(), 1_000),
+        (r"D:\我的文档\Chrome\Cache\Cache_Data\data_0".into(), 1_000),
+    ];
+    let t = tree("D:", &files);
+    let e = ex(&t, &c, r"D:\我的文档\Chrome\Cache");
+    assert_eq!(e.tier, Tier::Review, "{}", src(&e));
+}
+
+/// 第 1 轮冷启动评审：链接显示“不占空间，不用管”；0 字节的不进“未知”；未知项只说一次、给结论、替用户总结线索。
+#[test]
+fn links_empty_and_unknown_wording() {
+    let (c, _) = ctx(r"C:\Users\bob\AppData\Local\Temp");
+    let mut t = tree(
+        "C:",
+        &[
+            (r"C:\Documents and Settings\x".into(), 0),
+            (r"C:\Users\bob\AppData\Local\EmptyThing\x".into(), 0),
+            (r"C:\Users\bob\AppData\Local\OpenAI\Codex\bin\codex.exe".into(), 9_000_000),
+            (r"C:\Users\bob\AppData\Local\OpenAI\Codex\bin\helper.dll".into(), 1_000_000),
+            (r"C:\Users\bob\AppData\Local\OpenAI\Codex\config.json".into(), 1_000),
+        ],
+    );
+    // 把 Documents and Settings 标成没跟进去的链接（扫描器对重解析点就是这样记的）
+    let link = t.children.iter_mut().find(|n| n.name == "Documents and Settings").unwrap();
+    link.reparse_skipped = true;
+    link.children.clear();
+    link.allocated = 0;
+    let e = ex(&t, &c, r"C:\Documents and Settings");
+    assert!(matches!(&e.source, Source::Heuristic { name } if name == "reparse-link"), "{}", src(&e));
+    assert!(e.what.contains("不占空间") && e.gain_bytes == 0);
+    let e = ex(&t, &c, r"C:\Users\bob\AppData\Local\EmptyThing");
+    assert!(matches!(&e.source, Source::Heuristic { name } if name == "empty"), "{}", src(&e));
+    assert!(e.what.contains("不占空间"));
+    let e = ex(&t, &c, r"C:\Users\bob\AppData\Local\OpenAI");
+    assert!(e.is_unknown());
+    assert_eq!(e.what, "还没认出来，先别动");
+    assert_eq!(e.lose, "先不动它不会有任何损失。");
+    assert_eq!(e.what.matches("不确定").count() + e.why.matches("不确定").count() + e.lose.matches("不确定").count(), 0, "不要一直说“不确定”");
+    assert!(e.clues[0].contains("程序文件") && e.clues[0].contains("Codex"), "线索要替用户总结一句：{:?}", e.clues);
+}

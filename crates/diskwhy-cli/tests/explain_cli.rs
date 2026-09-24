@@ -160,7 +160,7 @@ fn check_expected(rows: &[Value], f: &Fake) {
     let m = by_path(rows, &f.p("qzxv-mystery"));
     assert_eq!(src_kind(m), "unknown");
     assert_eq!(m["tier"], "review");
-    assert_eq!(m["what"], "我也不确定这是什么");
+    assert_eq!(m["what"], "还没认出来，先别动");
     assert!(!m["clues"].as_array().unwrap().is_empty(), "未知项要列线索");
 
     for r in rows {
@@ -373,7 +373,8 @@ fn b3_llm_flag_is_off_by_default_and_only_asks_for_unknowns() {
     let raw = &reqs[0];
     assert!(raw.starts_with("POST /v1/chat/completions "), "{}", &raw[..raw.len().min(200)]);
     assert!(!raw.contains(SECRET), "请求里出现了文件内容！");
-    assert!(raw.contains("qzxv-mystery") && raw.contains("blob.qzx"), "应发送名字和子项名");
+    // 第 1 轮安全评审后：文件只发扩展名和个数，不发文件名
+    assert!(raw.contains("qzxv-mystery") && raw.contains(".qzx 文件 × 1") && !raw.contains("blob.qzx"), "应发送名字和文件类型、不发文件名");
 
     // 4. 整棵树 + --llm：只有认不出的那几个会问。
     got.lock().unwrap().clear();

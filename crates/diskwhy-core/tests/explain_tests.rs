@@ -596,7 +596,7 @@ fn heuristic_signatures_on_real_dirs() {
     // 未知：线索齐全
     let u = fx.explain(r"Local\weirdthing");
     assert_eq!(u.source, Source::Unknown);
-    assert_eq!(u.what, "我也不确定这是什么");
+    assert_eq!(u.what, "还没认出来，先别动");
     assert_eq!(u.tier, Tier::Review);
     let all = u.clues.join("\n");
     assert!(all.contains("最大的几个子项") && all.contains("blob.xyz"), "{all}");
@@ -716,11 +716,12 @@ fn llm_request_body_has_no_file_content_and_redacted_path() {
     let body = llm::build_request_body("test-model", &input).to_string();
 
     assert!(!body.contains(SECRET), "请求体里出现了文件内容！");
-    assert!(body.contains("notes.txt") && body.contains("data\\\\"), "应包含子项名：{body}");
+    // 第 1 轮安全评审后：子文件夹发名字，文件只发扩展名和个数（不发 notes.txt 这种文件名）
+    assert!(body.contains(".txt 文件 × 1") && body.contains("data\\\\") && !body.contains("notes.txt"), "应包含子文件夹名和文件类型：{body}");
     let user = std::env::var("USERNAME").unwrap_or_default();
     if !user.is_empty() && root.to_string_lossy().to_lowercase().contains(&format!(r"\users\{}", user.to_lowercase())) {
-        assert!(!body.to_lowercase().contains(&format!(r"users\\\\{}", user.to_lowercase())), "用户目录没有脱敏：{body}");
-        assert!(input.parent.starts_with('~'), "父路径应以 ~ 开头：{}", input.parent);
+        assert!(!body.to_lowercase().contains(&user.to_lowercase()), "用户名没有脱敏：{body}");
+        assert!(input.parent.starts_with('…'), "父路径只留最近两层：{}", input.parent);
     }
     // 只发了这四个字段（B-2 收紧：名字、父路径、子项名、大小）
     let v: serde_json::Value = serde_json::to_value(&input).unwrap();

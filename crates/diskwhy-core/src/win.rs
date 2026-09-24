@@ -357,3 +357,38 @@ pub fn relaunch_as_admin(exe: &str, params: &str) -> Result<(), RelaunchError> {
         }
     }
 }
+
+/// 当前用户的“个人文件夹”真实位置（桌面、文档、图片、视频、音乐、下载），用 `SHGetKnownFolderPath` 读，
+/// 这样用户把“文档”移到 `D:\文档` 之后，受保护目录也跟着走（第 1 轮安全评审第 10 条）。
+///
+/// 按 learn.microsoft.com（SHGetKnownFolderPath）：`dwFlags = 0`、`hToken = NULL` 表示当前用户；
+/// 返回的路径不带结尾反斜杠；`ppszPath` 不管成功失败都要用 `CoTaskMemFree` 释放。读不到的项跳过。
+pub fn known_personal_folders() -> Vec<String> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures,
+        FOLDERID_Videos,
+    };
+    let ids = [FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Pictures, FOLDERID_Videos, FOLDERID_Music, FOLDERID_Downloads];
+    let mut out = Vec::new();
+    for id in ids.iter() {
+        let mut p: windows_sys::core::PWSTR = null_mut();
+        // SAFETY：按文档传入 GUID 指针、0、NULL 和输出指针；返回后无论成功与否都释放 p。
+        let hr = unsafe { SHGetKnownFolderPath(id, 0, null_mut(), &mut p) };
+        if hr == 0 && !p.is_null() {
+            let mut len = 0usize;
+            // SAFETY：p 是以 NUL 结尾的 UTF-16 字符串（文档保证）。
+            unsafe {
+                while *p.add(len) != 0 {
+                    len += 1;
+                }
+                out.push(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+            }
+        }
+        if !p.is_null() {
+            // SAFETY：p 由 SHGetKnownFolderPath 用 CoTaskMemAlloc 分配。
+            unsafe { CoTaskMemFree(p as *const c_void) };
+        }
+    }
+    out
+}

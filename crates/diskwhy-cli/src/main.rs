@@ -32,12 +32,13 @@ mod explain_cmd;
 
 const USAGE: &str = "用法：
   diskwhy-cli scan <root> [--top 30] [--json out.json] [--json-depth 3] [--no-explain] [--mode exact|fast] [--threads N] [--keep-files 50] [--no-dedup] [--snapshot out.dwsnap] [--quiet]
-  diskwhy-cli explain <路径> [--top 50] [--json out.json|-] [--report report.json] [--md coverage.md] [--llm] [--mode exact|fast] [--no-dedup] [--quiet]
-  diskwhy-cli explain --from scan.json|snapshot.dwsnap [<路径>] [--top 50] [--json out.json|-] [--report report.json] [--md coverage.md] [--llm] [--no-reread]
+  diskwhy-cli explain <路径> [--top 50] [--json out.json|-] [--report report.json] [--md coverage.md] [--llm] [--redact] [--mode exact|fast] [--no-dedup] [--quiet]
+  diskwhy-cli explain --from scan.json|snapshot.dwsnap [<路径>] [--top 50] [--json out.json|-] [--report report.json] [--md coverage.md] [--llm] [--no-reread] [--redact]
   diskwhy-cli scan --from snapshot.dwsnap [--top N]   （读快照，不扫描）
 
   explain：第 0 行是 <路径> 本身，后面是它下面前 N 大目录；--top 0 只解释 <路径> 本身。
   --json 写 Explanation 数组（- 表示标准输出）；--report 写含统计的完整报告；
+  --redact 把 --json / --report 里的用户名（路径里的 \\Users\\<名字>）换成 <用户>；--md 总是这样做。
   --llm 只对认不出的目录问 AI，而且设置里要先启用（默认都不开，不联网）。";
 
 #[derive(PartialEq)]
@@ -62,6 +63,8 @@ pub struct Args {
     pub no_explain: bool,
     pub llm: bool,
     pub no_reread: bool,
+    /// explain：--json / --report 里的 `\Users\<用户名>` 换成 `\Users\<用户>`。
+    pub redact: bool,
     pub snapshot: Option<String>,
     pub from: Option<String>,
 }
@@ -103,6 +106,7 @@ fn parse_args() -> Result<Args, String> {
         no_explain: false,
         llm: false,
         no_reread: false,
+        redact: false,
         snapshot: None,
         from: None,
     };
@@ -128,6 +132,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-explain" => a.no_explain = true,
             "--llm" => a.llm = true,
             "--no-reread" => a.no_reread = true,
+            "--redact" => a.redact = true,
             "--snapshot" => a.snapshot = Some(val("--snapshot")?),
             "--from" => a.from = Some(val("--from")?),
             s if s.starts_with("--") => return Err(format!("未知参数 {s}\n{USAGE}")),

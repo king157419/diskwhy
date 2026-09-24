@@ -237,11 +237,58 @@ tier = "review"
 match = ['%APPDATA%\LarkShell']
 what = "飞书的本地数据：各账号的聊天和文档缓存、内置浏览器数据、登录信息、更新包"
 why = "飞书是基于 Chromium 的桌面程序，所有账号的本地数据都在这里"
-lose = "我不确定这里哪些是纯缓存，整个删会让飞书要重新登录，本地的消息缓存、草稿和设置可能丢（服务器上的消息和云文档不会丢）。线索：update 是更新包（可删，已标绿）；aha\\users\\<一串编号> 是每个登录账号的数据，里面 Service Worker\\CacheStorage、Code Cache、GPUCache 等是内置浏览器缓存（可删，已标绿）；sdk_storage 看名字像是各功能模块自己的存储，不确定能不能删。"
+lose = "整个删会让飞书要重新登录，本地的消息缓存、草稿和设置会丢；飞书帮助中心写明聊天记录和在线文档都存在云端，清缓存 / 重置不会丢。里面：update 是更新包（可删，已标绿）；aha\\users\\<编号> 是每个账号的内置浏览器数据（其中 Service Worker\\CacheStorage、Cache、Code Cache、GPUCache 可删，已标绿）；sdk_storage\\<编号> 是每个账号的本地数据库（消息、日历、邮件等的本地副本），sdk_storage\\log 是日志。"
 how = ["builtin_tool", "manual"]
-how_detail = "优先用飞书自带的清理：头像 → 设置 → 通用（或“存储空间”）→ 清理缓存（不同版本位置不同）。手动的话只删标绿的子文件夹。"
-refs = []
-verified_on = "2026-09-23"
+how_detail = "优先用飞书自带的清理：点头像 → 设置 → 通用 → 清理缓存（官方帮助中心的路径）；飞书异常时可以用 设置 → 系统诊断 → 重置设置项（会抹掉本地数据如草稿，云端内容不受影响）。手动的话只删标绿的子文件夹。"
+refs = ["https://www.feishu.cn/hc/zh-CN/articles/399507903065"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "feishu-sdk-storage"
+owner = "飞书"
+category = "userdata"
+tier = "review"
+kind = "dir"
+match = ['%APPDATA%\LarkShell\sdk_storage\*']
+what = "飞书某个账号的本地数据库（消息、通讯录、日历、邮件、搜索索引的本地副本）"
+why = "本机看到每个账号一个文件夹，里面是 im.db、contact.db、calendar.db、mail_*.db、common_search_*.db 等，还有 drive_download_tmp（云文档下载的临时文件）。其中一个账号的 resources\\seed 里有两个各约 370 MB、没有扩展名的数据文件，我不确定是什么（看位置像是飞书下载的资源包），这部分没有核实"
+lose = "删了飞书要重新从服务器同步消息，本地草稿等只存在本机的内容会丢；聊天记录和云文档在云端，不会丢（飞书帮助中心）。飞书运行时删不掉。"
+how = "builtin_tool"
+how_detail = "用飞书 设置 → 通用 → 清理缓存；实在要重建本地数据，用 设置 → 系统诊断 → 重置设置项，不要手动删数据库文件。"
+refs = ["https://www.feishu.cn/hc/zh-CN/articles/399507903065"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "feishu-logs"
+owner = "飞书"
+category = "log"
+tier = "safe"
+match = ['%APPDATA%\LarkShell\sdk_storage\log']
+what = "飞书的运行日志"
+why = "本机看到的都是 Feishu-installer-*.log、Feishu-launcher-*.log、*.alaudalog、*.logifier.encrypted 这类按日期命名的日志文件"
+lose = "只丢日志，飞书照常用；正在写的当天日志删不掉，跳过即可。只有在找飞书客服排查问题时才需要留着。"
+how = "delete"
+how_detail = "退出飞书后删除里面的文件。"
+refs = ["https://www.feishu.cn/hc/zh-CN/articles/399507903065"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "feishu-embedded-browser"
+owner = "飞书"
+category = "userdata"
+tier = "review"
+match = [
+  '%APPDATA%\LarkShell\aha\users\*',
+  '%APPDATA%\LarkShell\aha\users\*\profile_explorer',
+  '%APPDATA%\LarkShell\aha\users\*\profile_main',
+]
+what = "飞书某个账号的内置浏览器数据（打开网页、云文档、小程序用的 Chromium 用户资料）"
+why = "aha\\users\\<编号> 是每个登录账号一个文件夹（本机里面是 profile_explorer、profile_main、morpheus、PartitionsV2、AllDownloadHistory）；profile_* 的目录结构和 Chrome 的用户资料一样（Cache、Service Worker、IndexedDB、Local Storage、History 等），profile_explorer 是飞书里打开网页和文档用的，profile_main 是主界面用的（从名字推断）"
+lose = "整个删会让飞书里打开过的网页 / 应用要重新登录、丢本地保存的网页数据；里面的 Service Worker\\CacheStorage、Cache、Code Cache、GPUCache 是纯缓存，已单独标绿，可以放心清。"
+how = ["builtin_tool", "manual"]
+how_detail = "优先用飞书 设置 → 通用 → 清理缓存；手动的话只删标绿的缓存子文件夹。"
+refs = ["https://www.feishu.cn/hc/zh-CN/articles/399507903065"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "feishu-program"
@@ -286,6 +333,20 @@ how = ["manual", "builtin_tool"]
 how_detail = "百度网盘 → 设置 → 传输（或“基本”）里可以清理缓存、修改下载位置；不用了就在“设置 > 应用”里卸载。"
 refs = []
 verified_on = "2026-09-23"
+
+[[rule]]
+id = "baidu-netdisk-ui-data"
+owner = "百度网盘"
+category = "userdata"
+tier = "review"
+match = ['%APPDATA%\baidunetdisk']
+what = "百度网盘界面（Electron）的数据：登录状态、界面设置和网页缓存"
+why = "本机看到这里是 Chromium / Electron 的用户资料结构（Cache、Code Cache、GPUCache、IndexedDB、Local Storage…），百度网盘程序本体装在别处（本机在 D:\\baiduwangpan），和老版本装在 AppData\\Roaming\\baidu\\BaiduNetdisk 的情况不同"
+lose = "整个删百度网盘要重新登录、丢界面设置；Cache、Code Cache、GPUCache 是纯缓存，已单独标绿。已下载的文件不在这里。"
+how = "manual"
+how_detail = "只清标绿的缓存子文件夹；或在百度网盘设置里清理缓存。"
+refs = ["https://www.electronjs.org/docs/latest/api/app"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "baidu-netdisk-downloads"

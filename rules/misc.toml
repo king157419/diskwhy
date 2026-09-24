@@ -11,27 +11,67 @@ match = [
   '%APPDATA%\Claude\vm_bundles',
   '%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\vm_bundles',
 ]
-what = "Claude 桌面版下载的本地 Linux 虚拟机镜像"
-why = "从文件名看（rootfs.vhdx、vmlinuz、initrd、sessiondata.vhdx），这是 Claude 桌面版在本机隔离环境里执行任务用的小型虚拟机。注意：商店版 Claude 的数据会同时出现在 AppData\\Roaming\\Claude 和 Packages\\Claude_…\\LocalCache\\Roaming\\Claude 两处，其实是同一份，别算两遍"
-lose = "我不确定删了之后具体哪些功能受影响：用到它的功能可能要重新下载镜像（几 GB）；sessiondata.vhdx 看名字可能存有会话数据，删了可能丢失之前的工作记录。"
+what = "Claude 桌面版 Cowork 功能在本机跑的 Linux 虚拟机（“工作区”）"
+why = "Claude 帮助中心写明 Windows 版的 Cowork 需要系统的“虚拟机平台”（Virtual Machine Platform）功能。claudevm.bundle 里 rootfs.vhdx（Linux 系统盘，约 8 GB）、vmlinuz、initrd 是下载来的工作区镜像，sessiondata.vhdx 是 Cowork 会话自己的数据盘（单独说明）；由 CoworkVMService 服务管理。商店版 Claude 的这份文件同时显示在 AppData\\Roaming\\Claude 和 Packages\\Claude_…\\LocalCache\\Roaming\\Claude，是同一份"
+lose = "rootfs.vhdx / vmlinuz / initrd 删了，下次用 Cowork 会重新下载（约 8 GB），所以只有“不再用 Cowork”时删才真正腾出空间。sessiondata.vhdx 里是 Cowork 会话的数据，删了会丢。官方没有写清理办法，上面这些来自两篇实测文章，我没有在本机试删。"
+how = ["builtin_tool", "manual"]
+how_detail = "不用 Cowork：完全退出 Claude（服务 CoworkVMService 也会停），再删 rootfs.vhdx、vmlinuz、initrd；想留会话数据就别动 sessiondata.vhdx。工作区坏了：优先用 Claude 报错界面里的“重装工作区”按钮（据实测它保留 sessiondata.vhdx），不要整个删 vm_bundles。"
+refs = [
+  "https://support.claude.com/en/articles/12622703-deploy-claude-desktop-for-windows",
+  "https://blog.kamsker.at/blog/cowork-windows-broken",
+  "https://brycewatson.com/blog/18-cowork-vm-diagnostic-guide",
+]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "claude-cowork-sessiondata"
+owner = "Claude 桌面版（Anthropic）"
+category = "userdata"
+tier = "keep"
+kind = "file"
+match = [
+  '%APPDATA%\Claude\vm_bundles\claudevm.bundle\sessiondata.vhdx',
+  '%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\vm_bundles\claudevm.bundle\sessiondata.vhdx',
+]
+what = "Claude Cowork 会话的数据盘（虚拟磁盘文件）"
+why = "Cowork 工作区虚拟机里保存会话状态的磁盘；实测文章指出“重装工作区”按钮会保留它，而手动删整个 vm_bundles 会把它一起删掉"
+lose = "删了之前 Cowork 会话里的数据就没了。"
 how = "manual"
-how_detail = "建议先在 Claude 桌面版的设置里找相关功能的开关或清理选项；确实不用那项功能再考虑删除（先完全退出 Claude）。"
-refs = []
-verified_on = "2026-09-23"
+how_detail = "别单独删。确实不再用 Cowork、也不要以前的会话了，再连同整个 vm_bundles 一起删（先完全退出 Claude）。"
+refs = [
+  "https://brycewatson.com/blog/18-cowork-vm-diagnostic-guide",
+  "https://blog.kamsker.at/blog/cowork-windows-broken",
+]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "claude-desktop-data"
 owner = "Claude 桌面版（Anthropic）"
 category = "userdata"
 tier = "review"
-match = ['%APPDATA%\Claude', '%LOCALAPPDATA%\Packages\Claude_*']
-what = "Claude 桌面版的本地数据：登录信息、设置、界面缓存，以及虚拟机镜像"
-why = "Claude 桌面版是 Electron 程序，数据放在这里；商店版会通过应用包映射同时出现在 Packages\\Claude_… 下（同一份数据，看起来像两份）"
-lose = "整个删要重新登录、丢本地设置；Cache、Code Cache、GPUCache 等界面缓存可以放心清（单独标绿），vm_bundles 见它自己的说明。"
+match = ['%APPDATA%\Claude']
+what = "Claude 桌面版的本地数据：登录信息、设置、界面缓存、Cowork 虚拟机"
+why = "Claude 桌面版是 Electron 程序，数据放在这里。商店版的这个文件夹同时显示在 Packages\\Claude_…\\LocalCache\\Roaming\\Claude（Windows 对打包应用 AppData 的重定向，同一份文件，别算两遍）"
+lose = "整个删要重新登录、丢本地设置和本地会话记录；Cache、Code Cache、GPUCache 等界面缓存可以放心清（单独标绿），vm_bundles 见它自己的说明。"
 how = "manual"
 how_detail = "点进去只清标绿的缓存子文件夹；不用了就在“设置 > 应用”里卸载 Claude。"
-refs = []
-verified_on = "2026-09-23"
+refs = ["https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "claude-desktop-package"
+owner = "Claude 桌面版（Anthropic，商店版）"
+category = "userdata"
+tier = "review"
+scope = "self"
+match = ['%LOCALAPPDATA%\Packages\Claude_*']
+what = "商店版 Claude 桌面版的应用包文件夹"
+why = "里面的 LocalCache\\Roaming\\Claude 是 Claude 自己的数据；LocalCache\\Local、LocalCache\\Roaming 里的其他文件夹是在 Claude 里运行的程序（比如 Claude Code 执行的命令、它装的工具）往 AppData 写的文件——Windows 会把打包应用及其子进程新建的 AppData 文件存进这里，同时在原位置显示"
+lose = "不能整个删。点进去看：每个子文件夹 DiskWhy 会按它在 AppData 里对应的真实位置来说明。卸载 Claude 时，Windows 会把这里的文件（包括其他程序借道写进来的）一起删掉。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "claude-code-data"
@@ -49,17 +89,17 @@ verified_on = "2026-09-23"
 
 [[rule]]
 id = "codex-cli-data"
-owner = "Codex CLI（OpenAI 命令行工具）"
+owner = "Codex（OpenAI，命令行 / 桌面版 / 编辑器插件共用）"
 category = "userdata"
 tier = "review"
 match = ['%USERPROFILE%\.codex']
-what = "Codex 命令行工具的配置、登录信息和会话记录"
-why = "sessions 子文件夹按日期存每次对话的记录，时间长了会很大"
-lose = "删 sessions 里的旧记录只会丢那些历史对话；auth.json、config.toml 是登录和配置，删了要重新登录和配置。"
+what = "Codex（命令行 / 桌面版 / 编辑器插件共用）的配置、登录信息、会话记录和生成的文件"
+why = "OpenAI 文档：Codex 把本地状态放在 CODEX_HOME（默认 ~\\.codex），包括 config.toml、auth.json、会话记录。本机看到：sessions（按日期存的对话记录，最大）、thread_history / logs 等 .sqlite 数据库、generated_images（让 Codex 生成的图片）、.sandbox-bin、.tmp、plugins"
+lose = "删 sessions 里的旧日期文件夹只会丢那些历史对话；generated_images 是你让它生成的图片，删了就没了；auth.json、config.toml 是登录和配置，删了要重新登录和配置。.tmp 看名字是临时文件，但官方没说明能不能删，我不确定。"
 how = "manual"
-how_detail = "只删 sessions 里你不需要的旧日期文件夹。"
-refs = ["https://github.com/openai/codex"]
-verified_on = "2026-09-23"
+how_detail = "只删 sessions 里你不需要的旧日期文件夹；想要的图片先从 generated_images 挪出来；配置和数据库文件别动。也可以在 config.toml 里用 history 设置限制历史大小。"
+refs = ["https://developers.openai.com/codex/config-advanced"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "dot-cache-root"
@@ -206,12 +246,35 @@ category = "installer"
 tier = "review"
 match = ['%ProgramData%\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts', '%ProgramData%\NVIDIA Corporation\Downloader']
 what = "NVIDIA App（或旧的 GeForce Experience）下载的驱动和程序更新包"
-why = "NVIDIA 软件在后台下载新驱动和新版本，解压后装好"
-lose = "装好的驱动不受影响；以后回滚或重装驱动时需要重新下载。我不确定 NVIDIA App 会不会在下次检查更新时把它们重新下回来。"
+why = "本机看到：ota-artifacts\\grd 是 Game Ready 驱动（下载的压缩包 + post-processing 里解压出的 setup.exe、Display.Driver 等完整安装程序），nvapp 是 NVIDIA App 自己的更新包，其余 GUID 名字的文件夹是空的。装好的驱动 Windows 另存在 System32\\DriverStore（驱动仓库）里，不靠这些安装包运行"
+lose = "装好的驱动不受影响；以后想回滚或重装同一版驱动时要重新下载。NVIDIA 没有公开说明这个文件夹，我不确定 NVIDIA App 会不会在下次检查更新时把它们重新下回来（NVIDIA 论坛上有用户说大头就是这里的旧驱动）。"
 how = "delete"
-how_detail = "需要管理员权限。先退出 NVIDIA App 再删；或在 NVIDIA App 设置里关掉自动下载驱动。"
-refs = []
-verified_on = "2026-09-23"
+how_detail = "需要管理员权限。先退出 NVIDIA App，再删 grd、nvapp 里的内容（文件夹本身留着）；或在 NVIDIA App 设置里关掉自动下载驱动。"
+refs = [
+  "https://learn.microsoft.com/en-us/windows-hardware/drivers/install/driver-store",
+  "https://www.nvidia.com/en-us/geforce/forums/geforce-graphics-cards/5/558143/what-can-be-deleted-from-the-cprogramdatanvidia-co",
+]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "nvidia-driver-installers"
+owner = "NVIDIA App"
+category = "installer"
+tier = "review"
+match = [
+  '%ProgramData%\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts\grd',
+  '%ProgramData%\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts\crd',
+]
+what = "NVIDIA App 下载的显卡驱动安装包（grd = Game Ready 驱动，crd = Studio 驱动）"
+why = "NVIDIA App 更新驱动时先把驱动包下载到这里（按哈希命名的文件夹），再解压到 post-processing 里运行安装（里面是 setup.exe、Display.Driver、HDAudio、PhysX 等，和官网下载的驱动安装程序内容一样）。装好之后，Windows 会把驱动存进 System32\\DriverStore，系统用的是那一份"
+lose = "只是安装包：删了显卡驱动照常工作，想重装或回滚到这一版时要重新下载（约 1 GB 的压缩包，解压后 3 GB 左右）。"
+how = "delete"
+how_detail = "需要管理员权限。先退出 NVIDIA App 再删里面的内容；如果正在安装驱动，等装完再删。"
+refs = [
+  "https://learn.microsoft.com/en-us/windows-hardware/drivers/install/driver-store",
+  "https://nvidia.custhelp.com/app/answers/detail/a_id/10/~/nvidia-app-driver-installation-failed.-how-do-i-manually-clean-install-the",
+]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "nvidia-app-data"
@@ -298,13 +361,41 @@ owner = "罗技 G HUB"
 category = "app"
 tier = "review"
 match = ['%ProgramData%\LGHUB']
-what = "罗技 G HUB（外设驱动软件）的公共数据和下载的组件"
-why = "G HUB 下载的设备支持包、固件、更新都放在这里"
-lose = "我不确定其中哪些能删：depots 看起来是下载的组件包，cache 看起来是缓存；删了 G HUB 可能要重新下载，或设备配置不能用。"
+what = "罗技 G HUB（外设驱动软件）的公共数据：已装的组件和下载缓存"
+why = "本机看到：depots\\<构建号> 是当前装好的组件（current.json 里每个组件的 localFolder 都指向这里，包括设备支持、固件升级工具、各游戏的灯效小程序），cache 里是按 SHA-256 命名的单个大文件（看起来是下载下来的组件包），current.json / installation.json 记录安装状态"
+lose = "整个删 G HUB 就坏了，要重装。depots 是在用的组件；cache 见它自己的说明。罗技没有公开说明这些文件夹。"
 how = "manual"
-how_detail = "不建议手动删；G HUB 本身占地方的话可以卸载后重装。"
-refs = []
-verified_on = "2026-09-23"
+how_detail = "不建议手动删。罗技官方的“手动卸载重装”步骤里会整个删掉 ProgramData 下的 LGHUB 再重新安装（重装后只下载需要的组件），G HUB 出问题或占地方时可以照官方步骤做。"
+refs = ["https://support.logi.com/hc/en-us/articles/360023192454-G-HUB-Install-Uninstall-Update-Troubleshooting"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "logitech-ghub-depots"
+owner = "罗技 G HUB"
+category = "app"
+tier = "keep"
+match = ['%ProgramData%\LGHUB\depots']
+what = "罗技 G HUB 当前装好的组件（设备支持、固件工具、游戏灯效小程序等）"
+why = "G HUB 的 current.json 里每个组件的 localFolder 都指向 depots\\<构建号>\\<组件名>，是 G HUB 正在用的程序文件"
+lose = "删了 G HUB 和设备配置可能用不了，要修复或重装。"
+how = "manual"
+how_detail = "不要手动删；不用 G HUB 就在“设置 > 应用”里卸载。"
+refs = ["https://support.logi.com/hc/en-us/articles/360023192454-G-HUB-Install-Uninstall-Update-Troubleshooting"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "logitech-ghub-cache"
+owner = "罗技 G HUB"
+category = "cache"
+tier = "review"
+match = ['%ProgramData%\LGHUB\cache']
+what = "罗技 G HUB 下载下来的组件包（看起来是下载缓存）"
+why = "里面是按 SHA-256 哈希命名的单个大文件，修改时间和 depots 里组件的安装时间一致，看起来是下载后留下的原始包。罗技没有公开说明"
+lose = "我不确定：看起来删了不影响已装好的组件，但 G HUB 更新或修复时可能要重新下载；也可能 G HUB 用它校验，删了会触发重新下载。"
+how = "delete"
+how_detail = "需要管理员权限。先完全退出 G HUB（包括托盘图标）再删；之后打开 G HUB 看设备是否正常。"
+refs = ["https://support.logi.com/hc/en-us/articles/360023192454-G-HUB-Install-Uninstall-Update-Troubleshooting"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "raspberry-pi-imager-cache"
@@ -417,12 +508,30 @@ tier = "review"
 scope = "self"
 match = ['%USERPROFILE%\.antigravity', '%USERPROFILE%\.antigravity-ide']
 what = "Google Antigravity 编辑器的扩展文件夹"
-why = "Antigravity 是基于 VS Code 的编辑器，这个文件夹的结构和 ~\\.vscode 一样（extensions + argv.json）。Antigravity 官方文档没有写这个文件夹；Google 开发者论坛上有用户提到 2.0 版的 IDE 改用 .antigravity-ide（不是官方说明，仅供参考）"
+why = "Antigravity 是基于 VS Code 的编辑器，这个文件夹的结构和 ~\\.vscode 一样（extensions + argv.json）。VS Code 系编辑器升级扩展后，旧版本会记在 extensions\\.obsolete 里、等编辑器下次启动才删（VS Code 源码可查），所以很久没打开 Antigravity 时这里会堆着同一扩展的好几个版本。Antigravity 官方文档没有写这个文件夹；Google 开发者论坛上有用户提到 2.0 版的 IDE 改用 .antigravity-ide（不是官方说明，仅供参考）"
 lose = "删了 Antigravity 里装的扩展都会消失，要重新安装。"
 how = "manual"
-how_detail = "不用 Antigravity 了就先卸载它，再删这个文件夹；还在用就在编辑器的扩展面板里卸掉不需要的扩展。"
-refs = ["https://discuss.ai.google.dev/t/fix-for-antigravity-2-0-hijacking-the-ide-and-how-to-restore-your-lost-settings-extensions-for-windows-user/146158"]
-verified_on = "2026-09-23"
+how_detail = "还在用：打开一次 Antigravity 再关掉，它会自己清掉 .obsolete 里记着的旧版本扩展，再在扩展面板里卸掉不需要的。不用了：先在“设置 > 应用”里卸载它，再删这个文件夹。"
+refs = [
+  "https://discuss.ai.google.dev/t/fix-for-antigravity-2-0-hijacking-the-ide-and-how-to-restore-your-lost-settings-extensions-for-windows-user/146158",
+  "https://github.com/microsoft/vscode/blob/main/src/vs/platform/extensionManagement/node/extensionManagementService.ts",
+]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "openai-local"
+owner = "OpenAI"
+category = "app"
+tier = "review"
+scope = "self"
+match = ['%LOCALAPPDATA%\OpenAI']
+what = "OpenAI 软件在本机的文件夹（本机主要是 Codex 桌面版）"
+why = "本机里面是 Codex（桌面版从商店安装包复制出来的程序和运行时，单独说明）和一个几乎是空的 extension 文件夹"
+lose = "不要整个删；点进去看 Codex 子文件夹的说明。"
+how = "none"
+how_detail = ""
+refs = ["https://github.com/openai/codex/issues/42412"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "codex-desktop-local"
@@ -430,41 +539,84 @@ owner = "Codex 桌面版（OpenAI）"
 category = "app"
 tier = "review"
 match = ['%LOCALAPPDATA%\OpenAI\Codex']
-what = "Codex 桌面版从安装包里复制出来的程序和运行时"
-why = "从文件看：bin 里是 codex.exe、node.exe 和几个按哈希命名的文件夹，runtimes 里是 cua_node 等运行时。openai/codex 仓库的 issue #42412 描述了桌面版会把商店安装包里的运行时搬到这个用户可写的目录。OpenAI 官方文档里没有这个文件夹的说明"
-lose = "我不确定删了会不会自动重新生成；在用 Codex 桌面版的话，删了可能打不开或要重新准备运行时。"
+what = "Codex 桌面版从商店安装包里复制出来的程序和运行时"
+why = "bin 里是 codex.exe、node.exe、rg.exe 等和几个按哈希命名的文件夹（本机 4 个，修改日期从 5 月到 9 月不等，像是不同版本），runtimes\\cua_node 是“操控电脑”功能用的 Node 运行时。openai/codex 的 issue #42412 描述了：桌面版启动时会把商店安装包（C:\\Program Files\\WindowsApps\\OpenAI.Codex_…）里的运行时复制到这个用户可写的目录。OpenAI 官方文档里没有这个文件夹的说明"
+lose = "我不确定删了会不会在下次启动时自动重新复制（issue 里说它启动时会做这一步，但没人说明删掉后的行为）；在用 Codex 桌面版的话，删了可能打不开或要重新准备运行时。"
 how = "manual"
-how_detail = "不用 Codex 桌面版了：先在“设置 > 应用”里卸载，再删这里。还在用就别动。"
+how_detail = "不用 Codex 桌面版了：先在“设置 > 应用”里卸载，再删这里。还在用就别动；bin 里日期很旧的哈希文件夹看起来是旧版本残留，但没有官方说明，不建议手动删。"
 refs = ["https://github.com/openai/codex/issues/42412"]
-verified_on = "2026-09-23"
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "codex-runtimes-cache"
-owner = "Codex（OpenAI，推测）"
+owner = "Codex 桌面版 / ChatGPT 桌面版（OpenAI）"
 category = "app"
 tier = "review"
 match = ['%USERPROFILE%\.cache\codex-runtimes']
-what = "看起来是 Codex 自带的一套运行时（Python、Node 和原生依赖）"
-why = "线索：codex-primary-runtime\\dependencies 下有 native / python / node 三套运行时和 runtime.json，旁边的 codex-primary-runtime.previous-<GUID> 像是上一版的残留。没有找到官方文档说明它由谁创建、删了会不会自动重下"
-lose = "我不确定：删了可能要让 Codex 重新下载运行时，期间相关功能用不了。"
+what = "Codex 桌面版装的“主运行时”：一整套 Python、Node.js 和原生工具（git、poppler 等）"
+why = "给 Codex 的文档 / 表格 / 演示文稿 / PDF 插件用。本机 runtime.json 写着 bundleVersion 26.905.x、pythonVersion 3.12、nodeVersion 24，bundledPlugins 是 openai-primary-runtime；openai/codex 的 issue #29597 说明它是 Codex App 自己安装和刷新的（“Let Codex App install or refresh its local runtime under .cache\\codex-runtimes”）。旁边的 codex-primary-runtime.previous-<GUID> 是刷新时留下的上一版（单独说明）。官方文档没有写这个文件夹"
+lose = "我不确定删了之后什么时候会重新装：按 issue 的描述 Codex App 会自己安装 / 刷新它，但官方没写。删了之后、重新装好之前，Codex 的文档 / 表格 / PDF 类功能可能用不了。"
 how = "manual"
-how_detail = "先退出 Codex。名字带 .previous- 的旧版本文件夹看起来是升级残留，删它风险最小；codex-primary-runtime 本身建议保留。"
-refs = []
-verified_on = "2026-09-23"
+how_detail = "先完全退出 Codex / ChatGPT 桌面版。codex-primary-runtime 本身建议保留；.previous- 开头的旧版本见它自己的说明。不用 Codex 桌面版了，卸载后可以整个删。"
+refs = ["https://github.com/openai/codex/issues/29597"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "codex-runtimes-previous"
+owner = "Codex 桌面版 / ChatGPT 桌面版（OpenAI）"
+category = "app"
+tier = "review"
+kind = "dir"
+match = ['%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime.previous-*']
+what = "Codex 主运行时刷新时留下的上一版"
+why = "名字是 codex-primary-runtime.previous-<GUID>，修改时间比当前的 codex-primary-runtime 新（本机：9 月 10 日 vs 9 月 6 日），看起来是刷新运行时时把旧版改名留下的。官方没有说明它会不会被自动清掉"
+lose = "我不确定：看起来只是旧版本，删了当前运行时不受影响；如果刷新中途失败、Codex 需要回退，可能会用到它。"
+how = "delete"
+how_detail = "先完全退出 Codex / ChatGPT 桌面版，确认 codex-primary-runtime 还在，再删这个旧版本文件夹。"
+refs = ["https://github.com/openai/codex/issues/29597"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "aclos-game-recorder"
-owner = "不确定（可能与腾讯《无畏契约》的“无畏时刻”录像有关）"
+owner = "无畏契约（腾讯国服）相关程序（本机线索推断）"
 category = "userdata"
 tier = "review"
 match = ['%APPDATA%\ACLOS', '%USERPROFILE%\AppData\ACLOS']
-what = "某个游戏相关程序的数据，以及它录下来的游戏视频"
-why = "线索：Roaming\\ACLOS 是 Electron 程序的数据（Cache、GPUCache 等），还有 GameProxyCrashReports、TcVersions、Fixs；AppData\\ACLOS 下的 aclos-highlight、wonderfulVideos… 里是几 GB 的视频。网上有视频说《无畏契约》国服的“无畏时刻”自动录像默认存在 C 盘的 ACLOS 文件夹——没有找到官方说明，注册表里也没有登记，仅供参考"
-lose = "录像删了就找不回来；程序文件删了，相关的录制 / 加速功能可能失效。Cache 类子文件夹有单独规则（可放心清）。"
+what = "《无畏契约》国服配套程序（ACLOS）的数据，以及它自动录下的“无畏时刻”视频"
+why = "本机线索：Roaming\\ACLOS\\config.json 里有 ValPlayerLoadOutConfig（无畏契约的玩家装备配置），还有 WeGameWonderfulDb、ValDependencies、GameProxyCrashReports；它是 Electron 程序（Cache、GPUCache 等）。AppData\\ACLOS\\aclos-highlight\\wonderfulVideos… 里是录像；本机 D:\\valorant_game\\Tencent Games 下也有同名的 wonderfulVideos… 录像文件夹。网上也有人说“无畏时刻”自动录像默认存在 C 盘的 ACLOS 文件夹。没有找到腾讯的官方说明，注册表里也没有登记"
+lose = "录像删了就找不回来；程序文件删了，相关的录像 / 加速功能可能失效。Cache 类子文件夹有单独规则（可放心清）。"
 how = "manual"
-how_detail = "先确认是哪款软件（看游戏客户端里有没有“高光时刻 / 无畏时刻”之类的录像设置，一般能改保存位置）。录像想留就在软件里把保存位置改到别的盘再搬走；不想留就在软件里删。"
-refs = []
-verified_on = "2026-09-23"
+how_detail = "录像：在无畏契约客户端的“无畏时刻 / 录像”设置里查看、删除、改保存位置或关掉自动录制。程序数据：不建议手动删，不玩了就卸载游戏。"
+refs = ["https://www.youtube.com/watch?v=_buvk_TOEho"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "aclos-highlight-videos"
+owner = "无畏契约（腾讯国服，本机线索推断）"
+category = "userdata"
+tier = "review"
+match = ['%USERPROFILE%\AppData\ACLOS\aclos-highlight']
+what = "《无畏契约》“无畏时刻”自动录下的精彩片段视频"
+why = "每个 wonderfulVideos<数字> 文件夹对应一个账号，里面每个子文件夹是一段录像。开着自动录制时每局都录，会越积越多。依据见 ACLOS 文件夹的说明（本机线索，腾讯无公开说明）"
+lose = "删了这些录像就没了，游戏本身不受影响。想留的片段先挪走。"
+how = ["manual", "migrate"]
+how_detail = "在无畏契约客户端的录像设置里删除不要的、改保存位置或关掉自动录制；也可以直接删不要的录像文件夹（默认进回收站，清空回收站后才真正腾出空间）。"
+refs = ["https://www.youtube.com/watch?v=_buvk_TOEho"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "aclos-old-installer"
+owner = "无畏契约（腾讯国服）相关程序（本机线索推断）"
+category = "installer"
+tier = "review"
+match = ['%APPDATA%\ACLOS\TcVersions']
+what = "ACLOS 程序下载的安装包（本机是 2.16.3_installer.exe）"
+why = "文件夹里只有一个版本号命名的安装程序和 version_manifest.json；本机 Fixs 里的文件已是 2.17.0.500，看起来 TcVersions 里是更新用的旧版安装包"
+lose = "我不确定它会不会被程序用来修复 / 回滚；看起来只是旧版安装包，删了程序照常用，需要时会重新下载。"
+how = "delete"
+how_detail = "先退出无畏契约和它的配套程序再删。"
+refs = ["https://www.youtube.com/watch?v=_buvk_TOEho"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "electron-updater-cache"

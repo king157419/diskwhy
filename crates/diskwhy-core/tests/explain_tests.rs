@@ -557,7 +557,8 @@ fn heuristic_signatures_on_real_dirs() {
     let fx = Fixture::scan(root, ctx);
 
     assert_heur(&fx.explain(r"appx\Cache"), "chromium-cache", Tier::Review);
-    assert_heur(&fx.explain("py"), "python-env", Tier::Review);
+    // 有 python.exe + Lib\site-packages：2026-09-24 起由更具体的 python-runtime 认（同为 review）。
+    assert_heur(&fx.explain("py"), "python-runtime", Tier::Review);
     assert_heur(&fx.explain(r"webapp\node_modules"), "node-modules", Tier::Review);
     assert_ne!(heur_name(&fx.explain(r"orphan\node_modules")), Some("node-modules"), "没有 package.json 不应判成 Node 依赖");
     assert_heur(&fx.explain(r"rs\target"), "rust-target", Tier::Review);
@@ -931,4 +932,172 @@ fn former_unknowns_now_have_rules() {
         let e = ex(&t, p, &ctx);
         assert!(e.why.contains("没有找到") || e.lose.contains("不确定"), "{p} 应写明没核实：{}", e.why);
     }
+}
+
+// ───────────────────────── 2026-09-24 审计：商店应用重定向 + 用户自己放的大东西 ─────────────────────────
+
+/// 商店版应用的 LocalCache\Local|Roaming 按真实 AppData 路径说明，不再笼统说成“Claude 的数据”。
+#[test]
+fn msix_localcache_is_explained_by_real_appdata_path() {
+    let ctx = embedded_ctx();
+    let pkg = r"C:\Users\bob\AppData\Local\Packages\Claude_abc123";
+    let t = tree(&[
+        (&format!(r"{pkg}\LocalCache\Local\mybuild\target\.rustc_info.json"), 1_000),
+        (&format!(r"{pkg}\LocalCache\Local\mybuild\target\CACHEDIR.TAG"), 1_000),
+        (&format!(r"{pkg}\LocalCache\Local\mybuild\target\debug\deps\a.rlib"), 5_000_000_000),
+        (&format!(r"{pkg}\LocalCache\Local\pip\cache\http\x"), 300_000_000),
+        (&format!(r"{pkg}\LocalCache\Local\unknownthing\a.dat"), 10_000_000),
+        (&format!(r"{pkg}\LocalCache\Roaming\Claude\vm_bundles\claudevm.bundle\rootfs.vhdx"), 8_000_000_000),
+        (&format!(r"{pkg}\LocalCache\Roaming\Claude\vm_bundles\claudevm.bundle\sessiondata.vhdx"), 500_000_000),
+        (&format!(r"{pkg}\LocalState\x"), 1_000),
+    ]);
+
+    let m = ctx.msix_redirect(&format!(r"{pkg}\LocalCache\Local\pip\cache")).expect("应识别为重定向");
+    assert_eq!(m.mapped, r"C:\Users\bob\AppData\Local\pip\cache");
+    assert_eq!(m.app_name(), "Claude");
+    assert!(ctx.msix_redirect(&format!(r"{pkg}\LocalCache\Local")).is_none(), "LocalCache\\Local 本身不算");
+    assert_eq!(
+        ctx.msix_redirect(&format!(r"{pkg}\LocalCache\Roaming\Claude")).unwrap().mapped,
+        r"C:\Users\bob\AppData\Roaming\Claude"
+    );
+
+    assert_eq!(rule_id(&ex(&t, pkg, &ctx)), Some("claude-desktop-package"));
+    assert_eq!(rule_id(&ex(&t, &format!(r"{pkg}\LocalCache\Local"), &ctx)), Some("msix-localcache"));
+    // 真实路径 %LOCALAPPDATA%\pip\cache 是 safe 规则
+    let pip = ex(&t, &format!(r"{pkg}\LocalCache\Local\pip\cache"), &ctx);
+    assert_eq!((rule_id(&pip), pip.tier), (Some("pip-cache"), Tier::Safe));
+    assert!(pip.notes.iter().any(|n| n.contains("同一份") && n.contains(r"AppData\Local\pip\cache")), "{:?}", pip.notes);
+    // 编译产物：自己认出来 + 子文件夹沿用
+    assert_eq!(heur_name(&ex(&t, &format!(r"{pkg}\LocalCache\Local\mybuild\target"), &ctx)), Some("rust-target"));
+    assert_eq!(heur_name(&ex(&t, &format!(r"{pkg}\LocalCache\Local\mybuild\target\debug\deps"), &ctx)), Some("rust-target"));
+    assert_eq!(heur_name(&ex(&t, &format!(r"{pkg}\LocalCache\Local\mybuild"), &ctx)), Some("dominant-child"));
+    // 认不出来的不再冒充“Claude 桌面版的数据”，线索里写明真实位置
+    let unk = ex(&t, &format!(r"{pkg}\LocalCache\Local\unknownthing"), &ctx);
+    assert!(unk.is_unknown(), "{:?}", unk.source);
+    assert!(unk.clues.iter().any(|c| c.contains(r"AppData\Local\unknownthing")), "{:?}", unk.clues);
+    // Claude 自己的数据照旧
+    assert_eq!(rule_id(&ex(&t, &format!(r"{pkg}\LocalCache\Roaming\Claude"), &ctx)), Some("claude-desktop-data"));
+    assert_eq!(rule_id(&ex(&t, &format!(r"{pkg}\LocalCache\Roaming\Claude\vm_bundles"), &ctx)), Some("claude-desktop-vm"));
+    let sd = ex(&t, &format!(r"{pkg}\LocalCache\Roaming\Claude\vm_bundles\claudevm.bundle\sessiondata.vhdx"), &ctx);
+    assert_eq!((rule_id(&sd), sd.tier), (Some("claude-cowork-sessiondata"), Tier::Keep));
+    // 其他子文件夹仍按商店应用数据说明
+    assert_eq!(rule_id(&ex(&t, &format!(r"{pkg}\LocalState"), &ctx)), Some("store-app-package"));
+
+    // 汇总也按真实路径归档：pip 缓存算 safe，不再算进 Claude 的 review
+    let s = tier_summary(&t, &ctx);
+    assert!(s.top_safe.iter().any(|r| r.id == "pip-cache" && r.bytes == 300_000_000), "{:?}", s.top_safe);
+    assert!(!s.top_review.iter().any(|r| r.id == "claude-desktop-package" || r.id == "store-app-package" && r.bytes > 1_000_000_000));
+}
+
+/// 任何盘上用户自己放的大东西：聊天记录、游戏、虚拟机、conda、SDK、编译产物。启发式结果都不是 safe。
+#[test]
+fn user_big_items_on_any_drive() {
+    let ctx = embedded_ctx();
+    let t = tree(&[
+        // 微信聊天记录（改到别的文件夹）
+        (r"C:\wx\xwechat_files\wxid_a_1\msg\file\2026-06\a.pdf", 3_000_000_000),
+        (r"C:\wx\xwechat_files\wxid_a_1\cache\img\x", 100_000_000),
+        (r"C:\old\Tencent Files\12345\FileRecv\a.zip", 100_000_000),
+        // 腾讯游戏：游戏本体 + 自动录像
+        (r"C:\vg\Tencent Games\VALORANT\live\ShooterGame\Content\Paks\a.pak", 3_000_000_000),
+        (r"C:\vg\Tencent Games\wonderfulVideos123\v1\a.mp4", 9_000_000_000),
+        // Steam 库
+        (r"C:\steam\steamapps\common\Some Game\game.exe", 2_000_000_000),
+        (r"C:\steam\steamapps\appmanifest_1.acf", 1_000),
+        (r"C:\steam\steamapps\shadercache\1\x", 10_000_000),
+        (r"C:\steam\steamui\x", 1_000_000),
+        // 虚拟机
+        (r"C:\vms\win11\win11.vmx", 1_000),
+        (r"C:\vms\win11\win11.vmdk", 40_000_000_000),
+        (r"C:\vms\ubuntu\ubuntu.vbox", 1_000),
+        (r"C:\vms\ubuntu\ubuntu.vdi", 20_000_000_000),
+        // conda
+        (r"C:\conda\envs\e1\conda-meta\a.json", 1_000),
+        (r"C:\conda\envs\e1\Lib\site-packages\torch\lib\x.dll", 4_000_000_000),
+        (r"C:\conda\envs\e2\conda-meta\b.json", 1_000),
+        (r"C:\conda\envs\e2\python.exe", 100_000),
+        (r"C:\conda\pkgs\urls.txt", 1_000),
+        (r"C:\conda\pkgs\numpy-2.0-py312_0\info\index.json", 1_000),
+        (r"C:\conda\pkgs\numpy-2.0-py312_0\Lib\x.pyd", 50_000_000),
+        // 安卓 / Gradle / Flutter / pub
+        (r"C:\sdk\android\platform-tools\adb.exe", 10_000_000),
+        (r"C:\sdk\android\build-tools\35.0.0\aapt2.exe", 10_000_000),
+        (r"C:\sdk\android\platforms\android-35\android.jar", 50_000_000),
+        (r"C:\sdk\android\system-images\android-35\google_apis\x86_64\system.img", 3_000_000_000),
+        (r"C:\sdk\gradle\caches\9.3.1\transforms\x", 3_000_000_000),
+        (r"C:\sdk\gradle\wrapper\dists\gradle-9\x.zip", 700_000_000),
+        (r"C:\sdk\flutter\bin\flutter.bat", 1_000),
+        (r"C:\sdk\flutter\bin\cache\dart-sdk\bin\dart.exe", 2_000_000_000),
+        (r"C:\sdk\flutter\packages\flutter\pubspec.yaml", 1_000),
+        (r"C:\sdk\pub_cache\hosted\pub.dev\x", 200_000_000),
+        (r"C:\sdk\pub_cache\hosted-hashes\pub.dev\x", 1_000),
+        // Rust 编译产物（CARGO_TARGET_DIR 改了名字）
+        (r"C:\build\out\.rustc_info.json", 1_000),
+        (r"C:\build\out\CACHEDIR.TAG", 1_000),
+        (r"C:\build\out\debug\deps\a.rlib", 2_000_000_000),
+        // Python 库里的 pyproject.toml 不是“你的项目”
+        (r"C:\py\Lib\site-packages\pkga\pyproject.toml", 1_000),
+        (r"C:\py\Lib\site-packages\pkgb\pyproject.toml", 1_000),
+        (r"C:\py\python.exe", 100_000),
+        // 真的代码项目
+        (r"C:\code\app1\package.json", 1_000),
+        (r"C:\code\app2\Cargo.toml", 1_000),
+        (r"C:\code\app2\.git\HEAD", 1_000),
+    ]);
+    let cases: &[(&str, &str, Tier)] = &[
+        (r"C:\wx", "chat-files-container", Tier::Keep),
+        (r"C:\wx\xwechat_files", "chat-files", Tier::Keep),
+        (r"C:\wx\xwechat_files\wxid_a_1\msg\file\2026-06", "chat-files", Tier::Keep),
+        (r"C:\wx\xwechat_files\wxid_a_1\cache", "chat-files-cache", Tier::Review),
+        (r"C:\old\Tencent Files\12345", "chat-files", Tier::Keep),
+        (r"C:\vg\Tencent Games", "game-tencent-root", Tier::Keep),
+        (r"C:\vg", "game-tencent-root", Tier::Keep),
+        (r"C:\vg\Tencent Games\VALORANT\live\ShooterGame\Content\Paks", "game-tencent", Tier::Keep),
+        (r"C:\vg\Tencent Games\wonderfulVideos123", "game-highlights", Tier::Review),
+        (r"C:\steam", "steam-root", Tier::Keep),
+        (r"C:\steam\steamapps", "steam-library", Tier::Keep),
+        (r"C:\steam\steamapps\common\Some Game", "steam-game", Tier::Keep),
+        (r"C:\steam\steamapps\shadercache", "steam-cache", Tier::Review),
+        (r"C:\vms\win11", "vm-vmware", Tier::Keep),
+        (r"C:\vms\ubuntu", "vm-virtualbox", Tier::Keep),
+        (r"C:\conda", "conda-root", Tier::Keep),
+        (r"C:\conda\envs", "conda-envs", Tier::Keep),
+        (r"C:\conda\envs\e1", "conda-env", Tier::Keep),
+        (r"C:\conda\envs\e1\Lib\site-packages\torch", "conda-env", Tier::Keep),
+        (r"C:\conda\pkgs", "conda-pkgs", Tier::Review),
+        (r"C:\sdk", "dev-sdk-container", Tier::Review),
+        (r"C:\sdk\android", "android-sdk", Tier::Review),
+        (r"C:\sdk\android\system-images", "android-sdk-part", Tier::Review),
+        (r"C:\sdk\gradle", "gradle-home", Tier::Review),
+        (r"C:\sdk\gradle\caches", "gradle-cache", Tier::Review),
+        (r"C:\sdk\flutter", "flutter-sdk", Tier::Review),
+        (r"C:\sdk\flutter\bin\cache", "flutter-cache", Tier::Review),
+        (r"C:\sdk\pub_cache", "pub-cache", Tier::Review),
+        (r"C:\build\out", "rust-target", Tier::Review),
+        (r"C:\build\out\debug\deps", "rust-target", Tier::Review),
+        (r"C:\py", "python-runtime", Tier::Review),
+        (r"C:\code", "user-projects", Tier::Keep),
+        (r"C:\code\app2", "user-projects", Tier::Keep),
+    ];
+    for (p, name, tier) in cases {
+        let e = ex(&t, p, &ctx);
+        assert_eq!(heur_name(&e), Some(*name), "{p}：{:?} / {}", e.source, e.what);
+        assert_eq!(e.tier, *tier, "{p}");
+        assert!(e.tier != Tier::Safe);
+        if e.tier == Tier::Keep {
+            assert!(!e.how.contains(&How::Delete), "{p} keep 不能给删除");
+        }
+    }
+    // conda 环境集合列出各环境大小
+    let envs = ex(&t, r"C:\conda\envs", &ctx);
+    assert!(envs.clues.iter().any(|c| c.contains("e1") && c.contains("GB")), "{:?}", envs.clues);
+    // 虚拟机给迁移
+    assert!(ex(&t, r"C:\vms\win11", &ctx).how.contains(&How::Migrate));
+    // 腾讯游戏文件夹要点出录像占了多少
+    assert!(ex(&t, r"C:\vg\Tencent Games", &ctx).clues.iter().any(|c| c.contains("wonderfulVideos")));
+    // site-packages 里的包不是用户项目
+    let sp = ex(&t, r"C:\py\Lib\site-packages", &ctx);
+    assert_ne!(heur_name(&sp), Some("user-projects"), "{:?}", sp.what);
+    // 启发式的参考链接
+    assert!(ex(&t, r"C:\conda\pkgs", &ctx).refs.iter().any(|r| r.contains("conda")));
 }

@@ -552,12 +552,33 @@ tier = "keep"
 scope = "self"
 match = ['%LOCALAPPDATA%\Packages']
 what = "商店应用（MSIX 包）的数据，每个应用一个文件夹"
-why = "商店应用不能随便往别处写，它们的设置、缓存、下载内容都放在自己的文件夹里"
-lose = "不能整个删。请点进去看是哪个应用大；有的应用可以在“设置 > 应用 > 高级选项”里“重置”来清空数据。"
+why = "每个商店应用（包括打包成 MSIX 的桌面程序，比如商店版 Claude、Codex）在这里有自己的数据文件夹。桌面程序往 AppData 新建的文件，Windows 会存进对应包的 LocalCache\\Local / LocalCache\\Roaming，同时在原来的 AppData 位置显示同一份——所以这里的东西有时和 AppData 里看到的是同一份，不是两份"
+lose = "不能整个删。请点进去看是哪个应用大；有的应用可以在“设置 > 应用 > 高级选项”里“重置”来清空数据。卸载一个商店应用时，Windows 会把它在这里的数据（包括重定向进来的 AppData 文件）一起删掉。"
 how = "none"
 how_detail = ""
-refs = []
-verified_on = "2026-09-23"
+refs = ["https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes"]
+verified_on = "2026-09-24"
+
+[[rule]]
+id = "msix-localcache"
+owner = "Windows（商店应用 AppData 重定向）"
+category = "userdata"
+tier = "review"
+scope = "self"
+owner_from_path = true
+match = [
+  '%LOCALAPPDATA%\Packages\*\LocalCache',
+  '%LOCALAPPDATA%\Packages\*\LocalCache\Local',
+  '%LOCALAPPDATA%\Packages\*\LocalCache\Roaming',
+  '%LOCALAPPDATA%\Packages\*\LocalCache\LocalLow',
+]
+what = "这个商店应用（及它启动的程序）写进 AppData 的文件，被 Windows 存到了应用包里"
+why = "微软文档：打包成 MSIX 的桌面程序在 AppData 下新建的文件和文件夹，会写到“每用户、每应用”的私有位置（就是这里的 LocalCache\\Local / Roaming / LocalLow），运行时再合并显示在真实的 AppData 里。这个应用启动的子程序（比如在 Claude 里跑的命令行工具）写的文件也会进来，所以这里可能有和这个应用无关的文件夹"
+lose = "不能整个删。点进去看：每个子文件夹 DiskWhy 会按它在 AppData 里对应的真实位置来说明（比如这里的 Local\\pip 就按 AppData\\Local\\pip 说明）。卸载这个商店应用时，Windows 会把这里的文件一起删掉——如果里面有别的程序的数据，卸载前先确认。"
+how = "none"
+how_detail = ""
+refs = ["https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes"]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "store-app-package"

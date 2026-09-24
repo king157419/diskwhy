@@ -165,7 +165,7 @@ pub fn listing(result: &ScanResult, path: &str, limit: usize, ctx: Option<&Expla
     let node = *chain.last().unwrap();
     let parent_alloc = if chain.len() >= 2 { chain[chain.len() - 2].allocated } else { result.used_bytes };
     // 子项的“上层规则继承”只跟当前目录的祖先链有关，算一次。
-    let inherited = ctx.and_then(|c| c.rules.best_inherited(&chain));
+    let inherited = ctx.and_then(|c| c.inherited(&chain));
     let children = node
         .children
         .iter()
@@ -313,7 +313,7 @@ fn tm_fill<'a>(
     }
     let (max_n, min_frac) = TM_LEVELS[level.min(TM_LEVELS.len() - 1)];
     let min_bytes = (root_alloc as f64 * min_frac) as u64;
-    let inherited = ctx.and_then(|c| c.rules.best_inherited(chain));
+    let inherited = ctx.and_then(|c| c.inherited(chain));
     let mut sent = 0usize;
     for c in &node.children {
         if c.allocated == 0 {

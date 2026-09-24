@@ -7,6 +7,7 @@
 //! 3. 都不行：`source = Unknown`，把看到的线索列出来。
 //! 4. LLM 兜底（[`llm`]）只在用户点“问 AI”时调用，不在这里自动跑。
 
+pub mod big_items;
 pub mod env;
 pub mod heuristics;
 pub mod llm;
@@ -188,14 +189,130 @@ pub struct Target<'a> {
     pub ancestors: &'a [&'a Node],
 }
 
+// ───────────────────────── 商店应用（MSIX）重定向的 AppData ─────────────────────────
+
+/// `%LOCALAPPDATA%\Packages\<包>\LocalCache\{Local,Roaming,LocalLow}\…` 其实是“打包成商店应用的桌面程序
+/// （以及它启动的子程序）往 AppData 写的新文件”，Windows 把它们存在应用包里、同时在真实 AppData 位置显示同一份
+/// （learn.microsoft.com/windows/msix/desktop/desktop-to-uwp-behind-the-scenes）。
+/// 解释这种路径时按它对应的真实 AppData 路径去匹配规则，而不是笼统地说成“某商店应用的数据”。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsixRedirect {
+    /// 包文件夹名（如 `Claude_pzs8sxrjxfjjc`）。
+    pub package: String,
+    /// 对应的真实 AppData 路径（保留原大小写）。
+    pub mapped: String,
+    /// `AppData\Local` / `AppData\Roaming` / `AppData\LocalLow`。
+    pub area: &'static str,
+}
+
+impl MsixRedirect {
+    /// 包名里的应用名：`Publisher.AppName_发布者哈希` → `AppName`；`Claude_xxx` → `Claude`。
+    pub fn app_name(&self) -> String {
+        let first = self.package.split('_').next().unwrap_or(&self.package);
+        first.rsplit_once('.').map(|(_, a)| a).unwrap_or(first).to_string()
+    }
+}
+
+impl ExplainCtx {
+    /// 小写段是否形如 `<LOCALAPPDATA>\packages\<包>\localcache\<区>…`；返回 (LOCALAPPDATA 段数, 区对应的根变量, 子路径, 区名)。
+    fn msix_parts(&self, segs: &[String]) -> Option<(usize, &'static str, &'static str, &'static str)> {
+        let base = split_lower(self.env.get("LOCALAPPDATA")?);
+        let n = base.len();
+        if segs.len() < n + 4 || segs[..n] != base[..] || segs[n] != "packages" || segs[n + 2] != "localcache" {
+            return None;
+        }
+        match segs[n + 3].as_str() {
+            "local" => Some((n, "LOCALAPPDATA", "", "AppData\\Local")),
+            "roaming" => Some((n, "APPDATA", "", "AppData\\Roaming")),
+            "locallow" => Some((n, "USERPROFILE", "\\AppData\\LocalLow", "AppData\\LocalLow")),
+            _ => None,
+        }
+    }
+
+    /// 路径在某个商店应用的 LocalCache\{Local,Roaming,LocalLow} **之下**（不含这三个文件夹本身）时，给出对应的真实 AppData 路径。
+    pub fn msix_redirect(&self, path: &str) -> Option<MsixRedirect> {
+        let segs = split_lower(path);
+        let (n, var, sub, area) = self.msix_parts(&segs)?;
+        if segs.len() < n + 5 {
+            return None;
+        }
+        let orig: Vec<&str> = path.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
+        if orig.len() != segs.len() {
+            return None;
+        }
+        let root = self.env.get(var)?;
+        Some(MsixRedirect { package: orig[n + 1].to_string(), mapped: format!("{root}{sub}\\{}", orig[n + 4..].join("\\")), area })
+    }
+
+    /// 小写段正好是某个 LocalCache\{Local,Roaming,LocalLow} 文件夹本身时，返回它对应的真实 AppData 根（汇总遍历用）。
+    fn msix_area_root(&self, segs: &[String]) -> Option<String> {
+        let (n, var, sub, _) = self.msix_parts(segs)?;
+        if segs.len() != n + 4 {
+            return None;
+        }
+        Some(format!("{}{sub}", self.env.get(var)?))
+    }
+
+    /// 沿祖先链从近到远找第一个命中 `scope = tree` 规则的文件夹；商店应用重定向的路径按真实 AppData 路径匹配，
+    /// 而且只从同样是重定向的祖先继承（不会越过 LocalCache 边界继承“某商店应用的数据”）。
+    pub fn inherited(&self, ancestors: &[&Node]) -> Option<InheritedHit> {
+        let mut started_mapped: Option<bool> = None;
+        for a in ancestors.iter().rev() {
+            if a.path.is_empty() {
+                continue;
+            }
+            let m = self.msix_redirect(&a.path);
+            match started_mapped {
+                None => started_mapped = Some(m.is_some()),
+                Some(true) if m.is_none() => return None,
+                _ => {}
+            }
+            let segs = split_lower(m.as_ref().map(|x| x.mapped.as_str()).unwrap_or(&a.path));
+            if let Some(ri) = self.rules.best_tree_rule(&segs, a) {
+                return Some(InheritedHit { rule: ri, from_path: a.path.clone() });
+            }
+        }
+        None
+    }
+}
+
 /// 解释一个节点。继承命中会自己沿 `ancestors` 往上找。
 pub fn explain(t: &Target, ctx: &ExplainCtx) -> Explanation {
-    let inherited = ctx.rules.best_inherited(t.ancestors);
+    let inherited = ctx.inherited(t.ancestors);
     explain_with_inherited(t, inherited.as_ref(), ctx)
 }
 
-/// 同 [`explain`]，但继承命中由调用方预先算好（列目录时对所有子项只算一次）。
+/// 同 [`explain`]，但继承命中由调用方预先算好（列目录时对所有子项只算一次，用 [`ExplainCtx::inherited`]）。
 pub fn explain_with_inherited(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) -> Explanation {
+    if t.node.kind != NodeKind::Rest {
+        if let Some(m) = ctx.msix_redirect(t.path) {
+            return explain_redirected(t, inherited, &m, ctx);
+        }
+    }
+    explain_plain(t, inherited, ctx)
+}
+
+/// 商店应用重定向的路径：按真实 AppData 路径解释，再补一句“它其实是哪里、卸载时会怎样”。
+fn explain_redirected(t: &Target, inherited: Option<&InheritedHit>, m: &MsixRedirect, ctx: &ExplainCtx) -> Explanation {
+    // 只接受同样在 LocalCache 里面的上层规则，不越界继承“某商店应用的数据”。
+    let inh = inherited.filter(|h| ctx.msix_redirect(&h.from_path).is_some());
+    let mt = Target { node: t.node, path: &m.mapped, parent: t.parent, ancestors: t.ancestors };
+    let mut e = explain_plain(&mt, inh, ctx);
+    let app = m.app_name();
+    e.notes.insert(
+        0,
+        format!(
+            "它和「{}」是同一份文件：商店版「{app}」（以及它启动的其他程序，比如在它里面跑的命令行工具）往 {} 写的新文件，Windows 会存进这个应用包的 LocalCache，同时在原位置显示。所以这里按「{}」来说明。注意：卸载「{app}」时，Windows 会把这里的文件一起删掉。",
+            m.mapped, m.area, m.mapped
+        ),
+    );
+    if e.is_unknown() {
+        e.clues.insert(0, format!("它其实是「{}」（商店版「{app}」重定向过来的 {}）", m.mapped, m.area));
+    }
+    e
+}
+
+fn explain_plain(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) -> Explanation {
     let node = t.node;
     if node.kind == NodeKind::Rest {
         return explain_rest(t, inherited, ctx);
@@ -212,7 +329,10 @@ pub fn explain_with_inherited(t: &Target, inherited: Option<&InheritedHit>, ctx:
 
 /// 目录的“其余小文件合计”节点：跟随所在目录的说明。
 fn explain_rest(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) -> Explanation {
-    let segs = split_lower(t.path);
+    // 所在目录是商店应用重定向的 AppData 时，按真实路径匹配，且不越界继承。
+    let redirect = ctx.msix_redirect(t.path);
+    let inherited = if redirect.is_some() { inherited.filter(|h| ctx.msix_redirect(&h.from_path).is_some()) } else { inherited };
+    let segs = split_lower(redirect.as_ref().map(|m| m.mapped.as_str()).unwrap_or(t.path));
     // 所在目录自己精确命中的规则（只认 tree；self 规则只说明那个文件夹本身，不管里面的散文件）。
     let dir_rule = t
         .parent
@@ -346,7 +466,7 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
         })
         .collect();
     let mut segs = root_segs;
-    walk_summary(tree, &mut segs, &active, None, rs, &mut per_rule, &mut uncovered);
+    walk_summary(tree, &mut segs, &active, None, ctx, &mut per_rule, &mut uncovered);
 
     let mut s = TierSummary { uncovered_bytes: uncovered, rules_total: rs.rules.len(), ..Default::default() };
     let mut items: Vec<RuleBytes> = Vec::new();
@@ -390,10 +510,11 @@ fn walk_summary(
     segs: &mut Vec<String>,
     active: &[u32],
     inherited: Option<usize>,
-    rs: &RuleSet,
+    ctx: &ExplainCtx,
     per_rule: &mut [u64],
     uncovered: &mut u64,
 ) {
+    let rs = &ctx.rules;
     let exact = rs.best_exact_among(active, segs, Some(node));
     // self 规则只说明文件夹本身，里面的东西不归它。
     let child_inherited = match exact {
@@ -411,6 +532,19 @@ fn walk_summary(
             }
             NodeKind::Dir => {
                 segs.push(c.name.to_lowercase());
+                // 商店应用重定向的 AppData：里面的东西按真实 AppData 路径归档（和解释时一致）。
+                if let Some(root) = ctx.msix_area_root(segs) {
+                    let mut msegs = split_lower(&root);
+                    let mactive: Vec<u32> = (0..rs.patterns.len() as u32)
+                        .filter(|&i| {
+                            let p = &rs.patterns[i as usize].1;
+                            p.matches(&msegs) || p.could_match_below(&msegs)
+                        })
+                        .collect();
+                    walk_summary(c, &mut msegs, &mactive, None, ctx, per_rule, uncovered);
+                    segs.pop();
+                    continue;
+                }
                 let child_active: Vec<u32> = active
                     .iter()
                     .copied()
@@ -423,7 +557,7 @@ fn walk_summary(
                     let own = if child_active.is_empty() { None } else { rs.best_exact_among(&child_active, segs, Some(c)) };
                     add(per_rule, uncovered, own.or(child_inherited), c.allocated);
                 } else {
-                    walk_summary(c, segs, &child_active, child_inherited, rs, per_rule, uncovered);
+                    walk_summary(c, segs, &child_active, child_inherited, ctx, per_rule, uncovered);
                 }
                 segs.pop();
             }

@@ -372,26 +372,32 @@ impl RuleSet {
     }
 
     /// 沿祖先链从近到远找第一个命中 `scope = tree` 规则的文件夹。
+    ///
+    /// 只看原始路径；需要考虑商店应用（MSIX）重定向时用 `ExplainCtx::inherited`。
     pub fn best_inherited(&self, ancestors: &[&Node]) -> Option<InheritedHit> {
         for a in ancestors.iter().rev() {
             if a.path.is_empty() {
                 continue;
             }
-            let segs = split_lower(&a.path);
-            let mut best: Option<(u32, usize)> = None;
-            for (ri, p) in &self.patterns {
-                if self.rules[*ri].scope != Scope::Tree {
-                    continue;
-                }
-                if (best.is_none() || p.specificity > best.unwrap().0) && p.matches(&segs) && self.rule_accepts(*ri, Some(a)) {
-                    best = Some((p.specificity, *ri));
-                }
-            }
-            if let Some((_, ri)) = best {
+            if let Some(ri) = self.best_tree_rule(&split_lower(&a.path), a) {
                 return Some(InheritedHit { rule: ri, from_path: a.path.clone() });
             }
         }
         None
+    }
+
+    /// 某个文件夹（按 `segs` 匹配）精确命中的、`scope = tree` 的最具体规则。
+    pub fn best_tree_rule(&self, segs: &[String], node: &Node) -> Option<usize> {
+        let mut best: Option<(u32, usize)> = None;
+        for (ri, p) in &self.patterns {
+            if self.rules[*ri].scope != Scope::Tree {
+                continue;
+            }
+            if (best.is_none() || p.specificity > best.unwrap().0) && p.matches(segs) && self.rule_accepts(*ri, Some(node)) {
+                best = Some((p.specificity, *ri));
+            }
+        }
+        best.map(|b| b.1)
     }
 
     pub fn by_id(&self, id: &str) -> Option<&Rule> {

@@ -130,11 +130,11 @@ pub fn subtree_stats(node: &Node) -> SubtreeStats {
 
 // ───────────────────────── 小工具 ─────────────────────────
 
-fn child<'a>(n: &'a Node, name: &str) -> Option<&'a Node> {
+pub(super) fn child<'a>(n: &'a Node, name: &str) -> Option<&'a Node> {
     n.children.iter().find(|c| c.kind != NodeKind::Rest && c.name.eq_ignore_ascii_case(name))
 }
 
-fn has_child(n: &Node, name: &str) -> bool {
+pub(super) fn has_child(n: &Node, name: &str) -> bool {
     child(n, name).is_some()
 }
 
@@ -259,25 +259,25 @@ fn top_children_summary(n: &Node, k: usize) -> String {
 
 // ───────────────────────── 结果构造 ─────────────────────────
 
-struct Hint {
-    name: &'static str,
-    tier: Tier,
-    category: Category,
-    what: String,
-    why: String,
-    lose: String,
-    how: Vec<How>,
-    how_detail: String,
-    confidence: f32,
-    owner: Option<String>,
-    clues: Vec<String>,
+pub(super) struct Hint {
+    pub(super) name: &'static str,
+    pub(super) tier: Tier,
+    pub(super) category: Category,
+    pub(super) what: String,
+    pub(super) why: String,
+    pub(super) lose: String,
+    pub(super) how: Vec<How>,
+    pub(super) how_detail: String,
+    pub(super) confidence: f32,
+    pub(super) owner: Option<String>,
+    pub(super) clues: Vec<String>,
 }
 
 /// 统一收尾：档位兜底（绝不 safe）、能腾多少、年龄提示。
 fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explanation {
     let tier = if h.tier == Tier::Safe { Tier::Review } else { h.tier };
     let (gain_bytes, gain_note) = gain(tier, &h.how, t.node.allocated);
-    let mut notes = vec!["这是 DiskWhy 根据文件夹里的内容推测的，不是规则库里核实过的说法，所以最多只标“需要你判断”。".to_string()];
+    let mut notes = vec!["这是 DiskWhy 根据文件夹的名字和内容推测的，不是规则库里核实过的说法，所以绝不会标成“可放心清理”。".to_string()];
     let newest = if stats.newest_mtime > 0 { stats.newest_mtime } else { t.node.mtime };
     if let Some(s) = stale_note(newest, ctx.now) {
         notes.push(s);
@@ -296,7 +296,7 @@ fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explan
         gain_note,
         source: Source::Heuristic { name: h.name.to_string() },
         confidence: h.confidence,
-        refs: Vec::new(),
+        refs: super::big_items::refs_for(h.name).iter().map(|s| s.to_string()).collect(),
         verified_on: None,
         notes,
         clues: h.clues,
@@ -308,6 +308,18 @@ fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explan
 /// 规则没命中时调用：签名 → 注册表归属 → 未知。
 pub fn explain_unmatched(t: &Target, ctx: &ExplainCtx) -> Explanation {
     let stats = subtree_stats(t.node);
+    // 用户自己放的大东西（聊天记录、游戏、虚拟机、conda、SDK、编译产物）：按名字和结构认，优先于通用签名。
+    if let Some(h) = super::big_items::structural(t, ctx) {
+        return finish(h, t, &stats, ctx);
+    }
+    if let Some(h) = super::big_items::by_content(t, &stats) {
+        return finish(h, t, &stats, ctx);
+    }
+    // 上层文件夹能认出来（比如在 Rust 编译产物、conda 环境、Android SDK、Steam 游戏里面）：沿用上层的推测，
+    // 免得 conda 环境是 keep、它里面的 Lib 却被通用签名说成 review 的“一套 Python 环境”。
+    if let Some(h) = super::big_items::inherited(t, ctx) {
+        return finish(h, t, &stats, ctx);
+    }
     if let Some(h) = signature(t, &stats, ctx) {
         return finish(h, t, &stats, ctx);
     }

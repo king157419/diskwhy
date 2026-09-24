@@ -501,12 +501,15 @@ match = [
   '%USERPROFILE%\.vscode-oss\extensions',
 ]
 what = "编辑器装的扩展（插件）本体"
-why = "你在编辑器里安装的每个扩展都放在这里；旧版本有时不会被及时清掉"
+why = "你在编辑器里安装的每个扩展都放在这里。扩展升级后，旧版本会被记进这个文件夹里的 .obsolete 文件，等编辑器下次启动时才真正删掉（VS Code 源码 extensionManagementService 的 cleanUp → deleteExtensionsMarkedForRemoval）；所以很久没打开的编辑器，这里会堆着好几个版本"
 lose = "删了扩展就没了，要重新安装，扩展的设置一般还在。"
 how = "manual"
-how_detail = "在编辑器的扩展面板里卸载不用的扩展；同一扩展有多个版本号文件夹时，旧版本通常可删（编辑器重启后也会自己清）。"
-refs = ["https://code.visualstudio.com/docs/configure/extensions/extension-marketplace"]
-verified_on = "2026-09-23"
+how_detail = "先把对应的编辑器打开一次、再关掉，它会自己删掉 .obsolete 里记着的旧版本；再在扩展面板里卸载不用的扩展。不用这个编辑器了，先卸载编辑器再删这个文件夹。"
+refs = [
+  "https://code.visualstudio.com/docs/configure/extensions/extension-marketplace",
+  "https://github.com/microsoft/vscode/blob/main/src/vs/platform/extensionManagement/node/extensionManagementService.ts",
+]
+verified_on = "2026-09-24"
 
 [[rule]]
 id = "vscode-program"

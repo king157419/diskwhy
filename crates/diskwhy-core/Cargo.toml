@@ -15,4 +15,9 @@ ureq = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+# 只用于回收站的 IFileOperation（COM 接口，windows-sys 不含 COM 接口）。0.61.3 已在 Cargo.lock 里（Tauri 依赖它）。
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com"] }
 
+[dev-dependencies]
+# 测试里对文件内容算 SHA-256，核对隔离区 / 回收站往返后内容一致（0.10.9 已在 Cargo.lock 里）。
+sha2 = "0.10"

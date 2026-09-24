@@ -9,6 +9,8 @@
 //!
 //! 本库不依赖 Tauri。
 
+#[cfg(windows)]
+pub mod action;
 pub mod attribution;
 pub mod dedup;
 pub mod explain;

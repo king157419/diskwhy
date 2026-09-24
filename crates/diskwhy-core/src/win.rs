@@ -32,12 +32,12 @@ const DRIVE_FIXED: u32 = 3;
 /// GetCompressedFileSizeW 失败时的返回值 INVALID_FILE_SIZE (0xFFFFFFFF)。
 const INVALID_FILE_SIZE: u32 = 0xFFFF_FFFF;
 
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 加 `\\?\` 长路径前缀（已带前缀的原样返回）。
-fn long_path(path: &str) -> String {
+pub(crate) fn long_path(path: &str) -> String {
     if path.starts_with(r"\\?\") {
         path.to_string()
     } else {
@@ -45,7 +45,7 @@ fn long_path(path: &str) -> String {
     }
 }
 
-fn from_wide_nul(buf: &[u16]) -> String {
+pub(crate) fn from_wide_nul(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
 }
@@ -215,7 +215,7 @@ impl FsBackend for Win32Fs {
 }
 
 /// FileIdInfo 优先；失败退回 BY_HANDLE_FILE_INFORMATION 的 64 位文件索引。
-unsafe fn file_key(h: HANDLE, bh: Option<&BY_HANDLE_FILE_INFORMATION>) -> Option<FileKey> {
+pub(crate) unsafe fn file_key(h: HANDLE, bh: Option<&BY_HANDLE_FILE_INFORMATION>) -> Option<FileKey> {
     let mut fi: FILE_ID_INFO = zeroed();
     if GetFileInformationByHandleEx(
         h,

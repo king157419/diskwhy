@@ -55,7 +55,8 @@ const pseudoBlocks = computed(() => {
   const list: { key: PseudoKey; bytes: number }[] = [
     { key: "inacc", bytes: b.inaccessible },
     { key: "sysest", bytes: b.system_reserved_estimated },
-    { key: "unattr", bytes: b.unattributed },
+    // 扫描的只是一个文件夹时，“未归属”= 扫描范围之外的整个盘，不画进这个文件夹的方块图
+    { key: "unattr", bytes: b.scope_is_volume_root ? b.unattributed : 0 },
     { key: "cloud", bytes: b.cloud_placeholder },
   ];
   return list.filter((x) => x.bytes > 0);

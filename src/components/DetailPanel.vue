@@ -1,11 +1,41 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { askAi, tierKey, type Explanation, type NodeView } from "../api";
+import { askAi, cartEligibility, getGuidance, openSystemSettings, tierKey, type Explanation, type Guidance, type NodeView } from "../api";
 import { HOW_LABEL, TIER_BIG, TIER_HINT, attrText, fmtInt, fmtTime, humanBytes, sourceLabel } from "../format";
 
-const props = defineProps<{ node: NodeView | null; llmReady: boolean }>();
-const emit = defineEmits<{ openSettings: []; openPath: [path: string] }>();
+const props = defineProps<{ node: NodeView | null; llmReady: boolean; inCart: boolean; canAct: boolean }>();
+const emit = defineEmits<{ openSettings: []; openPath: [path: string]; addToCart: [node: NodeView]; removeFromCart: [path: string] }>();
+
+// ───── 阶段 D：动作区 ─────
+const elig = computed(() => cartEligibility(props.node));
+const guidance = ref<Guidance[]>([]);
+const guidanceError = ref("");
+const settingsError = ref("");
+watch(
+  () => (props.node ? props.node.path + "|" + props.node.kind + "|" + (props.node.explanation?.tier ?? "") : ""),
+  async () => {
+    guidance.value = [];
+    guidanceError.value = "";
+    settingsError.value = "";
+    const n = props.node;
+    if (!n || n.pseudo || n.kind === "Rest" || !n.explanation || n.explanation.source.kind === "unknown") return;
+    try {
+      guidance.value = await getGuidance(n.path, n.kind);
+    } catch (e) {
+      guidanceError.value = String(e);
+    }
+  },
+  { immediate: true },
+);
+async function openSettingsPage(uri: string) {
+  settingsError.value = "";
+  try {
+    await openSystemSettings(uri);
+  } catch (e) {
+    settingsError.value = String(e);
+  }
+}
 
 const aiResult = ref<Explanation | null>(null);
 const aiLoading = ref(false);
@@ -156,6 +186,50 @@ async function copy(text: string) {
         </div>
       </section>
 
+      <!-- 阶段 D：动作区。safe/review 且可以直接删 → 加入清理清单；keep → 该怎么腾；未知 → 先搞清楚 -->
+      <section v-if="ex && !node.pseudo && node.kind !== 'Rest'" class="act-box" :class="'act-' + (elig.ok ? tk : elig.reason || 'none')">
+        <template v-if="elig.ok">
+          <div class="act-row">
+            <button v-if="!inCart" class="btn primary" :disabled="!canAct" @click="emit('addToCart', node)">＋ 加入清理清单</button>
+            <button v-else class="btn" @click="emit('removeFromCart', node.path)">✓ 已在清理清单（点此移出）</button>
+            <span class="muted small">{{ humanBytes(node.allocated) }}</span>
+          </div>
+          <p class="muted small">
+            加入清单不会马上删除。点右下角“清理清单 → 预览”后，会逐条列出真正要删的文件、跳过的文件和原因，确认后才执行；默认进回收站。
+          </p>
+          <p v-if="tk === 'review'" class="act-review small">这一项删了有代价：{{ ex.lose }}</p>
+        </template>
+        <template v-else-if="elig.reason === 'unknown'">
+          <div class="act-title">先搞清楚它是什么再说</div>
+          <p class="small">
+            规则库和启发式都没认出来，DiskWhy 不会让你删它。上面列了看到的线索；也可以问问 AI——但 AI 的回答只是推测，同样不能作为删除依据。
+          </p>
+        </template>
+        <template v-else-if="elig.reason === 'keep' || elig.reason === 'tool'">
+          <div class="act-title">{{ elig.reason === "keep" ? "这个不能删，想腾空间这样做" : "这一项不建议直接删，这样清理" }}</div>
+          <p v-if="!guidance.length && ex.how_detail" class="small">{{ ex.how_detail }}</p>
+        </template>
+        <p v-else-if="elig.reason" class="small muted">{{ elig.reason }}</p>
+
+        <div v-if="guidance.length" class="guides">
+          <div v-for="g in guidance" :key="g.title" class="guide">
+            <div class="guide-title">
+              {{ g.title }}
+              <span v-if="g.needs_admin" class="tag">需要管理员</span>
+            </div>
+            <div v-if="g.command" class="guide-cmd">
+              <code>{{ g.command }}</code>
+              <button class="mini" @click="copy(g.command!)">{{ copied === g.command ? "已复制" : "复制" }}</button>
+            </div>
+            <div v-if="g.shell" class="muted small">在哪运行：{{ g.shell }}（DiskWhy 不会替你运行）</div>
+            <p class="small">{{ g.explain }}</p>
+            <button v-if="g.settings_uri" class="btn" @click="openSettingsPage(g.settings_uri!)">打开系统设置</button>
+          </div>
+          <p v-if="settingsError" class="ai-error small">{{ settingsError }}</p>
+        </div>
+        <p v-if="guidanceError" class="ai-error small">{{ guidanceError }}</p>
+      </section>
+
       <section v-if="aiResult" class="explain ex-ai">
         <div class="ex-head">
           <span class="ex-badge chip-review">AI 推测 · 需要你来判断</span>
@@ -200,7 +274,6 @@ async function copy(text: string) {
       <ul v-if="status.length" class="d-status">
         <li v-for="s in status" :key="s">{{ s }}</li>
       </ul>
-      <p class="muted small">目前只做解释，不提供删除按钮（带护栏的删除在下一阶段）。</p>
     </template>
     <template v-else>
       <p class="muted">点击左侧列表中的一项查看详情。</p>

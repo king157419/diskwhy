@@ -16,9 +16,24 @@
 //! - `test_llm(settings)` -> 连接测试结果文本
 //! - `ask_ai(path)`       -> Explanation（source = Llm，tier = review），只在用户点“问 AI”时调用
 //!
+//! 阶段 D（带护栏的动作，逻辑全在 `diskwhy_core::action`）：
+//! - `action_env`         -> 盘符 + 隔离区批次（超过 7 天的个数）+ 日志位置
+//! - `preview_plan(items, strategy)` -> PreflightReport（后端按当前扫描结果重新判断档位 / 规则 / 保护路径，枚举实际内容并预检）
+//! - `execute_plan(plan_id, skip_locked, onProgress)` -> ExecOutcome（执行 + 重扫受影响的子树 + 新摘要）
+//! - `list_quarantine` / `restore_batch(manifest_path)` / `purge_batch(manifest_path)`
+//! - `get_guidance(path, kind)` -> keep / 只能用工具 / 迁移 的指引（只展示命令，不运行）
+//! - `open_system_settings(uri)` -> 打开白名单里的 ms-settings 页
+//! - `pick_scan_folder` / `startup_scan_dir`（`--scan <文件夹>`）：只扫描某个文件夹
+//!
 //! 插件：`tauri-plugin-opener`（前端打开参考链接）、`tauri-plugin-dialog`（快照的保存/打开对话框，
 //! 只在 Rust 侧调用，前端不需要 dialog 权限）。
 
+use diskwhy_core::action::guidance::{self, Guidance};
+use diskwhy_core::action::log::ActionLog;
+use diskwhy_core::action::protect::Protector;
+use diskwhy_core::action::quarantine::{self, BatchInfo, PurgeReport, RestoreReport};
+use diskwhy_core::action::refresh::RefreshReport;
+use diskwhy_core::action::{self, ExecOptions, ExecProgress, ExecReport, Plan, PlanRequest, PreflightOptions, PreflightReport, Strategy};
 use diskwhy_core::explain::llm::{self, LlmSettings};
 use diskwhy_core::explain::{tier_summary, ExplainCtx, Explanation, Target, TierSummary};
 use diskwhy_core::scan::scan;
@@ -31,7 +46,7 @@ use diskwhy_core::{
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -45,6 +60,10 @@ struct AppState {
     scanning: AtomicBool,
     /// 解释上下文（环境变量 + 规则库 + 注册表快照 + 设置），第一次用到时加载一次。
     ctx: RwLock<Option<(Arc<ExplainCtx>, Vec<String>)>>,
+    /// 最近一次预览的清理计划（执行时按 id 取出，执行一次就没了）。
+    plan: Mutex<Option<Plan>>,
+    /// 正在执行 / 还原 / 清空。
+    acting: AtomicBool,
 }
 
 impl AppState {
@@ -375,6 +394,264 @@ async fn ask_ai(path: String, state: State<'_, AppState>) -> Result<Explanation,
     .map_err(|e| format!("AI 线程异常：{e}"))?
 }
 
+// ───────────────────────── 阶段 D：带护栏的动作 ─────────────────────────
+
+fn protector() -> &'static Protector {
+    static P: OnceLock<Protector> = OnceLock::new();
+    P.get_or_init(Protector::from_system)
+}
+
+fn quarantine_roots() -> Vec<String> {
+    let mut roots: Vec<String> = list_fixed_drives().into_iter().map(|d| d.root).collect();
+    for r in quarantine::known_roots() {
+        if !roots.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+            roots.push(r);
+        }
+    }
+    roots
+}
+
+#[derive(Serialize)]
+struct ActionEnv {
+    drives: Vec<DriveInfo>,
+    batches: Vec<BatchInfo>,
+    expired_batches: usize,
+    log_path: String,
+    keep_days: i64,
+}
+
+#[tauri::command]
+async fn action_env() -> Result<ActionEnv, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let batches = quarantine::list_batches(&quarantine_roots());
+        ActionEnv {
+            drives: list_fixed_drives(),
+            expired_batches: batches.iter().filter(|b| b.expired).count(),
+            batches,
+            log_path: ActionLog::default_path().map(|p| p.display().to_string()).unwrap_or_default(),
+            keep_days: quarantine::KEEP_DAYS,
+        }
+    })
+    .await
+    .map_err(|e| format!("线程异常：{e}"))
+}
+
+/// 清理清单 → 计划 + 预检。档位 / 规则 / 保护路径全部由后端按当前扫描结果重新判断。
+#[tauri::command]
+async fn preview_plan(items: Vec<PlanRequest>, strategy: Strategy, state: State<'_, AppState>) -> Result<PreflightReport, String> {
+    if state.scanning.load(Ordering::SeqCst) {
+        return Err("正在扫描，先等扫描结束".into());
+    }
+    if items.is_empty() {
+        return Err("清理清单是空的".into());
+    }
+    let r = state.result()?;
+    let ctx = state.ctx();
+    let (plan, rep) = tauri::async_runtime::spawn_blocking(move || {
+        let mut plan = action::build_plan(&r, &ctx, protector(), &items, strategy);
+        let rep = action::preflight(&mut plan, protector(), &PreflightOptions::default());
+        (plan, rep)
+    })
+    .await
+    .map_err(|e| format!("预检线程异常：{e}"))?;
+    *state.plan.lock().unwrap() = Some(plan);
+    Ok(rep)
+}
+
+#[derive(Serialize)]
+struct ExecOutcome {
+    report: ExecReport,
+    refresh: RefreshReport,
+    summary: Option<ScanSummary>,
+}
+
+/// 刷新受影响的目录并返回新的摘要（扫描结果不在时返回 None）。
+fn refresh_after(state: &AppState, ctx: &ExplainCtx, dirs: &[String]) -> (RefreshReport, Option<ScanSummary>) {
+    let taken = state.result.lock().unwrap().take();
+    let Some(mut arc) = taken else { return (RefreshReport::default(), None) };
+    let rep = {
+        let r = Arc::make_mut(&mut arc);
+        action::refresh::refresh_dirs(r, dirs)
+    };
+    let tiers = tier_summary(&arc.tree, ctx);
+    let snap = state.snapshot.lock().unwrap().clone();
+    let summary = summarize(&arc, tiers, snap);
+    *state.result.lock().unwrap() = Some(arc);
+    (rep, Some(summary))
+}
+
+#[tauri::command]
+async fn execute_plan(
+    plan_id: String,
+    skip_locked: bool,
+    on_progress: Channel<ExecProgress>,
+    state: State<'_, AppState>,
+) -> Result<ExecOutcome, String> {
+    if state.scanning.load(Ordering::SeqCst) {
+        return Err("正在扫描，先等扫描结束".into());
+    }
+    if state.acting.swap(true, Ordering::SeqCst) {
+        return Err("已经有一个清理动作在进行".into());
+    }
+    let plan = {
+        let mut g = state.plan.lock().unwrap();
+        match g.as_ref() {
+            Some(p) if p.id == plan_id => g.take(),
+            _ => None,
+        }
+    };
+    let Some(plan) = plan else {
+        state.acting.store(false, Ordering::SeqCst);
+        return Err("找不到这次预览的清单（可能已经执行过或被新的预览替换），请重新预览".into());
+    };
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let r = (|| {
+            let log_path = ActionLog::default_path().ok_or("找不到 %LOCALAPPDATA%")?;
+            let log = ActionLog::open(&log_path);
+            let mut opts = ExecOptions::new(&log);
+            opts.skip_locked = skip_locked;
+            let r = action::execute(&plan, protector(), &opts, |p| {
+                let _ = on_progress.send(p.clone());
+            });
+            if r.is_ok() {
+                if let Strategy::Quarantine { dest_root } = &plan.strategy {
+                    quarantine::remember_root(dest_root);
+                }
+            }
+            r
+        })();
+        (plan, r)
+    })
+    .await
+    .map_err(|e| format!("执行线程异常：{e}"));
+    let report = match res {
+        Ok((_, Ok(r))) => r,
+        Ok((plan, Err(e))) => {
+            // execute 只在动任何文件之前返回 Err（没预检、隔离区建不了、选了不跳过被占用的……），
+            // 所以把计划放回去，用户可以改一下再试，不用重新预览。
+            *state.plan.lock().unwrap() = Some(plan);
+            state.acting.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        Err(e) => {
+            state.acting.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    let ctx = state.ctx();
+    let dirs = report.affected_dirs.clone();
+    let st: &AppState = &state;
+    let (refresh, summary) = refresh_after(st, &ctx, &dirs);
+    state.acting.store(false, Ordering::SeqCst);
+    Ok(ExecOutcome { report, refresh, summary })
+}
+
+#[tauri::command]
+async fn list_quarantine() -> Result<Vec<BatchInfo>, String> {
+    tauri::async_runtime::spawn_blocking(|| quarantine::list_batches(&quarantine_roots()))
+        .await
+        .map_err(|e| format!("线程异常：{e}"))
+}
+
+#[derive(Serialize)]
+struct RestoreOutcome {
+    report: RestoreReport,
+    summary: Option<ScanSummary>,
+}
+
+#[tauri::command]
+async fn restore_batch(manifest_path: String, state: State<'_, AppState>) -> Result<RestoreOutcome, String> {
+    if state.acting.swap(true, Ordering::SeqCst) {
+        return Err("已经有一个清理动作在进行".into());
+    }
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let log = ActionLog::open(&ActionLog::default_path().ok_or("找不到 %LOCALAPPDATA%")?);
+        quarantine::restore(std::path::Path::new(&manifest_path), &log)
+    })
+    .await
+    .map_err(|e| format!("还原线程异常：{e}"));
+    let report = match res {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) | Err(e) => {
+            state.acting.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    let ctx = state.ctx();
+    let st: &AppState = &state;
+    let summary = if st.result.lock().unwrap().is_some() { refresh_after(st, &ctx, &report.touched_dirs).1 } else { None };
+    state.acting.store(false, Ordering::SeqCst);
+    Ok(RestoreOutcome { report, summary })
+}
+
+#[tauri::command]
+async fn purge_batch(manifest_path: String, state: State<'_, AppState>) -> Result<PurgeReport, String> {
+    if state.acting.swap(true, Ordering::SeqCst) {
+        return Err("已经有一个清理动作在进行".into());
+    }
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let log = ActionLog::open(&ActionLog::default_path().ok_or("找不到 %LOCALAPPDATA%")?);
+        quarantine::purge(std::path::Path::new(&manifest_path), &log)
+    })
+    .await
+    .map_err(|e| format!("清空线程异常：{e}"));
+    state.acting.store(false, Ordering::SeqCst);
+    res?
+}
+
+/// keep / 只能用工具 / 迁移 的指引（只展示命令，不运行）。
+#[tauri::command]
+fn get_guidance(path: String, kind: NodeKind, state: State<'_, AppState>) -> Result<Vec<Guidance>, String> {
+    let r = state.result()?;
+    let ctx = state.ctx();
+    if kind == NodeKind::Rest {
+        return Ok(Vec::new());
+    }
+    let (_, e) = view::explain_path(&r.tree, &path, &ctx).ok_or_else(|| format!("在扫描结果里找不到：{path}"))?;
+    Ok(guidance::guidance_for(&e))
+}
+
+/// 打开白名单里的系统设置页（ms-settings:storagesense 等）。
+#[tauri::command]
+fn open_system_settings(uri: String) -> Result<(), String> {
+    guidance::open_settings(&uri)
+}
+
+/// 选一个文件夹来扫描（Rust 侧弹系统对话框）。
+#[tauri::command]
+async fn pick_scan_folder(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(fp) = app.dialog().file().set_title("选择要扫描的文件夹").blocking_pick_folder() else {
+            return Ok(None);
+        };
+        let p: PathBuf = fp.into_path().map_err(|e| e.to_string())?;
+        Ok(Some(p.display().to_string()))
+    })
+    .await
+    .map_err(|e| format!("对话框线程异常：{e}"))?
+}
+
+/// 选一个文件夹（隔离区位置等）。
+#[tauri::command]
+async fn pick_folder(title: String, app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(fp) = app.dialog().file().set_title(title).blocking_pick_folder() else {
+            return Ok(None);
+        };
+        let p: PathBuf = fp.into_path().map_err(|e| e.to_string())?;
+        Ok(Some(p.display().to_string()))
+    })
+    .await
+    .map_err(|e| format!("对话框线程异常：{e}"))?
+}
+
+/// 启动参数 `--scan <文件夹>`：启动后直接扫描这个文件夹（自动化 / 演示用）。
+#[tauri::command]
+fn startup_scan_dir() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().position(|a| a == "--scan").and_then(|i| args.get(i + 1)).filter(|p| std::path::Path::new(p).is_dir()).cloned()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -396,7 +673,18 @@ pub fn run() {
             get_settings,
             save_settings,
             test_llm,
-            ask_ai
+            ask_ai,
+            action_env,
+            preview_plan,
+            execute_plan,
+            list_quarantine,
+            restore_batch,
+            purge_batch,
+            get_guidance,
+            open_system_settings,
+            pick_scan_folder,
+            pick_folder,
+            startup_scan_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

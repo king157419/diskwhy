@@ -256,3 +256,245 @@ export function startScan(root: string, onProgress: (p: ScanProgress) => void): 
   ch.onmessage = onProgress;
   return invoke<ScanSummary>("start_scan", { root, onProgress: ch });
 }
+
+// ───── 阶段 D：带护栏的动作 ─────
+export type Strategy = { kind: "recycle_bin" } | { kind: "quarantine"; dest_root: string };
+export type EntryKind = "file" | "link" | "cloud_dir";
+
+export interface PlanRequest {
+  path: string;
+  expect_rule: string | null;
+}
+
+/** 前端的清理清单项（只用于显示；真正的档位 / 规则由后端在预览时重新判断） */
+export interface CartItem {
+  path: string;
+  name: string;
+  kind: NodeKind;
+  allocated: number;
+  tier: Tier;
+  rule_id: string | null;
+  what: string;
+  lose: string;
+}
+
+export interface LockingProcess {
+  pid: number;
+  name: string;
+  service: string;
+}
+
+export interface EntryView {
+  path: string;
+  kind: EntryKind;
+  bytes: number;
+  mtime: number;
+  note: string | null;
+}
+
+export interface SkipView {
+  path: string;
+  kind: EntryKind;
+  bytes: number;
+  code: string;
+  reason: string;
+  processes: LockingProcess[];
+}
+
+export interface ItemReport {
+  path: string;
+  is_dir: boolean;
+  tier: Tier;
+  unknown: boolean;
+  source_label: string;
+  rule_id: string | null;
+  what: string;
+  owner: string | null;
+  lose: string;
+  scan_allocated: number;
+  blocked: string | null;
+  will_delete: EntryView[];
+  will_delete_count: number;
+  will_delete_bytes: number;
+  link_count: number;
+  skipped: SkipView[];
+  skipped_count: number;
+  skipped_bytes: number;
+  skipped_by_reason: Record<string, number>;
+  dirs_to_remove: number;
+  enum_errors: string[];
+}
+
+export interface ActionWarning {
+  code: string;
+  message: string;
+  blocking: boolean;
+}
+
+export interface DriveChoice {
+  root: string;
+  label: string;
+  free_bytes: number;
+  total_bytes: number;
+}
+
+export interface PreflightReport {
+  plan_id: string;
+  strategy: Strategy;
+  items: ItemReport[];
+  total_entries: number;
+  total_bytes: number;
+  total_skipped: number;
+  warnings: ActionWarning[];
+  locked_processes: LockingProcess[];
+  locked_count: number;
+  hot_count: number;
+  cloud_count: number;
+  link_count: number;
+  review_items: { path: string; what: string; lose: string; bytes: number }[];
+  can_execute: boolean;
+  quarantine_choices: DriveChoice[];
+}
+
+export interface ExecProgress {
+  done: number;
+  total: number;
+  bytes_done: number;
+  current: string;
+}
+
+export interface EntryResult {
+  path: string;
+  kind: EntryKind;
+  bytes: number;
+  result: "ok" | "skipped" | "failed";
+  reason: string;
+  dest: string | null;
+}
+
+export interface ItemResult {
+  path: string;
+  blocked: string | null;
+  ok: number;
+  ok_bytes: number;
+  skipped: number;
+  failed: number;
+  links_removed: number;
+  dirs_removed: number;
+  details: EntryResult[];
+}
+
+export interface ExecReport {
+  batch_id: string;
+  strategy_label: string;
+  started_at: number;
+  finished_at: number;
+  items: ItemResult[];
+  ok: number;
+  ok_bytes: number;
+  skipped: number;
+  failed: number;
+  manifest_path: string | null;
+  log_path: string;
+  log_failures: number;
+  cancelled: boolean;
+  affected_dirs: string[];
+  notes: string[];
+}
+
+export interface RefreshReport {
+  rescanned: string[];
+  removed: string[];
+  delta_bytes: number;
+  duration_ms: number;
+}
+
+export interface ExecOutcome {
+  report: ExecReport;
+  refresh: RefreshReport;
+  summary: ScanSummary | null;
+}
+
+export interface BatchInfo {
+  batch_id: string;
+  manifest_path: string;
+  batch_dir: string;
+  dest_root: string;
+  created_at: number;
+  age_days: number;
+  expired: boolean;
+  entries: number;
+  stored_entries: number;
+  bytes: number;
+  items: string[];
+}
+
+export interface RestoreReport {
+  batch_id: string;
+  restored: number;
+  restored_bytes: number;
+  skipped: number;
+  failed: number;
+  batch_removed: boolean;
+  problems: [string, string][];
+  touched_dirs: string[];
+}
+
+export interface PurgeReport {
+  batch_id: string;
+  deleted_entries: number;
+  freed_bytes: number;
+  removed: boolean;
+  error: string | null;
+}
+
+export interface ActionEnv {
+  drives: DriveInfo[];
+  batches: BatchInfo[];
+  expired_batches: number;
+  log_path: string;
+  keep_days: number;
+}
+
+export interface Guidance {
+  title: string;
+  command: string | null;
+  shell: string | null;
+  needs_admin: boolean;
+  explain: string;
+  settings_uri: string | null;
+}
+
+export const actionEnv = () => invoke<ActionEnv>("action_env");
+export const previewPlan = (items: PlanRequest[], strategy: Strategy) => invoke<PreflightReport>("preview_plan", { items, strategy });
+export function executePlan(planId: string, skipLocked: boolean, onProgress: (p: ExecProgress) => void): Promise<ExecOutcome> {
+  const ch = new Channel<ExecProgress>();
+  ch.onmessage = onProgress;
+  return invoke<ExecOutcome>("execute_plan", { planId, skipLocked, onProgress: ch });
+}
+export const listQuarantine = () => invoke<BatchInfo[]>("list_quarantine");
+export const restoreBatch = (manifestPath: string) =>
+  invoke<{ report: RestoreReport; summary: ScanSummary | null }>("restore_batch", { manifestPath });
+export const purgeBatch = (manifestPath: string) => invoke<PurgeReport>("purge_batch", { manifestPath });
+export const getGuidance = (path: string, kind: NodeKind) => invoke<Guidance[]>("get_guidance", { path, kind });
+export const openSystemSettings = (uri: string) => invoke<void>("open_system_settings", { uri });
+export const pickScanFolder = () => invoke<string | null>("pick_scan_folder");
+export const startupScanDir = () => invoke<string | null>("startup_scan_dir");
+
+/** 能不能加入清理清单（前端只用来决定显示哪个按钮；后端预览时会重新判断，不信任这里） */
+export function cartEligibility(n: NodeView | null): { ok: boolean; reason: string } {
+  if (!n || n.pseudo) return { ok: false, reason: "" };
+  if (n.kind === "Rest") return { ok: false, reason: "“其余小文件合计”不是真实的文件夹，请选具体的文件夹" };
+  const e = n.explanation;
+  if (!e) return { ok: false, reason: "" };
+  if (e.source.kind === "unknown") return { ok: false, reason: "unknown" };
+  if (e.source.kind === "llm") return { ok: false, reason: "AI 推测不能作为删除依据" };
+  if (e.tier === "keep") return { ok: false, reason: "keep" };
+  if (n.system_reserved) return { ok: false, reason: "系统保留项请用系统工具处理" };
+  if (n.mapped) return { ok: false, reason: "这是目录映射，请到“真正记账的位置”操作" };
+  if (n.inaccessible) return { ok: false, reason: "没有权限读取，不知道里面有什么，不能删" };
+  if (n.cloud_placeholder) return { ok: false, reason: "云端占位文件，DiskWhy 不碰" };
+  if (!e.how.includes("delete")) return { ok: false, reason: "tool" };
+  return { ok: true, reason: "" };
+}
+export const pickFolder = (title: string) => invoke<string | null>("pick_folder", { title });

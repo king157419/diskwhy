@@ -388,7 +388,30 @@ export interface PreflightReport {
   review_items: { path: string; what: string; lose: string; bytes: number }[];
   can_execute: boolean;
   quarantine_choices: DriveChoice[];
+  /** 阶段 G：true = 弹层先用的估算（扫描时的大小），逐个文件的检查还在后台进行，不能执行 */
+  pending: boolean;
+  timing_ms: Record<string, number>;
 }
+
+/** 预检进度（阶段 G） */
+export interface PreviewProgress {
+  /** plan / list / check / who / done */
+  phase: "plan" | "list" | "check" | "who" | "done";
+  dirs: number;
+  entries: number;
+  checked: number;
+  to_check: number;
+  locked: number;
+  rm_done: number;
+  rm_total: number;
+}
+
+export type PreviewEvent =
+  | { kind: "quote"; report: PreflightReport }
+  | { kind: "progress"; progress: PreviewProgress; elapsed_ms: number };
+
+/** 后端取消预检时 invoke 失败的原文 */
+export const PREVIEW_CANCELLED = "已取消";
 
 export interface ExecProgress {
   done: number;
@@ -500,7 +523,13 @@ export interface Guidance {
 }
 
 export const actionEnv = () => invoke<ActionEnv>("action_env");
-export const previewPlan = (items: PlanRequest[], strategy: Strategy) => invoke<PreflightReport>("preview_plan", { items, strategy });
+/** 预检：先收到 quote（弹层立刻出现），之后是 progress，全部检查完 promise 才返回完整报告 */
+export function previewPlan(items: PlanRequest[], strategy: Strategy, onEvent: (e: PreviewEvent) => void): Promise<PreflightReport> {
+  const ch = new Channel<PreviewEvent>();
+  ch.onmessage = onEvent;
+  return invoke<PreflightReport>("preview_plan", { items, strategy, onEvent: ch });
+}
+export const cancelPreview = () => invoke<void>("cancel_preview");
 export function executePlan(planId: string, skipLocked: boolean, onProgress: (p: ExecProgress) => void): Promise<ExecOutcome> {
   const ch = new Channel<ExecProgress>();
   ch.onmessage = onProgress;

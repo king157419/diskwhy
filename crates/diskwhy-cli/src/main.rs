@@ -20,16 +20,19 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 mod explain_cmd;
+mod preflight_cmd;
 
 const USAGE: &str = "用法：
   diskwhy-cli scan <root> [--top 30] [--json out.json] [--json-depth 3] [--mode exact|fast] [--threads N] [--keep-files 50] [--no-dedup] [--snapshot out.dwsnap] [--quiet]
   diskwhy-cli explain <root> [--top 50] [--json out.json] [--md coverage.md] [--mode exact|fast] [--no-dedup] [--quiet]
-  diskwhy-cli scan|explain --from snapshot.dwsnap [--top N]   （读快照，不扫描）";
+  diskwhy-cli scan|explain --from snapshot.dwsnap [--top N]   （读快照，不扫描）
+  diskwhy-cli preflight <root>|--from snapshot.dwsnap [--profile]   （按清理页默认勾选生成计划 + 预检并计时；只读，不删任何东西）";
 
 #[derive(PartialEq)]
 enum Cmd {
     Scan,
     Explain,
+    Preflight,
 }
 
 struct Args {
@@ -46,6 +49,7 @@ struct Args {
     no_dedup: bool,
     snapshot: Option<String>,
     from: Option<String>,
+    profile: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -53,6 +57,7 @@ fn parse_args() -> Result<Args, String> {
     let cmd = match it.next().as_deref() {
         Some("scan") => Cmd::Scan,
         Some("explain") => Cmd::Explain,
+        Some("preflight") => Cmd::Preflight,
         Some("-h") | Some("--help") | None => return Err(USAGE.into()),
         Some(other) => return Err(format!("未知子命令 {other}\n{USAGE}")),
     };
@@ -71,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
         no_dedup: false,
         snapshot: None,
         from: None,
+        profile: false,
     };
     while let Some(x) = it.next() {
         let mut val = |name: &str| it.next().ok_or_else(|| format!("{name} 缺少参数值"));
@@ -90,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--quiet" | "-q" => a.quiet = true,
             "--no-dedup" => a.no_dedup = true,
+            "--profile" => a.profile = true,
             "--snapshot" => a.snapshot = Some(val("--snapshot")?),
             "--from" => a.from = Some(val("--from")?),
             s if s.starts_with("--") => return Err(format!("未知参数 {s}\n{USAGE}")),
@@ -220,6 +227,10 @@ fn save_then_report(r: ScanResult, args: &Args) {
 fn report(r: ScanResult, args: &Args) {
     if args.cmd == Cmd::Explain {
         explain_cmd::run(&r, &args);
+        return;
+    }
+    if args.cmd == Cmd::Preflight {
+        preflight_cmd::run(&r, args);
         return;
     }
     let used = r.used_bytes;

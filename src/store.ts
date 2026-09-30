@@ -10,6 +10,8 @@ import {
   listDrives,
   openSnapshot,
   previewPlan,
+  cancelPreview,
+  PREVIEW_CANCELLED,
   relaunchAsAdmin,
   saveSnapshot,
   startScan,
@@ -25,6 +27,7 @@ import {
   type LlmSettings,
   type NodeView,
   type PreflightReport,
+  type PreviewProgress,
   type ScanProgress,
   type ScanSummary,
   type Strategy,
@@ -134,19 +137,55 @@ export function currentStrategy(): Strategy {
   return { kind: "recycle_bin" };
 }
 
-/** 预检：把勾选组里能直接删的路径交给后端（带着规则 id，后端会核对说明有没有变） */
+/** 后台逐个文件检查的进度（弹层里显示）；检查做完为 null */
+export const checkProgress = ref<PreviewProgress | null>(null);
+/** 当前这次预检的序号：关掉弹层 / 换了删到哪里之后，旧的结果回来也不用 */
+let previewSeq = 0;
+
+/**
+ * 预检：把勾选组里能直接删的路径交给后端（带着规则 id，后端会核对说明有没有变）。
+ * 阶段 G：后端先发 quote（按扫描时的大小），弹层立刻出现、按钮处于“正在检查”；
+ * 逐个文件的检查在后台进行（progress），做完 promise 返回完整报告，按钮才可用。
+ */
 export async function doPreview(strategy: Strategy = currentStrategy()) {
   const items = checkedGroups.value.flatMap((g) => g.paths.filter((p) => p.deletable).map((p) => ({ path: p.path, expect_rule: g.rule_id })));
   if (!items.length) return;
+  const seq = ++previewSeq;
   previewBusy.value = true;
   message.value = "";
+  checkProgress.value = { phase: "plan", dirs: 0, entries: 0, checked: 0, to_check: 0, locked: 0, rm_done: 0, rm_total: 0 };
   try {
-    report.value = await previewPlan(items, strategy);
+    const final = await previewPlan(items, strategy, (e) => {
+      if (seq !== previewSeq) return;
+      if (e.kind === "quote") {
+        report.value = e.report;
+        previewBusy.value = false;
+      } else checkProgress.value = e.progress;
+    });
+    if (seq !== previewSeq) return;
+    report.value = final;
   } catch (e) {
-    message.value = `预检失败：${e}`;
+    if (seq !== previewSeq) return;
+    if (String(e) !== PREVIEW_CANCELLED) {
+      message.value = `预检失败：${e}`;
+      report.value = null;
+    }
   } finally {
-    previewBusy.value = false;
+    if (seq === previewSeq) {
+      previewBusy.value = false;
+      checkProgress.value = null;
+    }
   }
+}
+
+/** 关掉确认弹层：还在检查就让后端停下 */
+export function closeReport() {
+  const checking = report.value?.pending || checkProgress.value !== null;
+  previewSeq++;
+  report.value = null;
+  checkProgress.value = null;
+  previewBusy.value = false;
+  if (checking) void cancelPreview().catch(() => {});
 }
 
 /** 改删到哪里（回收站 ↔ 隔离到某个盘）：重新预检 */

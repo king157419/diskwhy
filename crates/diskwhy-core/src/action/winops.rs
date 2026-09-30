@@ -86,31 +86,39 @@ pub fn fingerprint(path: &str, no_follow: bool) -> Result<Fingerprint, u32> {
         flags |= FILE_FLAG_OPEN_REPARSE_POINT;
     }
     let h = open(path, FILE_READ_ATTRIBUTES, flags)?;
+    let r = unsafe { fingerprint_of(h, true) };
+    unsafe { CloseHandle(h) };
+    r
+}
+
+/// 从已打开的句柄取指纹（不关句柄）。`always_compression = false` 时，只有带压缩 / 稀疏 / reparse 属性的文件
+/// 才多问一次 FileCompressionInfo（其余文件磁盘占用就是逻辑大小，按簇取整在上层做），省一次 IRP。
+unsafe fn fingerprint_of(h: HANDLE, always_compression: bool) -> Result<Fingerprint, u32> {
     unsafe {
         let mut bh: BY_HANDLE_FILE_INFORMATION = zeroed();
         if GetFileInformationByHandle(h, &mut bh) == 0 {
-            let e = GetLastError();
-            CloseHandle(h);
-            return Err(e);
+            return Err(GetLastError());
         }
         let key = file_key(h, Some(&bh)).unwrap_or(FileKey::from_u64(
             bh.dwVolumeSerialNumber as u64,
             ((bh.nFileIndexHigh as u64) << 32) | bh.nFileIndexLow as u64,
         ));
         let size = ((bh.nFileSizeHigh as u64) << 32) | bh.nFileSizeLow as u64;
+        // FILE_ATTRIBUTE_SPARSE_FILE 0x200 | REPARSE_POINT 0x400（WOF 压缩等）| COMPRESSED 0x800
+        let special = bh.dwFileAttributes & (0x200 | 0x400 | 0x800) != 0;
         let mut ci: FILE_COMPRESSION_INFO = zeroed();
-        let on_disk = if GetFileInformationByHandleEx(
-            h,
-            FileCompressionInfo,
-            &mut ci as *mut FILE_COMPRESSION_INFO as *mut c_void,
-            size_of::<FILE_COMPRESSION_INFO>() as u32,
-        ) != 0
+        let on_disk = if (always_compression || special)
+            && GetFileInformationByHandleEx(
+                h,
+                FileCompressionInfo,
+                &mut ci as *mut FILE_COMPRESSION_INFO as *mut c_void,
+                size_of::<FILE_COMPRESSION_INFO>() as u32,
+            ) != 0
         {
             ci.CompressedFileSize.max(0) as u64
         } else {
             size
         };
-        CloseHandle(h);
         Ok(Fingerprint {
             volume: key.volume,
             id: key.id,
@@ -134,6 +142,37 @@ pub fn delete_probe(path: &str, is_dir: bool) -> Result<(), u32> {
     let h = open(path, DELETE, flags)?;
     unsafe { CloseHandle(h) };
     Ok(())
+}
+
+/// 预检用：**一次打开**同时做占用探测和取指纹（阶段 G）。
+///
+/// 用 `DELETE | FILE_READ_ATTRIBUTES` + 全共享（读 / 写 / 删）+ `FILE_FLAG_OPEN_REPARSE_POINT` 打开：
+/// - 成功 → 没有别的句柄拒绝共享删除，现在能删；顺手从同一个句柄取指纹，立刻关闭，不做任何修改；
+/// - `ERROR_SHARING_VIOLATION` → 有别的句柄打开时没给 FILE_SHARE_DELETE（文档：“If this flag is not
+///   specified, but the file or device has been opened for delete access, the function fails”，反过来
+///   同理），交给上层问 Restart Manager 是谁；指纹改用只要 FILE_READ_ATTRIBUTES 的打开取
+///   （文档：共享模式不影响对属性的访问请求）；
+/// - 其他错误（5 没权限等）→ 同样退回只读属性的打开取指纹，探测结果原样返回。
+///
+/// 返回 `(探测结果, 指纹)`，语义与分别调用 [`delete_probe`] 和 [`fingerprint`] 相同，只是少开一次文件。
+pub fn probe_and_fingerprint(path: &str, is_dir: bool) -> (Result<(), u32>, Result<Fingerprint, u32>) {
+    let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
+    if is_dir {
+        flags |= FILE_FLAG_BACKUP_SEMANTICS;
+    }
+    match open(path, DELETE | FILE_READ_ATTRIBUTES, flags) {
+        Ok(h) => {
+            let fp = unsafe { fingerprint_of(h, false) };
+            unsafe { CloseHandle(h) };
+            (Ok(()), fp)
+        }
+        Err(c) if c == 2 || c == 3 => (Err(c), Err(c)),
+        Err(c) => {
+            // 没权限时再单独用 DELETE 探一次，确认是删除权限不够而不是读属性不够（和旧的 delete_probe 结果一致）。
+            let probe = if c == 5 { delete_probe(path, is_dir) } else { Err(c) };
+            (probe, fingerprint(path, true))
+        }
+    }
 }
 
 pub fn is_sharing_violation(code: u32) -> bool {
@@ -278,7 +317,15 @@ pub fn rm_locking_processes(files: &[String]) -> Result<Vec<LockingProcess>, Str
     unsafe {
         let mut session: u32 = 0;
         let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
-        let e = RmStartSession(&mut session, 0, key.as_mut_ptr());
+        let mut e = RmStartSession(&mut session, 0, key.as_mut_ptr());
+        // 文档：每个用户会话最多同时 64 个 Restart Manager 会话，满了返回 ERROR_MAX_SESSIONS_REACHED（353）。
+        // 预检最多并发几个会话，别的程序也可能占着一些：满了就稍等再试（最多约 2 秒）。
+        let mut tries = 0;
+        while e == 353 && tries < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            tries += 1;
+            e = RmStartSession(&mut session, 0, key.as_mut_ptr());
+        }
         if e != 0 {
             return Err(format!("RmStartSession 失败，错误 {e}"));
         }

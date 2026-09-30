@@ -25,8 +25,8 @@ pub mod refresh;
 pub mod winops;
 
 pub use execute::{execute, ExecOptions, ExecProgress, ExecReport, ItemResult};
-pub use plan::build_plan;
-pub use preflight::{preflight, PreflightOptions, PreflightReport};
+pub use plan::{build_plan, build_plan_quick, enumerate_plan};
+pub use preflight::{preflight, preflight_with, quote, PreflightOptions, PreflightReport};
 
 use crate::explain::{How, Source, Tier};
 use serde::{Deserialize, Serialize};
@@ -193,6 +193,72 @@ pub struct PlanItem {
     pub dirs: Vec<String>,
     /// 枚举时出的错（列不出的子目录等）。
     pub enum_errors: Vec<String>,
+    /// 所在卷的簇大小（预检取到指纹后按它把磁盘占用取整）。
+    #[serde(default = "default_cluster")]
+    pub cluster: u64,
+}
+
+fn default_cluster() -> u64 {
+    4096
+}
+
+/// 计划 + 预检的进度（阶段 G）。各阶段在工作线程里更新这些计数，界面层自己定时读（不在热路径上发消息）；
+/// `cancel` 置位后枚举 / 预检尽快停下，计划不会标记为已预检，不能执行。
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// 0 = 生成清单，1 = 列文件，2 = 逐个检查，3 = 问是哪些程序在占用，4 = 完成
+    pub phase: std::sync::atomic::AtomicU8,
+    pub dirs: std::sync::atomic::AtomicUsize,
+    pub entries: std::sync::atomic::AtomicUsize,
+    pub checked: std::sync::atomic::AtomicUsize,
+    pub to_check: std::sync::atomic::AtomicUsize,
+    pub locked: std::sync::atomic::AtomicUsize,
+    pub rm_done: std::sync::atomic::AtomicUsize,
+    pub rm_total: std::sync::atomic::AtomicUsize,
+    pub cancel: std::sync::atomic::AtomicBool,
+}
+
+/// [`Progress`] 某一刻的读数（发给界面）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProgressView {
+    /// `plan` / `list` / `check` / `who` / `done`
+    pub phase: String,
+    pub dirs: usize,
+    pub entries: usize,
+    pub checked: usize,
+    pub to_check: usize,
+    pub locked: usize,
+    pub rm_done: usize,
+    pub rm_total: usize,
+}
+
+impl Progress {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_phase(&self, p: u8) {
+        self.phase.store(p, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn view(&self) -> ProgressView {
+        use std::sync::atomic::Ordering::Relaxed;
+        ProgressView {
+            phase: match self.phase.load(Relaxed) {
+                0 => "plan",
+                1 => "list",
+                2 => "check",
+                3 => "who",
+                _ => "done",
+            }
+            .into(),
+            dirs: self.dirs.load(Relaxed),
+            entries: self.entries.load(Relaxed),
+            checked: self.checked.load(Relaxed),
+            to_check: self.to_check.load(Relaxed),
+            locked: self.locked.load(Relaxed),
+            rm_done: self.rm_done.load(Relaxed),
+            rm_total: self.rm_total.load(Relaxed),
+        }
+    }
 }
 
 impl PlanItem {

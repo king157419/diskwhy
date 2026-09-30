@@ -76,7 +76,8 @@ function manualLabel(g: CandidateGroup): string {
   return "手动清";
 }
 
-// 预检要逐个文件核对（占用、刚改过、云端文件），东西多时要一两分钟：按钮上显示已经等了多久
+// 点「清理」后先做快速计划（不到 1 秒），确认弹层马上出现，逐个文件的检查在弹层里显示进度（阶段 G）；
+// 这段很短的等待期间按钮上显示已经等了多久
 const elapsed = ref(0);
 let timer: ReturnType<typeof setInterval> | undefined;
 watch(previewBusy, (busy) => {

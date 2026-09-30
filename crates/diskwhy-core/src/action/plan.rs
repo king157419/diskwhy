@@ -1,9 +1,9 @@
-//! 清理清单 → 计划：重新解释每一项、过闸（档位 / 保护路径 / 规则一致性）、枚举实际内容。
+//! 清理清单 → 计划：重新解释每一项、过闸（档位 / 保护路径 / 规则一致性）、枚举实际内容（阶段 G：快速部分和枚举分开，枚举并行、不打开文件）。
 
 use super::preflight::{node_gate, rule_consistent, tier_gate};
 use super::protect::Protector;
 use super::winops;
-use super::{new_id, Decision, Entry, EntryKind, Plan, PlanItem, PlanRequest, Strategy, MAX_ENTRIES_PER_ITEM};
+use super::{new_id, Decision, Entry, EntryKind, Plan, PlanItem, PlanRequest, Progress, Strategy, MAX_ENTRIES_PER_ITEM};
 use crate::explain::{self, ExplainCtx, Source, Target, Tier};
 use crate::fs::{attrs, join, reparse, round_up};
 use crate::model::{NodeKind, ScanResult};
@@ -25,8 +25,17 @@ fn lower(s: &str) -> String {
     s.to_lowercase()
 }
 
-/// 生成计划。被拦下的项保留在计划里（带原因，界面上列出来），但不枚举内容、不会执行。
+/// 生成计划（快速部分 + 枚举）。被拦下的项保留在计划里（带原因，界面上列出来），但不枚举内容、不会执行。
 pub fn build_plan(result: &ScanResult, ctx: &ExplainCtx, protector: &Protector, reqs: &[PlanRequest], strategy: Strategy) -> Plan {
+    let mut plan = build_plan_quick(result, ctx, protector, reqs, strategy);
+    enumerate_plan(&mut plan, &Progress::default());
+    plan
+}
+
+/// 计划的快速部分（阶段 G，本机 911 项约 0.1 秒）：去重合并、每项重新解释、过闸（保护路径 / 节点 / 档位 /
+/// 规则一致性）。**不枚举磁盘内容**，`entries` 为空；之后由 [`enumerate_plan`] 填。确认弹层先用它的结果
+/// （扫描时的大小）立刻出现，枚举和预检在后台做完再更新。
+pub fn build_plan_quick(result: &ScanResult, ctx: &ExplainCtx, protector: &Protector, reqs: &[PlanRequest], strategy: Strategy) -> Plan {
     let mut warnings = Vec::new();
     // 去重 + 去掉被别的项包含的项（删父目录内容时子项自然包含在内）。
     let mut paths: Vec<&PlanRequest> = Vec::new();
@@ -90,6 +99,7 @@ fn blocked_item(path: &str, reason: String) -> PlanItem {
         decisions: Vec::new(),
         dirs: Vec::new(),
         enum_errors: Vec::new(),
+        cluster: 4096,
     }
 }
 
@@ -134,6 +144,7 @@ fn build_item(
         decisions: Vec::new(),
         dirs: Vec::new(),
         enum_errors: Vec::new(),
+        cluster: 4096,
     };
     // 3. 节点本身（系统保留 / 映射 / 无权限 / 云占位 / 其余小文件）
     if let Some(why) = node_gate(node) {
@@ -150,16 +161,8 @@ fn build_item(
         item.blocked = Some(why);
         return item;
     }
-    // 6. 枚举实际内容
     let vol = crate::scan::volume_root_of(&full).unwrap_or_default();
-    let cluster = *cluster_cache.entry(vol.clone()).or_insert_with(|| crate::win::volume_space(&vol).map(|v| v.cluster_size).unwrap_or(4096));
-    enumerate(&mut item, cluster);
-    if item.entries.len() > MAX_ENTRIES_PER_ITEM {
-        item.blocked = Some(format!("这一项里有 {} 个以上的文件，太多了，请拆成更小的文件夹分批清理", MAX_ENTRIES_PER_ITEM));
-        item.entries.clear();
-        item.dirs.clear();
-    }
-    item.decisions = vec![Decision::Pending; item.entries.len()];
+    item.cluster = *cluster_cache.entry(vol.clone()).or_insert_with(|| crate::win::volume_space(&vol).map(|v| v.cluster_size).unwrap_or(4096));
     item
 }
 
@@ -167,94 +170,141 @@ fn is_cloud(a: u32, tag: u32) -> bool {
     a & attrs::CLOUD_PLACEHOLDER_MASK != 0 || (a & attrs::REPARSE_POINT != 0 && reparse::is_cloud(tag))
 }
 
-/// 枚举一个清单项在磁盘上的实际内容：文件（带指纹）、链接（不跟随）、云目录（不进去）、子目录。
-fn enumerate(item: &mut PlanItem, cluster: u64) {
-    let make_file = |path: String, a: u32, tag: u32, size: u64, mtime: i64| -> Entry {
-        if is_cloud(a, tag) {
-            // 云占位 / 云文件：只看目录项属性，绝不打开
-            return Entry { path, kind: EntryKind::File, attrs: a, reparse_tag: tag, size, bytes: 0, mtime, fp: None, link_is_dir: false };
-        }
-        // 只有“名字代理”类 reparse（符号链接 / 联接 / 挂载点，IsReparseTagNameSurrogate：bit 29）
-        // 或目录型 reparse 才当链接；WOF 压缩、重复数据删除等其他 reparse 文件就是普通文件。
-        if a & attrs::REPARSE_POINT != 0 && (tag & 0x2000_0000 != 0 || a & attrs::DIRECTORY != 0) {
-            let fp = winops::fingerprint(&path, true).ok();
-            return Entry { path, kind: EntryKind::Link, attrs: a, reparse_tag: tag, size, bytes: 0, mtime, fp, link_is_dir: a & attrs::DIRECTORY != 0 };
-        }
-        let fp = winops::fingerprint(&path, true).ok();
-        let bytes = match fp {
-            Some(f) if f.links > 1 => 0,
-            Some(f) => round_up(f.on_disk, cluster),
-            None => round_up(size, cluster),
-        };
-        Entry { path, kind: EntryKind::File, attrs: a, reparse_tag: tag, size, bytes, mtime, fp, link_is_dir: false }
-    };
+/// 由目录项（FindFirstFileExW 的结果）生成一条。**这里不打开任何文件**：指纹（文件 ID / 大小 / 修改时间）
+/// 在预检里和占用探测用同一次打开取（阶段 G），云占位 / 云文件永远不打开。
+fn make_entry(path: String, a: u32, tag: u32, size: u64, mtime: i64, cluster: u64) -> Entry {
+    if is_cloud(a, tag) {
+        return Entry { path, kind: EntryKind::File, attrs: a, reparse_tag: tag, size, bytes: 0, mtime, fp: None, link_is_dir: false };
+    }
+    // 只有“名字代理”类 reparse（符号链接 / 联接 / 挂载点，IsReparseTagNameSurrogate：bit 29）
+    // 或目录型 reparse 才当链接；WOF 压缩、重复数据删除等其他 reparse 文件就是普通文件。
+    if a & attrs::REPARSE_POINT != 0 && (tag & 0x2000_0000 != 0 || a & attrs::DIRECTORY != 0) {
+        return Entry { path, kind: EntryKind::Link, attrs: a, reparse_tag: tag, size, bytes: 0, mtime, fp: None, link_is_dir: a & attrs::DIRECTORY != 0 };
+    }
+    // 预检取到指纹后按真实磁盘占用 / 硬链接数重算；这里先按逻辑大小取整。
+    Entry { path, kind: EntryKind::File, attrs: a, reparse_tag: tag, size, bytes: round_up(size, cluster), mtime, fp: None, link_is_dir: false }
+}
 
-    if !item.is_dir {
-        match winops::stat_entry(&item.path) {
-            Ok(r) => item.entries.push(make_file(item.path.clone(), r.attrs, r.reparse_tag, r.size, r.mtime)),
-            Err(code) => item.enum_errors.push(format!("读不到「{}」（Win32 错误 {code}）", item.path)),
+/// 枚举每个没被拦下的清单项在磁盘上的实际内容：文件、链接（不跟随）、云目录（不进去）、子目录。
+///
+/// 阶段 G：所有清单项的目录一起按层并行列（rayon），每层列完再合并；不打开文件（指纹在预检里取）。
+/// 本机默认勾选 6.5 万个文件夹，单线程逐个列要 7.6 秒。取消时尽快返回（计划不完整，之后不会被执行）。
+pub fn enumerate_plan(plan: &mut Plan, prog: &Progress) {
+    use rayon::prelude::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    prog.set_phase(1);
+    // (清单项序号, 目录, 深度)
+    let mut frontier: Vec<(usize, String, usize)> = Vec::new();
+    let mut raw_dirs: Vec<Vec<(String, usize)>> = vec![Vec::new(); plan.items.len()];
+    let mut overflow = vec![false; plan.items.len()];
+    for (ii, item) in plan.items.iter_mut().enumerate() {
+        if item.blocked.is_some() || !item.entries.is_empty() {
+            continue;
         }
-        return;
-    }
-    // 清单项本身如果是链接（联接 / 符号链接），就只处理链接自身。
-    if let Ok(me) = winops::stat_entry(&item.path) {
-        if me.attrs & attrs::REPARSE_POINT != 0 && !reparse::is_cloud(me.reparse_tag) {
-            let fp = winops::fingerprint(&item.path, true).ok();
-            item.entries.push(Entry {
-                path: item.path.clone(),
-                kind: EntryKind::Link,
-                attrs: me.attrs,
-                reparse_tag: me.reparse_tag,
-                size: 0,
-                bytes: 0,
-                mtime: me.mtime,
-                fp,
-                link_is_dir: true,
-            });
-            return;
+        let cluster = item.cluster;
+        if !item.is_dir {
+            match winops::stat_entry(&item.path) {
+                Ok(r) => item.entries.push(make_entry(item.path.clone(), r.attrs, r.reparse_tag, r.size, r.mtime, cluster)),
+                Err(code) => item.enum_errors.push(format!("读不到「{}」（Win32 错误 {code}）", item.path)),
+            }
+            continue;
         }
-    }
-    let mut stack: Vec<(String, usize)> = vec![(item.path.clone(), 0)];
-    let mut dirs: Vec<(String, usize)> = Vec::new();
-    while let Some((dir, depth)) = stack.pop() {
-        if item.entries.len() > MAX_ENTRIES_PER_ITEM {
-            return;
-        }
-        let list = match winops::list_dir(&dir) {
-            Ok(l) => l,
-            Err(code) => {
-                item.enum_errors.push(format!("列不出「{dir}」（Win32 错误 {code}），里面的东西不会动"));
+        // 清单项本身如果是链接（联接 / 符号链接），就只处理链接自身。
+        if let Ok(me) = winops::stat_entry(&item.path) {
+            if me.attrs & attrs::REPARSE_POINT != 0 && !reparse::is_cloud(me.reparse_tag) {
+                item.entries.push(Entry {
+                    path: item.path.clone(),
+                    kind: EntryKind::Link,
+                    attrs: me.attrs,
+                    reparse_tag: me.reparse_tag,
+                    size: 0,
+                    bytes: 0,
+                    mtime: me.mtime,
+                    fp: None,
+                    link_is_dir: true,
+                });
                 continue;
             }
-        };
-        for r in list {
-            let p = join(&dir, &r.name);
-            let a = r.attrs;
-            if a & attrs::DIRECTORY != 0 {
-                if is_cloud(a, r.reparse_tag) {
-                    item.entries.push(Entry {
-                        path: p,
-                        kind: EntryKind::CloudDir,
-                        attrs: a,
-                        reparse_tag: r.reparse_tag,
-                        size: 0,
-                        bytes: 0,
-                        mtime: r.mtime,
-                        fp: None,
-                        link_is_dir: true,
-                    });
-                } else if a & attrs::REPARSE_POINT != 0 {
-                    item.entries.push(make_file(p, a, r.reparse_tag, 0, r.mtime));
-                } else {
-                    dirs.push((p.clone(), depth + 1));
-                    stack.push((p, depth + 1));
+        }
+        frontier.push((ii, item.path.clone(), 0));
+    }
+    while !frontier.is_empty() {
+        if prog.cancelled() {
+            return;
+        }
+        let listed: Vec<_> = frontier
+            .par_iter()
+            .map(|(ii, dir, depth)| {
+                let r = winops::list_dir(dir);
+                prog.dirs.fetch_add(1, Relaxed);
+                if let Ok(l) = &r {
+                    prog.entries.fetch_add(l.len(), Relaxed);
                 }
-            } else {
-                item.entries.push(make_file(p, a, r.reparse_tag, r.size, r.mtime));
+                (*ii, dir, *depth, r)
+            })
+            .collect();
+        let mut next = Vec::new();
+        for (ii, dir, depth, r) in listed {
+            if overflow[ii] {
+                continue;
+            }
+            let item = &mut plan.items[ii];
+            let list = match r {
+                Ok(l) => l,
+                Err(code) => {
+                    item.enum_errors.push(format!("列不出「{dir}」（Win32 错误 {code}），里面的东西不会动"));
+                    continue;
+                }
+            };
+            let cluster = item.cluster;
+            for r in list {
+                let p = join(dir, &r.name);
+                let a = r.attrs;
+                if a & attrs::DIRECTORY != 0 {
+                    if is_cloud(a, r.reparse_tag) {
+                        item.entries.push(Entry {
+                            path: p,
+                            kind: EntryKind::CloudDir,
+                            attrs: a,
+                            reparse_tag: r.reparse_tag,
+                            size: 0,
+                            bytes: 0,
+                            mtime: r.mtime,
+                            fp: None,
+                            link_is_dir: true,
+                        });
+                    } else if a & attrs::REPARSE_POINT != 0 {
+                        item.entries.push(make_entry(p, a, r.reparse_tag, 0, r.mtime, cluster));
+                    } else {
+                        raw_dirs[ii].push((p.clone(), depth + 1));
+                        next.push((ii, p, depth + 1));
+                    }
+                } else {
+                    item.entries.push(make_entry(p, a, r.reparse_tag, r.size, r.mtime, cluster));
+                }
+            }
+            if item.entries.len() > MAX_ENTRIES_PER_ITEM {
+                overflow[ii] = true;
             }
         }
+        next.retain(|(ii, _, _)| !overflow[*ii]);
+        frontier = next;
     }
-    dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    item.dirs = dirs.into_iter().map(|d| d.0).collect();
-    item.entries.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    for (ii, item) in plan.items.iter_mut().enumerate() {
+        if overflow[ii] || item.entries.len() > MAX_ENTRIES_PER_ITEM {
+            item.blocked = Some(format!("这一项里有 {} 个以上的文件，太多了，请拆成更小的文件夹分批清理", MAX_ENTRIES_PER_ITEM));
+            item.entries.clear();
+            item.dirs.clear();
+            item.decisions.clear();
+            continue;
+        }
+        if item.blocked.is_some() {
+            continue;
+        }
+        let mut dirs = std::mem::take(&mut raw_dirs[ii]);
+        dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        item.dirs = dirs.into_iter().map(|d| d.0).collect();
+        item.entries.sort_by_cached_key(|e| e.path.to_lowercase());
+        item.decisions = vec![Decision::Pending; item.entries.len()];
+    }
 }

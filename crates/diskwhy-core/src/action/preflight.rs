@@ -12,9 +12,9 @@
 //! | 8 | 空间提示：回收站策略且所在卷可用空间 < 10% | [`preflight`] | 警告 + 可切换到隔离区 |
 //! | 9 | 重新校验：执行前每条再取一次文件 ID / 大小 / 修改时间 | [`super::execute`] | 对不上的跳过 |
 
-use super::protect::Protector;
-use super::winops::{self, LockingProcess};
-use super::{Decision, EntryKind, EntryView, Plan, SkipReason, Strategy, HOT_WINDOW_SECS, LOW_SPACE_RATIO, PREVIEW_LIMIT};
+use super::protect::{ParentCache, Protector};
+use super::winops::{self, Fingerprint, LockingProcess};
+use super::{Decision, EntryKind, EntryView, Plan, Progress, SkipReason, Strategy, HOT_WINDOW_SECS, LOW_SPACE_RATIO, PREVIEW_LIMIT};
 use crate::explain::{ExplainCtx, Explanation, How, Source, Tier};
 use crate::explain::pattern::split_lower;
 use crate::explain::rules::Scope;
@@ -129,15 +129,20 @@ pub struct PreflightOptions {
     /// 当前时间（Unix 秒），测试可固定。
     pub now: i64,
     pub hot_window_secs: i64,
-    /// 被占用的文件不超过这么多个时，逐个问 Restart Manager 以便精确到文件；否则成组问一次。
-    pub rm_per_file_limit: usize,
-    /// 成组问 Restart Manager 最多带多少个文件。
-    pub rm_group_limit: usize,
+    /// 问 Restart Manager 时每组最多几个文件（同一清单项里的被占用文件按这个大小分组，每组一个会话）。
+    ///
+    /// 阶段 G 实测（本机 259 个被占用文件、18 个清单项）：RmGetList 的耗时基本和“这一组查到几个进程”成正比
+    /// （每个进程约 0.2 秒），259 个一组 25 秒；按清单项分、每组 ≤16 个、8 个会话并发 6.7 秒。
+    pub rm_chunk: usize,
+    /// 同时开几个 Restart Manager 会话（文档：每个用户会话最多 64 个，别的程序也可能在用，留足余量）。
+    pub rm_sessions: usize,
+    /// 最多把多少个被占用的文件交给 Restart Manager；超过的只标“被占用”、不查进程（防止极端情况下查几分钟）。
+    pub rm_max_files: usize,
 }
 
 impl Default for PreflightOptions {
     fn default() -> Self {
-        PreflightOptions { now: crate::explain::now_unix(), hot_window_secs: HOT_WINDOW_SECS, rm_per_file_limit: 20, rm_group_limit: 1000 }
+        PreflightOptions { now: crate::explain::now_unix(), hot_window_secs: HOT_WINDOW_SECS, rm_chunk: 16, rm_sessions: 6, rm_max_files: 2048 }
     }
 }
 
@@ -224,6 +229,12 @@ pub struct PreflightReport {
     pub can_execute: bool,
     /// 可选的隔离区盘（源所在盘以外的固定盘）。
     pub quarantine_choices: Vec<DriveChoice>,
+    /// 阶段 G：true = 这只是弹层先用的估算（扫描时的大小），逐个文件的检查还在后台进行，不能执行。
+    #[serde(default)]
+    pub pending: bool,
+    /// 各阶段用时（毫秒），排查慢在哪里用。
+    #[serde(default)]
+    pub timing_ms: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,10 +245,42 @@ pub struct ReviewNote {
     pub bytes: u64,
 }
 
-/// 预检：逐条给出 删 / 只删链接 / 跳过（原因），并汇总警告。会修改 `plan` 里的 `decisions`。
+/// 预检：逐条给出 删 / 只删链接 / 跳过（原因），并汇总警告。会修改 `plan` 里的 `decisions`、`fp`、`bytes`。
 pub fn preflight(plan: &mut Plan, protector: &Protector, opts: &PreflightOptions) -> PreflightReport {
-    let mut locked_refs: Vec<(usize, usize)> = Vec::new();
-    for (ii, item) in plan.items.iter_mut().enumerate() {
+    preflight_with(plan, protector, opts, &Progress::default())
+}
+
+/// 确认弹层先用的估算（阶段 G）：只用快速计划（[`super::plan::build_plan_quick`]）的结果，每项按扫描时的大小算，
+/// 被拦下的项照常列出、空间提示 / 隔离区检查照常给出；`pending = true`、`can_execute = false`。
+pub fn quote(plan: &Plan) -> PreflightReport {
+    report_impl(plan, Vec::new(), true)
+}
+
+enum RmMsg {
+    Locked(usize, usize, String),
+    ItemDone(usize),
+}
+
+/// 一组交给 Restart Manager 的文件和查到的进程。
+type RmResult = (Vec<(usize, usize)>, Vec<LockingProcess>);
+
+/// 同 [`preflight`]，带进度和取消。
+///
+/// 阶段 G 的做法（护栏和判断顺序与阶段 D 相同，只是更快）：
+/// 1. 每条的保护路径检查：父目录真实位置按文件夹缓存（[`ParentCache`]），同一文件夹只解析一次；
+/// 2. 云占位 / 云文件：只看目录项属性，**不打开**；
+/// 3. 其余每个文件 / 链接**只打开一次**（[`winops::probe_and_fingerprint`]）：同时得到占用探测结果和指纹
+///    （文件 ID / 大小 / 修改时间，执行前的重新校验用它对比）；30 分钟内改过的按指纹里的修改时间跳过；
+/// 4. 以上按文件并行（多线程按顺序分块取活）；
+/// 5. 探测到被占用的文件边探测边交给 Restart Manager：同一清单项的按 `rm_chunk` 个一组，最多 `rm_sessions`
+///    个会话并发，只调用 RmStartSession / RmRegisterResources / RmGetList / RmEndSession（只报告，不关进程）。
+///
+/// 取消时尽快返回，`plan.preflight_done` 保持 false（不能执行）。
+pub fn preflight_with(plan: &mut Plan, protector: &Protector, opts: &PreflightOptions, prog: &Progress) -> PreflightReport {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let t0 = std::time::Instant::now();
+    let mut timing: BTreeMap<String, u64> = BTreeMap::new();
+    for item in plan.items.iter_mut() {
         if item.blocked.is_none() {
             // 保护路径再查一次（纵深防御：清单可能是很久以前生成的）
             if let Some(why) = protector.check(&item.path) {
@@ -246,75 +289,210 @@ pub fn preflight(plan: &mut Plan, protector: &Protector, opts: &PreflightOptions
         }
         if item.blocked.is_some() {
             item.decisions = vec![Decision::Skip { reason: SkipReason::Protected { why: "整项被拦下".into() } }; item.entries.len()];
-            continue;
+        } else if item.decisions.len() != item.entries.len() {
+            item.decisions = vec![Decision::Pending; item.entries.len()];
         }
-        for (ei, e) in item.entries.iter().enumerate() {
-            let d = decide(e, protector, opts);
-            if matches!(d, Decision::Skip { reason: SkipReason::Locked { .. } }) {
-                locked_refs.push((ii, ei));
+    }
+    // 小的清单项排在前面：被占用的文件多半在应用缓存这类小文件夹里（本机 259 个被占用文件全在 18 个小项里，
+    // uv / npm / cargo 这些十几万个文件的大缓存里一个都没有），先查小的，Restart Manager 就能在大项的探测期间做完。
+    let mut order: Vec<usize> = (0..plan.items.len()).filter(|&ii| plan.items[ii].blocked.is_none()).collect();
+    order.sort_by_key(|&ii| plan.items[ii].entries.len());
+    let work: Vec<(usize, usize)> = order.iter().flat_map(|&ii| (0..plan.items[ii].entries.len()).map(move |ei| (ii, ei))).collect();
+    let remaining: Vec<AtomicUsize> =
+        plan.items.iter().map(|it| AtomicUsize::new(if it.blocked.is_none() { it.entries.len() } else { 0 })).collect();
+    prog.to_check.store(work.len(), Relaxed);
+    prog.set_phase(2);
+    // 只有真的按普通文件夹枚举过的清单项才能当“根”（清单项本身是链接时只有它自己一条，不算）。
+    let cache = ParentCache::with_roots(
+        plan.items
+            .iter()
+            .filter(|i| i.blocked.is_none() && i.is_dir && !i.entries.iter().any(|e| e.kind == EntryKind::Link && e.path == i.path))
+            .map(|i| i.path.as_str()),
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<RmMsg>();
+    let items = &plan.items;
+    let (decided, rm_results, check_ms) = std::thread::scope(|s| {
+        let coord = s.spawn(|| rm_coordinator(rx, opts, prog));
+        let tc = std::time::Instant::now();
+        // 按顺序分块取活（不用 rayon 的二分切分，保证大体按上面排好的顺序查）；实测线程再多也快不了多少
+        // （16 线程约 31 µs / 个，4 线程约 38 µs / 个），用 CPU 线程数、至少 4 个。
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 16);
+        const BLOCK: usize = 64;
+        let next = AtomicUsize::new(0);
+        let slots: Vec<std::sync::Mutex<Vec<(Decision, Option<Fingerprint>, u64)>>> =
+            (0..work.len().div_ceil(BLOCK)).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        std::thread::scope(|s2| {
+            for _ in 0..threads {
+                let tx = tx.clone();
+                let (next, slots, work, cache, remaining) = (&next, &slots, &work, &cache, &remaining);
+                s2.spawn(move || loop {
+                    let b = next.fetch_add(1, Relaxed);
+                    if b >= slots.len() || prog.cancelled() {
+                        break;
+                    }
+                    let mut out = Vec::with_capacity(BLOCK);
+                    for &(ii, ei) in &work[b * BLOCK..((b + 1) * BLOCK).min(work.len())] {
+                        let item = &items[ii];
+                        let e = &item.entries[ei];
+                        let r = decide(e, protector, cache, opts, item.cluster);
+                        if matches!(r.0, Decision::Skip { reason: SkipReason::Locked { .. } }) {
+                            prog.locked.fetch_add(1, Relaxed);
+                            let _ = tx.send(RmMsg::Locked(ii, ei, e.path.clone()));
+                        }
+                        prog.checked.fetch_add(1, Relaxed);
+                        if remaining[ii].fetch_sub(1, Relaxed) == 1 {
+                            let _ = tx.send(RmMsg::ItemDone(ii));
+                        }
+                        out.push(r);
+                    }
+                    *slots[b].lock().unwrap() = out;
+                });
             }
-            item.decisions[ei] = d;
+        });
+        let decided: Vec<(Decision, Option<Fingerprint>, u64)> = slots.into_iter().flat_map(|m| m.into_inner().unwrap()).collect();
+        let check_ms = tc.elapsed().as_millis() as u64;
+        drop(tx);
+        if prog.rm_done.load(Relaxed) < prog.rm_total.load(Relaxed) {
+            prog.set_phase(3);
         }
+        let rm = coord.join().unwrap_or_default();
+        (decided, rm, check_ms)
+    });
+    timing.insert("check_parallel".into(), check_ms);
+    timing.insert("rm_after_check".into(), (t0.elapsed().as_millis() as u64).saturating_sub(check_ms));
+    timing.insert("parent_dirs_resolved".into(), cache.len() as u64);
+    if prog.cancelled() {
+        return report_impl(plan, Vec::new(), true);
+    }
+    for (&(ii, ei), (d, fp, bytes)) in work.iter().zip(decided) {
+        let item = &mut plan.items[ii];
+        item.decisions[ei] = d;
+        let e = &mut item.entries[ei];
+        if fp.is_some() {
+            e.fp = fp;
+        }
+        e.bytes = bytes;
     }
     // 护栏 7：被占用的文件问 Restart Manager 是谁在用（只报告）。
     let mut all_procs: Vec<LockingProcess> = Vec::new();
-    if !locked_refs.is_empty() {
-        let paths: Vec<String> = locked_refs.iter().map(|&(i, e)| plan.items[i].entries[e].path.clone()).collect();
-        if locked_refs.len() <= opts.rm_per_file_limit {
-            for (k, &(i, e)) in locked_refs.iter().enumerate() {
-                let procs = winops::rm_locking_processes(std::slice::from_ref(&paths[k])).unwrap_or_default();
-                all_procs.extend(procs.iter().cloned());
-                plan.items[i].decisions[e] = Decision::Skip { reason: SkipReason::Locked { processes: procs } };
-            }
-        } else {
-            let group: Vec<String> = paths.iter().take(opts.rm_group_limit).cloned().collect();
-            let procs = winops::rm_locking_processes(&group).unwrap_or_default();
-            all_procs.extend(procs.iter().cloned());
-            for &(i, e) in &locked_refs {
-                plan.items[i].decisions[e] = Decision::Skip { reason: SkipReason::Locked { processes: procs.clone() } };
-            }
+    for (refs, procs) in rm_results {
+        all_procs.extend(procs.iter().cloned());
+        for (ii, ei) in refs {
+            plan.items[ii].decisions[ei] = Decision::Skip { reason: SkipReason::Locked { processes: procs.clone() } };
         }
-        all_procs.sort_by_key(|p| p.pid);
-        all_procs.dedup_by_key(|p| p.pid);
     }
+    all_procs.sort_by_key(|p| p.pid);
+    all_procs.dedup_by_key(|p| p.pid);
     plan.preflight_done = true;
-    report(plan, all_procs)
+    prog.set_phase(4);
+    let mut rep = report_impl(plan, all_procs, false);
+    timing.insert("total".into(), t0.elapsed().as_millis() as u64);
+    rep.timing_ms = timing;
+    rep
 }
 
-fn decide(e: &super::Entry, protector: &Protector, opts: &PreflightOptions) -> Decision {
+/// 收被占用的文件、按清单项分组交给 Restart Manager（最多 `rm_sessions` 个会话并发），和探测同时进行。
+fn rm_coordinator(rx: std::sync::mpsc::Receiver<RmMsg>, opts: &PreflightOptions, prog: &Progress) -> Vec<RmResult> {
+    use std::sync::atomic::Ordering::Relaxed;
+    type Job = Vec<(usize, usize, String)>;
+    let (jtx, jrx) = std::sync::mpsc::channel::<Job>();
+    let jrx = std::sync::Mutex::new(jrx);
+    let out: std::sync::Mutex<Vec<RmResult>> = std::sync::Mutex::new(Vec::new());
+    let chunk = opts.rm_chunk.max(1);
+    std::thread::scope(|s| {
+        for _ in 0..opts.rm_sessions.max(1) {
+            s.spawn(|| loop {
+                let job = match jrx.lock().unwrap().recv() {
+                    Ok(j) => j,
+                    Err(_) => break,
+                };
+                let procs = if prog.cancelled() {
+                    Vec::new()
+                } else {
+                    let paths: Vec<String> = job.iter().map(|x| x.2.clone()).collect();
+                    winops::rm_locking_processes(&paths).unwrap_or_default()
+                };
+                out.lock().unwrap().push((job.iter().map(|x| (x.0, x.1)).collect(), procs));
+                prog.rm_done.fetch_add(1, Relaxed);
+            });
+        }
+        let mut bufs: BTreeMap<usize, Job> = BTreeMap::new();
+        let mut sent = 0usize;
+        let send = |job: Job| {
+            if !job.is_empty() {
+                prog.rm_total.fetch_add(1, Relaxed);
+                let _ = jtx.send(job);
+            }
+        };
+        for msg in rx {
+            match msg {
+                RmMsg::Locked(ii, ei, path) => {
+                    if sent >= opts.rm_max_files {
+                        continue; // 超过上限：只标“被占用”，不查进程
+                    }
+                    sent += 1;
+                    let b = bufs.entry(ii).or_default();
+                    b.push((ii, ei, path));
+                    if b.len() >= chunk {
+                        send(std::mem::take(b));
+                    }
+                }
+                RmMsg::ItemDone(ii) => {
+                    if let Some(b) = bufs.remove(&ii) {
+                        send(b);
+                    }
+                }
+            }
+        }
+        for (_, b) in std::mem::take(&mut bufs) {
+            send(b);
+        }
+        drop(jtx);
+    });
+    out.into_inner().unwrap()
+}
+
+/// 一条的决定 + 预检时取到的指纹 + 能腾出的字节。判断顺序同阶段 D：保护路径 → 云 → 链接 → 读不到 → 热文件 → 占用。
+fn decide(e: &super::Entry, protector: &Protector, cache: &ParentCache, opts: &PreflightOptions, cluster: u64) -> (Decision, Option<Fingerprint>, u64) {
     // 护栏 2（条目级）：文件夹里面的 .ssh 之类
-    if let Some(why) = protector.entry_blocked(&e.path) {
-        return Decision::Skip { reason: SkipReason::Protected { why } };
+    if let Some(why) = protector.entry_blocked_cached(&e.path, cache) {
+        return (Decision::Skip { reason: SkipReason::Protected { why } }, None, e.bytes);
     }
-    // 护栏 5：云
-    if e.kind == EntryKind::CloudDir || (e.kind == EntryKind::File && e.fp.is_none() && is_cloud_attrs(e.attrs, e.reparse_tag)) {
-        return Decision::Skip { reason: SkipReason::Cloud };
+    // 护栏 5：云（只看目录项属性，绝不打开）
+    if e.kind == EntryKind::CloudDir || (e.kind == EntryKind::File && is_cloud_attrs(e.attrs, e.reparse_tag)) {
+        return (Decision::Skip { reason: SkipReason::Cloud }, None, e.bytes);
     }
-    // 护栏 6：链接只删自身
+    // 护栏 6：链接只删自身（打开的是链接本身，不跟随）
     if e.kind == EntryKind::Link {
-        return match winops::delete_probe(&e.path, e.link_is_dir) {
+        let (probe, fp) = winops::probe_and_fingerprint(&e.path, e.link_is_dir);
+        let d = match probe {
             Ok(()) => Decision::RemoveLink,
             Err(c) if winops::is_sharing_violation(c) => Decision::Skip { reason: SkipReason::Locked { processes: vec![] } },
             Err(2) | Err(3) => Decision::Skip { reason: SkipReason::Missing },
             Err(c) => Decision::Skip { reason: SkipReason::NoPermission { code: c } },
         };
+        return (d, fp.ok(), 0);
     }
-    let Some(fp) = e.fp else {
-        return Decision::Skip { reason: SkipReason::Unreadable { code: 0 } };
+    // 护栏 7 的探测 + 指纹：一次打开（DELETE | 读属性，全共享，不跟随），立刻关闭，不改文件
+    let (probe, fp) = winops::probe_and_fingerprint(&e.path, false);
+    let fp = match fp {
+        Ok(f) => f,
+        Err(2) | Err(3) => return (Decision::Skip { reason: SkipReason::Missing }, None, e.bytes),
+        Err(c) => return (Decision::Skip { reason: SkipReason::Unreadable { code: c } }, None, e.bytes),
     };
-    // 护栏 4：热文件
-    let mtime = winops::ft_to_unix(fp.mtime_ft);
-    let age = opts.now - mtime;
+    let bytes = if fp.links > 1 { 0 } else { crate::fs::round_up(fp.on_disk, cluster) };
+    // 护栏 4：热文件（按刚取到的指纹里的修改时间）
+    let age = opts.now - winops::ft_to_unix(fp.mtime_ft);
     if age < opts.hot_window_secs {
-        return Decision::Skip { reason: SkipReason::Hot { minutes_ago: (age.max(0) / 60) } };
+        return (Decision::Skip { reason: SkipReason::Hot { minutes_ago: age.max(0) / 60 } }, Some(fp), bytes);
     }
-    // 护栏 7：占用探测（DELETE 权限 + 全共享打开，立刻关闭，不改文件）
-    match winops::delete_probe(&e.path, false) {
+    let d = match probe {
         Ok(()) => Decision::Delete,
         Err(c) if winops::is_sharing_violation(c) => Decision::Skip { reason: SkipReason::Locked { processes: vec![] } },
         Err(2) | Err(3) => Decision::Skip { reason: SkipReason::Missing },
         Err(c) => Decision::Skip { reason: SkipReason::NoPermission { code: c } },
-    }
+    };
+    (d, Some(fp), bytes)
 }
 
 /// 隔离区位置的检查：完整路径、不在任何清单项里面、不在 Windows / Program Files 里、能写。
@@ -359,7 +537,8 @@ fn is_cloud_attrs(a: u32, tag: u32) -> bool {
     a & attrs::CLOUD_PLACEHOLDER_MASK != 0 || (a & attrs::REPARSE_POINT != 0 && reparse::is_cloud(tag))
 }
 
-fn report(plan: &Plan, locked_processes: Vec<LockingProcess>) -> PreflightReport {
+/// 汇总报告。`pending = true`（弹层先用的估算）时每项按扫描时的大小算、不能执行。
+fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool) -> PreflightReport {
     let mut items = Vec::new();
     let (mut total_entries, mut total_bytes, mut total_skipped) = (0usize, 0u64, 0usize);
     let (mut locked_count, mut hot_count, mut cloud_count, mut link_count) = (0, 0, 0, 0);
@@ -398,13 +577,17 @@ fn report(plan: &Plan, locked_processes: Vec<LockingProcess>) -> PreflightReport
                 }
             }
         }
-        let wd_count = if it.blocked.is_none() { it.entry_count() } else { 0 };
-        let wd_bytes = if it.blocked.is_none() { it.bytes() } else { 0 };
+        let wd_count = if it.blocked.is_none() && !pending { it.entry_count() } else { 0 };
+        let wd_bytes = match (&it.blocked, pending) {
+            (Some(_), _) => 0,
+            (None, true) => it.scan_allocated,
+            (None, false) => it.bytes(),
+        };
         total_entries += wd_count;
         total_bytes += wd_bytes;
         total_skipped += sk_count;
         link_count += links;
-        if it.blocked.is_none() && it.tier == Tier::Review && wd_count > 0 {
+        if it.blocked.is_none() && it.tier == Tier::Review && (wd_count > 0 || (pending && wd_bytes > 0)) {
             review_items.push(ReviewNote { path: it.path.clone(), what: it.what.clone(), lose: it.lose.clone(), bytes: wd_bytes });
         }
         items.push(ItemReport {
@@ -419,7 +602,7 @@ fn report(plan: &Plan, locked_processes: Vec<LockingProcess>) -> PreflightReport
             lose: it.lose.clone(),
             scan_allocated: it.scan_allocated,
             blocked: it.blocked.clone(),
-            will_delete: if it.blocked.is_none() { it.entries_preview(PREVIEW_LIMIT) } else { vec![] },
+            will_delete: if it.blocked.is_none() && !pending { it.entries_preview(PREVIEW_LIMIT) } else { vec![] },
             will_delete_count: wd_count,
             will_delete_bytes: wd_bytes,
             link_count: links,
@@ -440,7 +623,7 @@ fn report(plan: &Plan, locked_processes: Vec<LockingProcess>) -> PreflightReport
     let mut src_vols: Vec<String> = plan
         .items
         .iter()
-        .filter(|i| i.blocked.is_none() && i.entry_count() > 0)
+        .filter(|i| i.blocked.is_none() && (pending || i.entry_count() > 0))
         .filter_map(|i| crate::scan::volume_root_of(&i.path))
         .collect();
     src_vols.sort();
@@ -516,7 +699,7 @@ fn report(plan: &Plan, locked_processes: Vec<LockingProcess>) -> PreflightReport
         .filter(|d| !src_vols.iter().any(|v| v.eq_ignore_ascii_case(&d.root)))
         .map(|d| DriveChoice { root: d.root.clone(), label: d.label.clone(), free_bytes: d.free_bytes, total_bytes: d.total_bytes })
         .collect();
-    let can_execute = total_entries > 0 && !warnings.iter().any(|w| w.blocking);
+    let can_execute = !pending && plan.preflight_done && total_entries > 0 && !warnings.iter().any(|w| w.blocking);
     PreflightReport {
         plan_id: plan.id.clone(),
         strategy: plan.strategy.clone(),
@@ -533,5 +716,7 @@ fn report(plan: &Plan, locked_processes: Vec<LockingProcess>) -> PreflightReport
         review_items,
         can_execute,
         quarantine_choices,
+        pending,
+        timing_ms: BTreeMap::new(),
     }
 }

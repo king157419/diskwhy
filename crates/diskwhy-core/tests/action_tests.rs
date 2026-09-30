@@ -973,3 +973,167 @@ fn quarantine_unwritable_destination_is_blocked_before_anything_moves() {
     assert!(t.p(r"cache\x.bin").exists(), "什么都不能动");
     let _ = Command::new("icacls").arg(q.s("")).args(["/remove:d", "*S-1-1-0"]).output();
 }
+
+// ───────────────────────── 阶段 G：预检提速 ─────────────────────────
+
+/// 占用探测（一次打开：DELETE | 读属性，全共享）先筛出被占用的文件，只把这些交给 Restart Manager，
+/// 分组、多会话并发；进程名照样报告，进程不会被关。
+#[test]
+fn probe_then_restart_manager_flags_only_locked_files() {
+    use diskwhy_core::action::winops;
+    let t = TempTree::new("probe-rm");
+    let mut locked_paths = Vec::new();
+    let mut free_paths = Vec::new();
+    for i in 0..30 {
+        let rel = format!(r"cache\{}\f{i:02}.bin", if i % 2 == 0 { "a" } else { "b" });
+        write_old(&t.p(&rel), format!("free {i}").as_bytes());
+        free_paths.push(t.p(&rel));
+    }
+    for i in 0..13 {
+        let rel = format!(r"cache\{}\locked{i:02}.bin", if i < 9 { "a" } else { "b" });
+        write_old(&t.p(&rel), format!("locked {i}").as_bytes());
+        locked_paths.push(t.p(&rel));
+    }
+    // 不共享（share 0）占住 12 个；第 13 个只给读写共享、不给 FILE_SHARE_DELETE —— 同样算被占用
+    let mut handles: Vec<fs::File> = locked_paths[..12]
+        .iter()
+        .map(|p| fs::OpenOptions::new().read(true).write(true).share_mode(0).open(p).unwrap())
+        .collect();
+    handles.push(fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&locked_paths[12]).unwrap());
+    // 另一个文件被打开但给了全部共享（含删除）：不算被占用
+    let shared_ok = t.p(r"cache\a\shared-delete-ok.bin");
+    write_old(&shared_ok, b"shared");
+    let _h_shared = fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2 | 0x4).open(&shared_ok).unwrap();
+    free_paths.push(shared_ok.clone());
+
+    // 1. 探测函数本身
+    let (probe, fp) = winops::probe_and_fingerprint(&free_paths[0].to_string_lossy(), false);
+    assert_eq!(probe, Ok(()));
+    let fp = fp.unwrap();
+    let fp2 = winops::fingerprint(&free_paths[0].to_string_lossy(), true).unwrap();
+    assert_eq!((fp.volume, fp.id, fp.size, fp.mtime_ft), (fp2.volume, fp2.id, fp2.size, fp2.mtime_ft), "一次打开取到的指纹必须和单独取的一致");
+    let (probe, fp) = winops::probe_and_fingerprint(&locked_paths[0].to_string_lossy(), false);
+    assert!(matches!(probe, Err(c) if winops::is_sharing_violation(c)), "被占用的文件应该探测到共享冲突：{probe:?}");
+    assert!(fp.is_ok(), "被占用的文件也要能取到指纹（只读属性不受共享模式限制）：{fp:?}");
+    let (probe, _) = winops::probe_and_fingerprint(&shared_ok.to_string_lossy(), false);
+    assert_eq!(probe, Ok(()), "别人打开时给了 FILE_SHARE_DELETE 的文件不算被占用");
+
+    // 2. 整个预检：小分组（每组 4 个）、3 个会话并发 → 至少 4 组
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    let opts = PreflightOptions { rm_chunk: 4, rm_sessions: 3, ..PreflightOptions::default() };
+    let prog = action::Progress::default();
+    let t0 = std::time::Instant::now();
+    let rep = action::preflight_with(&mut plan, &prot, &opts, &prog);
+    let v = prog.view();
+    println!("预检 {:?}，进度 {v:?}，分段 {:?}", t0.elapsed(), rep.timing_ms);
+    let me = std::process::id();
+    let item = &plan.items[0];
+    let dec = |p: &Path| {
+        let s = p.to_string_lossy().to_string();
+        let i = item.entries.iter().position(|e| e.path.eq_ignore_ascii_case(&s)).unwrap_or_else(|| panic!("清单里没有 {s}"));
+        (&item.entries[i], &item.decisions[i])
+    };
+    for p in &locked_paths {
+        match dec(p).1 {
+            Decision::Skip { reason: SkipReason::Locked { processes } } => {
+                assert!(processes.iter().any(|x| x.pid == me), "{}：Restart Manager 应该报告当前进程 PID {me}，实际 {processes:?}", p.display())
+            }
+            d => panic!("{} 被占用，应该跳过，实际 {d:?}", p.display()),
+        }
+    }
+    for p in &free_paths {
+        let (e, d) = dec(p);
+        assert_eq!(d, &Decision::Delete, "{} 没被占用，应该可以删", p.display());
+        assert!(e.fp.is_some(), "能删的文件必须带指纹（执行前重新校验要用）");
+    }
+    assert_eq!(rep.locked_count, 13);
+    assert!(rep.locked_processes.iter().any(|x| x.pid == me));
+    assert_eq!((v.checked, v.to_check), (item.entries.len(), item.entries.len()));
+    assert_eq!(v.locked, 13);
+    assert!(v.rm_total >= 4 && v.rm_done == v.rm_total, "应该分成至少 4 组问 Restart Manager：{v:?}");
+    assert!(rep.can_execute && !rep.pending);
+    // 进程没被关：句柄都还能用
+    for h in handles.iter_mut().take(12) {
+        h.write_all(b" still mine").unwrap();
+    }
+}
+
+/// 快速计划（不枚举）马上给出估算，弹层用它先出现；估算不能执行，取消的预检也不能执行。
+#[test]
+fn quick_plan_quote_is_pending_and_cancelled_preflight_cannot_execute() {
+    let t = TempTree::new("quote");
+    for i in 0..5 {
+        write_old(&t.p(&format!(r"cache\q{i}.bin")), &content(&format!("q{i}"), 5000));
+    }
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let reqs = [req(&t.s("cache"))];
+    let t0 = std::time::Instant::now();
+    let plan = action::build_plan_quick(&r, &ctx, &prot, &reqs, Strategy::RecycleBin);
+    let q = action::quote(&plan);
+    println!("快速计划 + 估算 {:?}", t0.elapsed());
+    assert!(plan.items[0].entries.is_empty(), "快速计划不枚举内容");
+    assert!(q.pending && !q.can_execute);
+    assert_eq!(q.items[0].will_delete_count, 0);
+    assert!(q.total_bytes > 0 && q.total_bytes == plan.items[0].scan_allocated, "估算按扫描时的大小：{} vs {}", q.total_bytes, plan.items[0].scan_allocated);
+    let log = ActionLog::open(&t.p("actions.log"));
+    assert!(action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).is_err(), "没预检的计划不能执行");
+
+    // 取消：预检尽快返回，计划不标记为已预检，执行被拒绝，文件原封不动
+    let mut plan2 = action::build_plan_quick(&r, &ctx, &prot, &reqs, Strategy::RecycleBin);
+    let prog = action::Progress::default();
+    action::enumerate_plan(&mut plan2, &prog);
+    assert_eq!(plan2.items[0].entries.len(), 5);
+    prog.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let rep = action::preflight_with(&mut plan2, &prot, &PreflightOptions::default(), &prog);
+    assert!(rep.pending && !rep.can_execute && !plan2.preflight_done);
+    let err = action::execute(&plan2, &prot, &ExecOptions::new(&log), |_| {}).unwrap_err();
+    assert!(err.contains("预检"), "{err}");
+    assert!((0..5).all(|i| t.p(&format!(r"cache\q{i}.bin")).exists()));
+
+    // 正常做完：和一次性 build_plan + preflight 结果一样
+    let mut plan3 = action::build_plan_quick(&r, &ctx, &prot, &reqs, Strategy::RecycleBin);
+    action::enumerate_plan(&mut plan3, &action::Progress::default());
+    let rep3 = action::preflight(&mut plan3, &prot, &PreflightOptions::default());
+    assert!(!rep3.pending && rep3.can_execute && plan3.preflight_done);
+    assert_eq!(rep3.total_entries, 5);
+}
+
+/// 父目录真实位置的缓存：清单项下面的文件夹按“清单项真实位置 + 相对路径”推出来，结果必须和实际解析一致；
+/// 清单项本身经过链接指到受保护目录时照样拦下。
+#[test]
+fn parent_cache_derived_paths_match_real_resolution() {
+    use diskwhy_core::action::protect::ParentCache;
+    use diskwhy_core::action::winops::final_path;
+    let t = TempTree::new("pcache");
+    fs::create_dir_all(t.p(r"real\a\b\c")).unwrap();
+    mklink_j(&t.p("via-link"), &t.p("real"));
+    let root = t.s("via-link");
+    let cache = ParentCache::with_roots([root.as_str()]);
+    for rel in ["", r"\a", r"\a\b", r"\A\B\c"] {
+        let p = format!("{root}{rel}");
+        let derived = cache.resolve(&p).expect("应该能解析");
+        let real = final_path(&p).expect("实际解析");
+        assert!(derived.eq_ignore_ascii_case(&real), "{p}：推出来的 {derived} 和实际的 {real} 不一致");
+        assert!(real.to_lowercase().contains(r"\real"), "{real}");
+    }
+    // 不在清单项下面：照旧实际解析
+    let other = t.s("real");
+    assert_eq!(cache.resolve(&other).map(|x| x.to_lowercase()), final_path(&other).map(|x| x.to_lowercase()));
+    // 清单项是指向 C:\Windows 的联接：里面的条目用缓存检查照样被拦
+    let win = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    mklink_j(&t.p("win-link"), Path::new(&win));
+    let wl = t.s("win-link");
+    let prot = Protector::from_system();
+    let c2 = ParentCache::with_roots([wl.as_str()]);
+    let entry = format!(r"{wl}\System32\drivers\etc\hosts");
+    let a = prot.entry_blocked(&entry);
+    let b = prot.entry_blocked_cached(&entry, &c2);
+    assert!(a.is_some() && b.is_some(), "经过链接指到 Windows 目录的条目必须被拦：{a:?} / {b:?}");
+}

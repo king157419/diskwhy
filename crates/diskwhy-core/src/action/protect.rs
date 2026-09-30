@@ -200,6 +200,12 @@ impl Protector {
 
     /// 检查一个删除请求。返回 `Some(原因)` 表示拒绝。
     pub fn check(&self, input: &str) -> Option<String> {
+        self.check_with(input, &|p: &str| winops::final_path(p))
+    }
+
+    /// 同 [`Protector::check`]，但父目录的真实位置由 `resolve_parent` 给出（预检里用 [`ParentCache`]：
+    /// 同一个文件夹里的几千个文件只解析一次父目录）。检查逻辑、拒绝条件和 `check` 完全相同。
+    pub fn check_with(&self, input: &str, resolve_parent: &dyn Fn(&str) -> Option<String>) -> Option<String> {
         let n = match normalize(input) {
             Ok(n) => n,
             Err(e) => return Some(e),
@@ -221,7 +227,7 @@ impl Protector {
             if n.segs.len() >= 2 {
                 let (parent, name) = n.path.rsplit_once('\\').unwrap();
                 let parent = if parent.len() == 2 { format!("{parent}\\") } else { parent.to_string() };
-                if let Some(real_parent) = winops::final_path(&parent) {
+                if let Some(real_parent) = resolve_parent(&parent) {
                     if let Ok(real) = normalize(&crate::fs::join(&real_parent, name)) {
                         if real.segs != n.segs {
                             if let Some(r) = self.check_segs(&real.segs) {
@@ -309,6 +315,73 @@ impl Protector {
     /// 清单里的单个条目（文件夹里面的文件）是否受保护：只看“本身或里面”的规则（条目不会是祖先）。
     pub fn entry_blocked(&self, path: &str) -> Option<String> {
         self.check(path)
+    }
+
+    /// 同 [`Protector::entry_blocked`]，父目录真实位置走缓存。
+    pub fn entry_blocked_cached(&self, path: &str, cache: &ParentCache) -> Option<String> {
+        self.check_with(path, &|p: &str| cache.resolve(p))
+    }
+}
+
+/// 父目录真实位置（GetFinalPathNameByHandleW）的缓存，一次预检内有效。
+///
+/// 阶段 G 实测（本机默认勾选 39.6 万个文件、6.5 万个文件夹）：逐个文件解析父目录要 40 秒，
+/// 占保护路径检查时间的 93%。两层优化：
+/// 1. 同一个父目录的结果对里面的所有文件都一样，每个文件夹只算一次；
+/// 2. 清单项里面的文件夹：枚举时**只进入不是 reparse point 的普通文件夹**（链接只作为条目、不跟进去），
+///    所以 清单项下面某个文件夹的真实位置 = 清单项本身的真实位置 + 相对路径，只需对清单项本身调用一次
+///    GetFinalPathNameByHandleW（[`ParentCache::with_roots`]）。不在任何清单项下面的父目录照旧实际解析。
+///
+/// 枚举之后文件夹被人换成链接这种竞态，由执行时的重新校验兜住：`execute::reverify` 仍然逐条、不走缓存地
+/// 完整检查保护路径（含实际解析父目录），并核对文件 ID。
+#[derive(Default)]
+pub struct ParentCache {
+    map: std::sync::RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// (小写的清单项路径, 清单项路径, 它的真实位置)
+    roots: Vec<(String, String, Option<String>)>,
+}
+
+impl ParentCache {
+    /// `roots`：清单项（文件夹）路径。每个调用一次 GetFinalPathNameByHandleW。
+    pub fn with_roots<'a>(roots: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut v: Vec<(String, String, Option<String>)> =
+            roots.into_iter().map(|r| (r.to_lowercase(), r.to_string(), winops::final_path(r))).collect();
+        // 最长的在前（嵌套的清单项取最近的那个）
+        v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        ParentCache { map: Default::default(), roots: v }
+    }
+
+    pub fn resolve(&self, parent: &str) -> Option<String> {
+        if let Some(v) = self.map.read().unwrap().get(parent) {
+            return v.clone();
+        }
+        let v = self.derive(parent).unwrap_or_else(|| winops::final_path(parent));
+        self.map.write().unwrap().insert(parent.to_string(), v.clone());
+        v
+    }
+
+    /// 在某个清单项下面：真实位置 = 清单项的真实位置 + 相对路径。不在任何清单项下面返回 None（要实际解析）。
+    fn derive(&self, parent: &str) -> Option<Option<String>> {
+        for (rl, r, real) in &self.roots {
+            let Some(prefix) = parent.get(..r.len()) else { continue };
+            if prefix.to_lowercase() != *rl {
+                continue;
+            }
+            if parent.len() == r.len() {
+                return Some(real.clone());
+            }
+            if parent.as_bytes()[r.len()] == b'\\' && !r.ends_with('\\') {
+                let rest = &parent[r.len() + 1..];
+                return Some(real.as_ref().map(|x| crate::fs::join(x, rest)));
+            }
+        }
+        None
+    }
+    pub fn len(&self) -> usize {
+        self.map.read().unwrap().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

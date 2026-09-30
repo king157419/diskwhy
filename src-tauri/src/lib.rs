@@ -22,7 +22,9 @@
 //!
 //! 阶段 D（带护栏的动作，逻辑全在 `diskwhy_core::action`）：
 //! - `action_env`         -> 盘符 + 隔离区批次（超过 7 天的个数）+ 日志位置
-//! - `preview_plan(items, strategy)` -> PreflightReport（后端按当前扫描结果重新判断档位 / 规则 / 保护路径，枚举实际内容并预检）
+//! - `preview_plan(items, strategy, onEvent: Channel<PreviewEvent>)` -> PreflightReport（后端按当前扫描结果重新判断档位 / 规则 / 保护路径，
+//!   先发 quote 让弹层立刻出现，再在后台枚举实际内容并预检，期间发 progress；阶段 G）
+//! - `cancel_preview()`：取消正在进行的预检
 //! - `execute_plan(plan_id, skip_locked, onProgress)` -> ExecOutcome（执行 + 重扫受影响的子树 + 新摘要）
 //! - `list_quarantine` / `restore_batch(manifest_path)` / `purge_batch(manifest_path)`
 //! - `get_guidance(path, kind)` -> keep / 只能用工具 / 迁移 的指引（只展示命令，不运行）
@@ -37,7 +39,7 @@ use diskwhy_core::action::log::ActionLog;
 use diskwhy_core::action::protect::Protector;
 use diskwhy_core::action::quarantine::{self, BatchInfo, PurgeReport, RestoreReport};
 use diskwhy_core::action::refresh::RefreshReport;
-use diskwhy_core::action::{self, ExecOptions, ExecProgress, ExecReport, Plan, PlanRequest, PreflightOptions, PreflightReport, Strategy};
+use diskwhy_core::action::{self, ExecOptions, ExecProgress, ExecReport, Plan, PlanRequest, PreflightOptions, PreflightReport, Progress, ProgressView, Strategy};
 use diskwhy_core::explain::llm::{self, LlmSettings};
 use diskwhy_core::explain::candidates::{cleanup_candidates, CandidateGroup};
 use diskwhy_core::explain::{tier_summary, ExplainCtx, Explanation, Target, TierSummary};
@@ -67,6 +69,8 @@ struct AppState {
     ctx: RwLock<Option<(Arc<ExplainCtx>, Vec<String>)>>,
     /// 最近一次预览的清理计划（执行时按 id 取出，执行一次就没了）。
     plan: Mutex<Option<Plan>>,
+    /// 正在进行的预检（阶段 G：后台进行，可取消）。
+    preview: Mutex<Option<Arc<Progress>>>,
     /// 正在执行 / 还原 / 清空。
     acting: AtomicBool,
 }
@@ -490,9 +494,28 @@ async fn action_env() -> Result<ActionEnv, String> {
     .map_err(|e| format!("线程异常：{e}"))
 }
 
+/// 预检过程中发给前端的消息（阶段 G）。
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PreviewEvent {
+    /// 快速计划做完（约 0.1–0.5 秒）：弹层用它立刻出现，`report.pending = true`，不能执行。
+    Quote { report: PreflightReport },
+    /// 后台枚举 / 逐个检查的进度（约每 150 毫秒一次）。
+    Progress { progress: ProgressView, elapsed_ms: u64 },
+}
+
 /// 清理清单 → 计划 + 预检。档位 / 规则 / 保护路径全部由后端按当前扫描结果重新判断。
+///
+/// 阶段 G：先做快速计划并立刻通过 `on_event` 发 `quote`（弹层马上出现），再在后台枚举、逐个检查，
+/// 期间发 `progress`；全部做完才返回完整的预检报告并保存计划（只有这时才能执行）。
+/// `cancel_preview` 或新的一次预览会让这次尽快停下并返回“已取消”。
 #[tauri::command]
-async fn preview_plan(items: Vec<PlanRequest>, strategy: Strategy, state: State<'_, AppState>) -> Result<PreflightReport, String> {
+async fn preview_plan(
+    items: Vec<PlanRequest>,
+    strategy: Strategy,
+    on_event: Channel<PreviewEvent>,
+    state: State<'_, AppState>,
+) -> Result<PreflightReport, String> {
     if state.scanning.load(Ordering::SeqCst) {
         return Err("正在扫描，先等扫描结束".into());
     }
@@ -501,15 +524,89 @@ async fn preview_plan(items: Vec<PlanRequest>, strategy: Strategy, state: State<
     }
     let r = state.result()?;
     let ctx = state.ctx();
-    let (plan, rep) = tauri::async_runtime::spawn_blocking(move || {
-        let mut plan = action::build_plan(&r, &ctx, protector(), &items, strategy);
-        let rep = action::preflight(&mut plan, protector(), &PreflightOptions::default());
-        (plan, rep)
+    let prog = Arc::new(Progress::default());
+    {
+        // 新的预览替换旧的：旧的尽快停下
+        let mut cur = state.preview.lock().unwrap();
+        if let Some(old) = cur.replace(prog.clone()) {
+            old.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+    // 旧计划作废（执行只认最新一次做完的预检）
+    *state.plan.lock().unwrap() = None;
+    let p2 = prog.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let t0 = std::time::Instant::now();
+        let mut plan = action::build_plan_quick(&r, &ctx, protector(), &items, strategy);
+        let _ = on_event.send(PreviewEvent::Quote { report: action::quote(&plan) });
+        let quote_ms = t0.elapsed().as_millis() as u64;
+        let done = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let (prog, done, ch) = (p2.clone(), done.clone(), on_event.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = ch.send(PreviewEvent::Progress { progress: prog.view(), elapsed_ms: t0.elapsed().as_millis() as u64 });
+                }
+            })
+        };
+        let te = std::time::Instant::now();
+        action::enumerate_plan(&mut plan, &p2);
+        let enumerate_ms = te.elapsed().as_millis() as u64;
+        let rep = if p2.cancelled() { None } else { Some(action::preflight_with(&mut plan, protector(), &PreflightOptions::default(), &p2)) };
+        done.store(true, Ordering::Relaxed);
+        let _ = ticker.join();
+        match rep {
+            Some(mut rep) if !p2.cancelled() => {
+                rep.timing_ms.insert("click_to_done".into(), t0.elapsed().as_millis() as u64);
+                rep.timing_ms.insert("quote".into(), quote_ms);
+                rep.timing_ms.insert("enumerate".into(), enumerate_ms);
+                // 排查用：设了环境变量 DISKWHY_PREFLIGHT_LOG=<文件> 时，把各阶段用时追加一行进去
+                if let Ok(p) = std::env::var("DISKWHY_PREFLIGHT_LOG") {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                        let v = p2.view();
+                        let _ = writeln!(
+                            f,
+                            "{}",
+                            serde_json::json!({ "timing_ms": rep.timing_ms, "entries": v.to_check, "dirs": v.dirs, "locked": v.locked, "rm_sessions": v.rm_total })
+                        );
+                    }
+                }
+                Some((plan, rep))
+            }
+            _ => None,
+        }
     })
     .await
-    .map_err(|e| format!("预检线程异常：{e}"))?;
-    *state.plan.lock().unwrap() = Some(plan);
-    Ok(rep)
+    .map_err(|e| format!("预检线程异常：{e}"));
+    // 只有仍是“当前这次”预览时才保存计划
+    let mut cur = state.preview.lock().unwrap();
+    let still_current = cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, &prog));
+    if still_current {
+        *cur = None;
+    }
+    drop(cur);
+    match res? {
+        Some((plan, rep)) if still_current && !prog.cancelled() => {
+            *state.plan.lock().unwrap() = Some(plan);
+            Ok(rep)
+        }
+        _ => Err(PREVIEW_CANCELLED.into()),
+    }
+}
+
+const PREVIEW_CANCELLED: &str = "已取消";
+
+/// 取消正在进行的预检（关掉确认弹层时）。
+#[tauri::command]
+fn cancel_preview(state: State<'_, AppState>) {
+    if let Some(p) = state.preview.lock().unwrap().take() {
+        p.cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(Serialize)]
@@ -730,6 +827,7 @@ pub fn run() {
             ask_ai,
             action_env,
             preview_plan,
+            cancel_preview,
             execute_plan,
             list_quarantine,
             restore_batch,

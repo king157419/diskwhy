@@ -1,5 +1,5 @@
 // 界面上的短标签（阶段 F）。后果标签只认规则 / 启发式给出的 lose_kind，不按文案关键词猜。
-import type { Category, LoseKind } from "./api";
+import type { PreviewProgress, Category, LoseKind } from "./api";
 
 /** 后果类型 → 标签文字，顺序即严重程度（从最坏到最轻） */
 export const LOSE_LABEL: Record<LoseKind, string> = {
@@ -109,4 +109,16 @@ export function shortPath(p: string): string {
   ];
   for (const [re, v] of rules) if (re.test(p)) return p.replace(re, v);
   return p;
+}
+
+// ───── 预检进度（阶段 G：确认弹层里“正在检查”一行） ─────
+
+/** 预检进度 → 一行短字 + 进度条百分比（列文件占 5%，逐个检查占 90%，问占用程序占最后一点） */
+export function checkLine(p: PreviewProgress | null): { text: string; pct: number } {
+  const n = (x: number) => x.toLocaleString("zh-CN");
+  if (!p || p.phase === "plan") return { text: "正在检查", pct: 2 };
+  if (p.phase === "list") return { text: `正在列出文件 ${n(p.entries)}`, pct: 5 };
+  if (p.phase === "check") return { text: `正在检查 ${n(p.checked)} / ${n(p.to_check)}`, pct: 5 + (p.to_check ? (p.checked * 90) / p.to_check : 0) };
+  if (p.phase === "who") return { text: `正在查占用的程序 ${p.rm_done} / ${p.rm_total}`, pct: 97 };
+  return { text: "正在检查", pct: 99 };
 }

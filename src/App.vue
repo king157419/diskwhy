@@ -7,7 +7,7 @@ import CleanupPage from "./pages/CleanupPage.vue";
 import ExplorePage from "./pages/ExplorePage.vue";
 import QuarantinePage from "./pages/QuarantinePage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
-import { init, message, notice, page, report } from "./store";
+import { closeReport, init, message, notice, page, report } from "./store";
 
 const pages = {
   home: HomePage,
@@ -47,7 +47,7 @@ watch(notice, (v) => {
       </div>
     </div>
 
-    <ConfirmDialog v-if="report" :key="report.plan_id" :report="report" @close="report = null" />
+    <ConfirmDialog v-if="report" :key="report.plan_id" :report="report" @close="closeReport" />
   </div>
 </template>
 

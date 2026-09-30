@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LoseKind } from "./api";
-import { cleanCat, clipWidth, isHardTag, LOSE_LABEL, LOSE_ORDER, loseLabel, worstLose } from "./labels";
+import { checkLine, cleanCat, clipWidth, isHardTag, LOSE_LABEL, LOSE_ORDER, loseLabel, worstLose } from "./labels";
 
 describe("后果标签 lose_kind → 中文", () => {
   it("八种都有固定的标签", () => {
@@ -58,5 +58,28 @@ describe("路径缩写", () => {
     expect(shortPath(String.raw`C:\Users\king\.m2\repository`)).toBe(String.raw`%USERPROFILE%\.m2\repository`);
     expect(shortPath(String.raw`C:\ProgramData\Package Cache`)).toBe(String.raw`%ProgramData%\Package Cache`);
     expect(shortPath(String.raw`C:\Windows\Temp`)).toBe(String.raw`C:\Windows\Temp`);
+  });
+});
+
+describe("预检进度一行（阶段 G）", () => {
+  const base = { dirs: 0, entries: 0, checked: 0, to_check: 0, locked: 0, rm_done: 0, rm_total: 0 };
+  it("各阶段的短字", () => {
+    expect(checkLine(null).text).toBe("正在检查");
+    expect(checkLine({ ...base, phase: "list", entries: 460723 }).text).toBe("正在列出文件 460,723");
+    expect(checkLine({ ...base, phase: "check", checked: 1200, to_check: 396065 }).text).toBe("正在检查 1,200 / 396,065");
+    expect(checkLine({ ...base, phase: "who", rm_done: 3, rm_total: 30 }).text).toBe("正在查占用的程序 3 / 30");
+  });
+  it("进度条单调往前、不超过 100", () => {
+    const seq = [
+      checkLine(null).pct,
+      checkLine({ ...base, phase: "list" }).pct,
+      checkLine({ ...base, phase: "check", checked: 0, to_check: 10 }).pct,
+      checkLine({ ...base, phase: "check", checked: 10, to_check: 10 }).pct,
+      checkLine({ ...base, phase: "who" }).pct,
+      checkLine({ ...base, phase: "done" }).pct,
+    ];
+    for (let i = 1; i < seq.length; i++) expect(seq[i]).toBeGreaterThanOrEqual(seq[i - 1]);
+    expect(Math.max(...seq)).toBeLessThanOrEqual(100);
+    expect(checkLine({ ...base, phase: "check", checked: 0, to_check: 0 }).pct).toBe(5);
   });
 });

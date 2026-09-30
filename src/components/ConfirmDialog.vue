@@ -3,11 +3,13 @@
 // 「跳过 N 项 · 正在使用 ›」、只有清单里有需你判断的项时才出现的勾选、一个主按钮。
 // 清单数据全部来自后端预检（按磁盘上的真实内容重新枚举），护栏逻辑和阶段 D 一样：
 // 被拦下的项不会删、阻止性警告时按钮不可用、被占用的文件跳过、执行后只重扫受影响的子树。
+// 阶段 G：点「清理」后弹层立刻出现（report.pending = true，数字是扫描时的大小），逐个文件的检查在后台进行，
+// 「跳过」一行先显示检查进度、主按钮显示“正在检查”且不可用；检查完换成完整报告（同一个 plan_id，勾选状态保留）。
 import { computed, ref } from "vue";
 import { executePlan, pickFolder, type ExecOutcome, type ExecProgress, type ItemReport, type LoseKind, type PreflightReport } from "../api";
 import { gbNum, sizeParts } from "../capacity";
-import { CLEAN_CAT_NAME, isHardTag, loseLabel, shortPath, type CleanCat } from "../labels";
-import { candidates, groupCat, onExecuted, page, report as reportRef, requote, summary } from "../store";
+import { checkLine, CLEAN_CAT_NAME, isHardTag, loseLabel, shortPath, type CleanCat } from "../labels";
+import { candidates, checkProgress, groupCat, onExecuted, page, report as reportRef, requote, summary } from "../store";
 
 const props = defineProps<{ report: PreflightReport }>();
 const emit = defineEmits<{ close: [] }>();
@@ -29,7 +31,10 @@ const groupOf = (p: string) => {
   return candidates.value.find((g) => g.paths.some((x) => x.path.toLowerCase() === k)) ?? null;
 };
 
-const live = computed(() => props.report.items.filter((i) => !i.blocked && i.will_delete_count > 0));
+const pending = computed(() => props.report.pending === true);
+const live = computed(() => props.report.items.filter((i) => !i.blocked && (pending.value ? i.will_delete_bytes > 0 : i.will_delete_count > 0)));
+/** 检查进度一行：列文件 → 逐个检查 → 问是哪些程序在占用 */
+const check = computed(() => checkLine(checkProgress.value));
 const blocked = computed(() => props.report.items.filter((i) => i.blocked));
 
 /** 需你判断的项：按候选组合并（一组可能有好几个位置） */
@@ -107,7 +112,13 @@ function nameOf(p: string) {
 
 const free = computed(() => summary.value?.free_bytes ?? 0);
 const canRun = computed(
-  () => phase.value === "preview" && props.report.can_execute && !blocking.value.length && live.value.length > 0 && (!hasReview.value || ack.value),
+  () =>
+    phase.value === "preview" &&
+    !pending.value &&
+    props.report.can_execute &&
+    !blocking.value.length &&
+    live.value.length > 0 &&
+    (!hasReview.value || ack.value),
 );
 
 async function run() {
@@ -199,7 +210,7 @@ const pct = computed(() => {
           <button class="x" aria-label="取消" @click="close"><svg class="i" viewBox="0 0 24 24"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
         </div>
         <div class="m-total">
-          <span class="v num">{{ gbNum(report.total_bytes) }}<small>GB</small></span>
+          <span class="v num" :class="{ est: pending }">{{ gbNum(report.total_bytes) }}<small>GB</small></span>
           <span class="after">
             <em v-if="isRecycle">清空回收站后</em>C 盘剩余 <b class="num">{{ gbNum(free) }} → {{ gbNum(free + report.total_bytes) }} GB</b>
           </span>
@@ -246,7 +257,11 @@ const pct = computed(() => {
               </div>
             </template>
           </div>
-          <button v-if="skipCount" class="m-skip" :aria-expanded="skipOpen" @click="skipOpen = !skipOpen">
+          <div v-if="pending" class="m-skip checking" role="status" aria-live="polite">
+            <span class="spin" aria-hidden="true"></span><span class="num">{{ check.text }}</span>
+            <span class="cbar"><i :style="{ width: check.pct + '%' }"></i></span>
+          </div>
+          <button v-else-if="skipCount" class="m-skip" :aria-expanded="skipOpen" @click="skipOpen = !skipOpen">
             <b>跳过 <span class="num">{{ skipCount.toLocaleString("zh-CN") }}</span> 个</b>{{ skipReason }}
             <svg class="i" viewBox="0 0 24 24"><path :d="skipOpen ? 'm6 9 6 6 6-6' : 'm9 18 6-6-6-6'" /></svg>
           </button>
@@ -272,8 +287,9 @@ const pct = computed(() => {
           <span @click="ack = !ack">我知道这些删了的后果</span>
           <span class="c"><span class="num">{{ reviewRows.length }}</span> 项需你判断</span>
         </label>
-        <button class="btn" :disabled="!canRun" @click="run">
-          清理 <span class="num">{{ gbNum(report.total_bytes) }} GB</span>
+        <button class="btn" :disabled="!canRun" :aria-busy="pending" @click="run">
+          <template v-if="pending">正在检查…</template>
+          <template v-else>清理 <span class="num">{{ gbNum(report.total_bytes) }} GB</span></template>
         </button>
       </template>
     </div>
@@ -563,6 +579,40 @@ const pct = computed(() => {
 .m-skip b {
   color: var(--ink2);
   font-weight: var(--w-med);
+}
+.m-skip.checking {
+  cursor: default;
+}
+.m-skip .cbar {
+  margin-left: auto;
+  width: 120px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--sunk);
+  overflow: hidden;
+}
+.m-skip .cbar i {
+  display: block;
+  height: 100%;
+  background: var(--ink3);
+  transition: width var(--dur-2) linear;
+}
+.spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line2);
+  border-top-color: var(--ink2);
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.m-total .v.est {
+  opacity: 0.55;
+  transition: opacity var(--dur-2) var(--ease);
 }
 .low {
   margin-top: 12px;

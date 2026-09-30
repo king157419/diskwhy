@@ -25,3 +25,6 @@ dist-ssr
 
 # Rust workspace build output
 /target/
+
+# 浏览器预览用的假数据（含本机路径，不提交）
+/src/dev/

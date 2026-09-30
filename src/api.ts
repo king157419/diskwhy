@@ -25,6 +25,9 @@ export type Tier = "safe" | "review" | "keep";
 /** 界面上的四种颜色：未知单独算灰色（后端 tier 仍是 review） */
 export type TierKey = Tier | "unknown";
 export type How = "delete" | "builtin_tool" | "migrate" | "manual" | "none";
+/** 删了最坏会怎样（阶段 F：后果标签，由规则 / 启发式明确给出） */
+export type LoseKind = "irreversible" | "repair" | "unsure" | "reinstall" | "relogin" | "feature" | "redownload" | "slower";
+export type Category = "cache" | "log" | "installer" | "build" | "model" | "userdata" | "system" | "vm" | "trash" | "app" | "unknown";
 export type Source =
   | { kind: "rule"; id: string; group: string; inherited_from: string | null }
   | { kind: "heuristic"; name: string }
@@ -36,10 +39,11 @@ export type Source =
 export interface Explanation {
   tier: Tier;
   owner: string | null;
-  category: string;
+  category: Category;
   what: string;
   why: string;
   lose: string;
+  lose_kind: LoseKind | null;
   how: How[];
   how_detail: string;
   gain_bytes: number;
@@ -141,6 +145,34 @@ export interface ScanSummary {
   tiers: TierSummary;
   mapped_dirs: MappedDir[];
   snapshot: SnapshotInfo | null;
+  /** 清理页的候选（阶段 F） */
+  candidates: CandidateGroup[];
+}
+
+export interface CandidatePath {
+  path: string;
+  bytes: number;
+  deletable: boolean;
+}
+
+/** 一组清理候选：同一条规则（或同一种启发式）命中的所有位置 */
+export interface CandidateGroup {
+  key: string;
+  rule_id: string | null;
+  group: string;
+  heuristic: string | null;
+  name: string;
+  owner: string;
+  category: Category;
+  tier: "safe" | "review";
+  lose_kind: LoseKind | null;
+  how: How[];
+  what: string;
+  lose: string;
+  how_detail: string;
+  bytes: number;
+  deletable_bytes: number;
+  paths: CandidatePath[];
 }
 
 export interface MappedDir {
@@ -182,6 +214,8 @@ export interface TreemapNode {
   tier: TierKey;
   what: string;
   owner: string | null;
+  lose_kind: LoseKind | null;
+  category: Category;
   inaccessible: boolean;
   reparse_skipped: boolean;
   system_reserved: boolean;
@@ -481,20 +515,6 @@ export const openSystemSettings = (uri: string) => invoke<void>("open_system_set
 export const pickScanFolder = () => invoke<string | null>("pick_scan_folder");
 export const startupScanDir = () => invoke<string | null>("startup_scan_dir");
 
-/** 能不能加入清理清单（前端只用来决定显示哪个按钮；后端预览时会重新判断，不信任这里） */
-export function cartEligibility(n: NodeView | null): { ok: boolean; reason: string } {
-  if (!n || n.pseudo) return { ok: false, reason: "" };
-  if (n.kind === "Rest") return { ok: false, reason: "“其余小文件合计”不是真实的文件夹，请选具体的文件夹" };
-  const e = n.explanation;
-  if (!e) return { ok: false, reason: "" };
-  if (e.source.kind === "unknown") return { ok: false, reason: "unknown" };
-  if (e.source.kind === "llm") return { ok: false, reason: "AI 推测不能作为删除依据" };
-  if (e.tier === "keep") return { ok: false, reason: "keep" };
-  if (n.system_reserved) return { ok: false, reason: "系统保留项请用系统工具处理" };
-  if (n.mapped) return { ok: false, reason: "这是目录映射，请到“真正记账的位置”操作" };
-  if (n.inaccessible) return { ok: false, reason: "没有权限读取，不知道里面有什么，不能删" };
-  if (n.cloud_placeholder) return { ok: false, reason: "云端占位文件，DiskWhy 不碰" };
-  if (!e.how.includes("delete")) return { ok: false, reason: "tool" };
-  return { ok: true, reason: "" };
-}
 export const pickFolder = (title: string) => invoke<string | null>("pick_folder", { title });
+export const getUiPrefs = () => invoke<{ theme: string | null }>("get_ui_prefs");
+export const setUiPrefs = (prefs: { theme: string | null }) => invoke<void>("set_ui_prefs", { prefs });

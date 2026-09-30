@@ -1,274 +1,190 @@
-/*
- * DiskWhy 设计系统（阶段 E）—— “石墨 + 鸢尾”
- *
- * - 底色：偏暖的石墨灰（不是蓝黑），层次只靠背景明度差 + 1px 细边框，不靠阴影堆叠。
- * - 强调色：鸢尾蓝紫（Iris）。三档色标已经占了绿 / 琥珀 / 玫红三个暖色区，
- *   强调色如果再用暖色会和“需判断 / 保留”混淆，所以刻意选一个冷色，整个界面只有它一个“品牌色”。
- * - 三档色标（可清理 / 需判断 / 保留 / 未知）只出现在小标签、圆点、方块图色块上，不整行涂色。
- * - 数字一律等宽（Geist Mono，tabular），单位统一由 humanBytes 输出（B / KB / MB / GB / TB）。
- *
- * 主题：<html data-theme="dark|light">；没有 data-theme 时跟随系统。默认深色（src/theme.ts）。
- */
+/* DiskWhy 阶段 F · 设计令牌：三主题共用一套布局，只换 token 和装饰。
+   主题由 <html data-theme="A|B|C"> 决定（src/theme.ts）：A 浅色·纸本 / B 深色·暖炭 / C 趣味·汽水。
+   色板、字体、圆角取自 docs/mockups/v2/theme.css（用户确认过的设计稿）。
+   C 主题的 2px 描边和硬投影由 --bw / --shadow-* 吸收：组件统一用这些变量留位置，不给 C 单独写布局。 */
 
+/* ───────── 共享：字体栈、字号阶梯、字重、间距 ───────── */
 :root {
-  /* ── 字体 ── */
-  --font-sans: "Geist Variable", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif;
-  --font-mono: "Geist Mono Variable", "Cascadia Mono", "Consolas", "Microsoft YaHei UI", monospace;
+  --cjk: "Noto Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  --ui: "Geist", var(--cjk);
+  --mono: "Geist Mono", ui-monospace, "Cascadia Mono", var(--cjk);
 
-  /* ── 字号阶梯（px）：11 / 12 / 13 / 14 / 16 / 20 / 26 / 34 ── */
-  --fs-2xs: 11px;
-  --fs-xs: 12px;
-  --fs-sm: 13px;
-  --fs-md: 14px;
-  --fs-lg: 16px;
-  --fs-xl: 20px;
-  --fs-2xl: 26px;
-  --fs-3xl: 34px;
-  --lh-tight: 1.25;
-  --lh-body: 1.55;
+  /* Noto Sans SC 可变字重：取能和 Geist 搭配的值 */
+  --w-reg: 400;
+  --w-med: 500;
+  --w-semi: 600;
+  --w-bold: 700;
 
-  /* ── 间距（4px 基准）── */
-  --sp-1: 4px;
-  --sp-2: 8px;
-  --sp-3: 12px;
-  --sp-4: 16px;
-  --sp-5: 20px;
-  --sp-6: 24px;
-  --sp-8: 32px;
-  --sp-10: 40px;
-  --sp-12: 48px;
+  /* 中文字号 */
+  --fs-meta: 12px;
+  --fs-sub: 13px;
+  --fs-body: 15px;
+  --fs-group: 18px;
+  --fs-title: 24px;
+  /* 西文数字字号（比同层中文大 1–2px，补 x 高度差） */
+  --fn-path: 12px;
+  --fn-row: 16px;
+  --fn-label: 28px;
 
-  /* ── 圆角 ── */
-  --r-xs: 4px;
-  --r-sm: 6px;
-  --r-md: 10px;
-  --r-lg: 14px;
-  --r-xl: 18px;
-  --r-pill: 999px;
+  --gutter: 96px;
+  --titlebar: 44px;
 
-  /* ── 动效：只做 120–200ms 的过渡，不做装饰动画 ── */
-  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --dur-1: 120ms;
   --dur-2: 180ms;
-  --dur-3: 240ms;
-
-  /* ── 布局 ── */
-  --sidebar-w: 232px;
-  --sidebar-w-compact: 72px;
-  --detail-w: 380px;
-  --header-h: 68px;
+  --dur-3: 260ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
-/* ───────────── 深色（默认） ───────────── */
+/* ───────── A 浅色 · 纸本 ───────── */
 :root,
-:root[data-theme="dark"] {
-  color-scheme: dark;
-
-  --bg-0: #0e0e11; /* 侧栏 / 窗口底 */
-  --bg-1: #141418; /* 主区 */
-  --surface-1: #1a1a1f; /* 卡片 */
-  --surface-2: #212127; /* 悬停 / 次级块 */
-  --surface-3: #2a2a31; /* 按下 / 输入框 */
-  --surface-inset: #111114; /* 凹陷区（进度槽、方块图底） */
-  --border-1: rgba(255, 255, 255, 0.06);
-  --border-2: rgba(255, 255, 255, 0.1);
-  --border-3: rgba(255, 255, 255, 0.16);
-
-  --text-1: #ececf1;
-  --text-2: #a4a6b1;
-  --text-3: #6d6f7b;
-  --text-on-accent: #ffffff;
-
-  --accent: #8b8cff; /* 文字 / 图标 / 描边 */
-  --accent-fill: #6c6df0; /* 主按钮底 */
-  --accent-fill-hover: #7b7cf6;
-  --accent-soft: rgba(139, 140, 255, 0.14);
-  --accent-softer: rgba(139, 140, 255, 0.08);
-  --accent-ring: rgba(139, 140, 255, 0.45);
-
-  /* 三档色标 */
-  --t-safe: #5ccb9a;
-  --t-safe-bg: rgba(92, 203, 154, 0.12);
-  --t-safe-fg: #82dcb3;
-  --t-review: #e8b454;
-  --t-review-bg: rgba(232, 180, 84, 0.12);
-  --t-review-fg: #f0c878;
-  --t-keep: #ee7a7f;
-  --t-keep-bg: rgba(238, 122, 127, 0.12);
-  --t-keep-fg: #f49a9e;
-  --t-unknown: #8e93a3;
-  --t-unknown-bg: rgba(142, 147, 163, 0.14);
-  --t-unknown-fg: #b6bac6;
-
-  /* 归属条 */
-  --c-scanned: #8b8cff;
-  --c-sys: #5a93e8;
-  --c-inacc: #555866;
-  --c-cloud: #4bb7c3;
-  --c-unattr: #b9a27a;
-
-  /* 方块图色块（深、克制的“宝石色”，白字） */
-  --tm-safe: #2b5f4c;
-  --tm-review: #685330;
-  --tm-keep: #5f3a43;
-  --tm-unknown: #393c48;
-  --tm-other: #2a2b32;
-  --tm-pseudo: #22232a;
-  --tm-pseudo-line: #363843;
-  --tm-text: #f4f4f7;
-  --tm-gap: #141418;
-
-  /* 语义 */
-  --danger: #ef6b73;
-  --danger-fill: #d9464f;
-  --danger-bg: rgba(239, 107, 115, 0.1);
-  --danger-border: rgba(239, 107, 115, 0.32);
-  --warn: #e8b454;
-  --warn-bg: rgba(232, 180, 84, 0.09);
-  --warn-border: rgba(232, 180, 84, 0.28);
-  --ok: #5ccb9a;
-  --ok-bg: rgba(92, 203, 154, 0.1);
-  --ok-border: rgba(92, 203, 154, 0.28);
-
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
-  --shadow-2: 0 8px 24px -10px rgba(0, 0, 0, 0.6);
-  --shadow-pop: 0 18px 48px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px var(--border-2);
-  --scrim: rgba(6, 6, 9, 0.62);
-}
-
-/* ───────────── 浅色 ───────────── */
-:root[data-theme="light"] {
+[data-theme="A"] {
   color-scheme: light;
+  --bg: #f3f1ec;
+  --surface: #fbfaf7;
+  --sunk: #eae7e0;
+  --line: #e1ddd4;
+  --line2: #cfc9bd;
+  --ink: #1c1b18;
+  --ink2: #5f5b53;
+  --ink3: #99948a;
+  --accent: #1f6b50;
+  --accent-ink: #ffffff;
+  --accent-hover: #17573f;
+  --safe: #2a7a5a;
+  --safe-soft: #ddebe3;
+  --safe-label: var(--accent);
+  --review: #bc7a22;
+  --review-soft: #f4e8d6;
+  --review-ink: #8a5610;
+  --review-label: var(--review);
+  --keep: #cbc4b7;
+  --keep2: #ddd7cc;
+  --free-line: #cfc9bd;
+  --danger: #b4452f;
 
-  --bg-0: #efeff3;
-  --bg-1: #f7f7f9;
-  --surface-1: #ffffff;
-  --surface-2: #f3f3f7;
-  --surface-3: #e9e9ef;
-  --surface-inset: #eeeef2;
-  --border-1: rgba(22, 22, 40, 0.07);
-  --border-2: rgba(22, 22, 40, 0.11);
-  --border-3: rgba(22, 22, 40, 0.18);
+  --display: "Instrument Serif", serif;
+  --display-w: 400;
+  --display-track: -0.01em;
+  --display-vs: normal;
+  --heading: var(--ui);
+  --heading-w: var(--w-bold);
 
-  --text-1: #17181c;
-  --text-2: #595c68;
-  --text-3: #8b8e9a;
-  --text-on-accent: #ffffff;
-
-  --accent: #5557e0;
-  --accent-fill: #5b5de6;
-  --accent-fill-hover: #4c4ed8;
-  --accent-soft: rgba(91, 93, 230, 0.11);
-  --accent-softer: rgba(91, 93, 230, 0.06);
-  --accent-ring: rgba(91, 93, 230, 0.35);
-
-  --t-safe: #1f9d6a;
-  --t-safe-bg: rgba(31, 157, 106, 0.1);
-  --t-safe-fg: #157a51;
-  --t-review: #b7791f;
-  --t-review-bg: rgba(183, 121, 31, 0.11);
-  --t-review-fg: #8f5c12;
-  --t-keep: #d14b55;
-  --t-keep-bg: rgba(209, 75, 85, 0.1);
-  --t-keep-fg: #b0343e;
-  --t-unknown: #6b7080;
-  --t-unknown-bg: rgba(107, 112, 128, 0.11);
-  --t-unknown-fg: #4f5362;
-
-  --c-scanned: #5b5de6;
-  --c-sys: #3f7fd9;
-  --c-inacc: #b4b7c2;
-  --c-cloud: #2a9fac;
-  --c-unattr: #b08f58;
-
-  --tm-safe: #bfe3d1;
-  --tm-review: #efdcae;
-  --tm-keep: #efd3d6;
-  --tm-unknown: #dcdee6;
-  --tm-other: #e6e6ec;
-  --tm-pseudo: #e3e4ea;
-  --tm-pseudo-line: #cdd0d9;
-  --tm-text: #1b1c21;
-  --tm-gap: #f7f7f9;
-
-  --danger: #d23c47;
-  --danger-fill: #d23c47;
-  --danger-bg: rgba(210, 60, 71, 0.07);
-  --danger-border: rgba(210, 60, 71, 0.28);
-  --warn: #a8690f;
-  --warn-bg: rgba(183, 121, 31, 0.08);
-  --warn-border: rgba(183, 121, 31, 0.28);
-  --ok: #1f9d6a;
-  --ok-bg: rgba(31, 157, 106, 0.08);
-  --ok-border: rgba(31, 157, 106, 0.26);
-
-  --shadow-1: 0 1px 2px rgba(20, 20, 40, 0.06);
-  --shadow-2: 0 8px 24px -12px rgba(20, 20, 40, 0.18);
-  --shadow-pop: 0 18px 48px -14px rgba(20, 20, 40, 0.28), 0 0 0 1px var(--border-2);
-  --scrim: rgba(20, 20, 30, 0.32);
+  --r: 6px;
+  --r-lg: 10px;
+  --r-pill: 6px;
+  --bw: 1px;
+  --stroke: var(--line);
+  --shadow: none;
+  --shadow-hard: none;
+  --shadow-pop: 0 30px 80px -20px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--line);
+  --btn-bg: var(--accent);
+  --btn-ink: #ffffff;
+  --btn-shadow: 0 1px 0 rgba(255, 255, 255, 0.18) inset, 0 8px 20px -12px rgba(31, 107, 80, 0.7);
+  --overlay: rgba(28, 27, 24, 0.32);
+  --hover: var(--sunk);
+  --tag-hard-ink: #ffffff;
+  --grain-opacity: 0.035;
+  --grain-blend: multiply;
 }
 
-/* 跟随系统：没有 data-theme 且系统是浅色时，用浅色（值与上面相同） */
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme]) {
-    color-scheme: light;
-    --bg-0: #efeff3;
-    --bg-1: #f7f7f9;
-    --surface-1: #ffffff;
-    --surface-2: #f3f3f7;
-    --surface-3: #e9e9ef;
-    --surface-inset: #eeeef2;
-    --border-1: rgba(22, 22, 40, 0.07);
-    --border-2: rgba(22, 22, 40, 0.11);
-    --border-3: rgba(22, 22, 40, 0.18);
-    --text-1: #17181c;
-    --text-2: #595c68;
-    --text-3: #8b8e9a;
-    --accent: #5557e0;
-    --accent-fill: #5b5de6;
-    --accent-fill-hover: #4c4ed8;
-    --accent-soft: rgba(91, 93, 230, 0.11);
-    --accent-softer: rgba(91, 93, 230, 0.06);
-    --accent-ring: rgba(91, 93, 230, 0.35);
-    --t-safe: #1f9d6a;
-    --t-safe-bg: rgba(31, 157, 106, 0.1);
-    --t-safe-fg: #157a51;
-    --t-review: #b7791f;
-    --t-review-bg: rgba(183, 121, 31, 0.11);
-    --t-review-fg: #8f5c12;
-    --t-keep: #d14b55;
-    --t-keep-bg: rgba(209, 75, 85, 0.1);
-    --t-keep-fg: #b0343e;
-    --t-unknown: #6b7080;
-    --t-unknown-bg: rgba(107, 112, 128, 0.11);
-    --t-unknown-fg: #4f5362;
-    --c-scanned: #5b5de6;
-    --c-sys: #3f7fd9;
-    --c-inacc: #b4b7c2;
-    --c-cloud: #2a9fac;
-    --c-unattr: #b08f58;
-    --tm-safe: #bfe3d1;
-    --tm-review: #efdcae;
-    --tm-keep: #efd3d6;
-    --tm-unknown: #dcdee6;
-    --tm-other: #e6e6ec;
-    --tm-pseudo: #e3e4ea;
-    --tm-pseudo-line: #cdd0d9;
-    --tm-text: #1b1c21;
-    --tm-gap: #f7f7f9;
-    --danger: #d23c47;
-    --danger-fill: #d23c47;
-    --danger-bg: rgba(210, 60, 71, 0.07);
-    --danger-border: rgba(210, 60, 71, 0.28);
-    --warn: #a8690f;
-    --warn-bg: rgba(183, 121, 31, 0.08);
-    --warn-border: rgba(183, 121, 31, 0.28);
-    --ok: #1f9d6a;
-    --ok-bg: rgba(31, 157, 106, 0.08);
-    --ok-border: rgba(31, 157, 106, 0.26);
-    --shadow-1: 0 1px 2px rgba(20, 20, 40, 0.06);
-    --shadow-2: 0 8px 24px -12px rgba(20, 20, 40, 0.18);
-    --shadow-pop: 0 18px 48px -14px rgba(20, 20, 40, 0.28), 0 0 0 1px var(--border-2);
-    --scrim: rgba(20, 20, 30, 0.32);
-  }
+/* ───────── B 深色 · 暖炭 ───────── */
+[data-theme="B"] {
+  color-scheme: dark;
+  --bg: #14110e;
+  --surface: #1b1713;
+  --sunk: #0f0d0a;
+  --line: #2a241e;
+  --line2: #3b332b;
+  --ink: #f3ece2;
+  --ink2: #b6ab9c;
+  --ink3: #7e7468;
+  --accent: #ebc47a;
+  --accent-ink: #241a0d;
+  --accent-hover: #f2d192;
+  --safe: #ebc47a;
+  --safe-soft: rgba(235, 196, 122, 0.12);
+  --safe-label: var(--safe);
+  --review: #e3876b;
+  --review-soft: rgba(227, 135, 107, 0.12);
+  --review-ink: #f0a48c;
+  --review-label: var(--review-ink);
+  --keep: #4a4138;
+  --keep2: #3a332c;
+  --free-line: #3b332b;
+  --danger: #e3876b;
+
+  --display: "Geist", sans-serif;
+  --display-w: 200;
+  --display-track: -0.045em;
+  --display-vs: normal;
+  --heading: var(--ui);
+  --heading-w: var(--w-semi);
+
+  --r: 8px;
+  --r-lg: 12px;
+  --r-pill: 8px;
+  --bw: 1px;
+  --stroke: var(--line);
+  --shadow: none;
+  --shadow-hard: none;
+  --shadow-pop: 0 40px 100px -20px rgba(0, 0, 0, 0.8), 0 0 0 1px #342c25;
+  --btn-bg: var(--accent);
+  --btn-ink: #241a0d;
+  --btn-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset, 0 12px 32px -14px rgba(235, 196, 122, 0.55);
+  --overlay: rgba(5, 4, 3, 0.6);
+  --hover: rgba(255, 255, 255, 0.035);
+  --tag-hard-ink: #1b130d;
+  --grain-opacity: 0.045;
+  --grain-blend: normal;
+}
+
+/* ───────── C 趣味 · 汽水 ───────── */
+[data-theme="C"] {
+  color-scheme: light;
+  --bg: #f4f0e6;
+  --surface: #ffffff;
+  --sunk: #eae5d8;
+  --line: rgba(20, 20, 18, 0.14);
+  --line2: #141412;
+  --ink: #141412;
+  --ink2: #46433d;
+  --ink3: #86817a;
+  --accent: #d4f24c;
+  --accent-ink: #141412;
+  --accent-hover: #c8ea2e;
+  --safe: #d4f24c;
+  --safe-soft: #eef9c2;
+  --safe-label: #141412;
+  --review: #ff8a76;
+  --review-soft: #ffe1da;
+  --review-ink: #141412;
+  --review-label: #141412;
+  --keep: #d6d0c1;
+  --keep2: #e6e1d5;
+  --free-line: #141412;
+  --danger: #e0553c;
+
+  --display: "Bricolage Grotesque", sans-serif;
+  --display-w: 800;
+  --display-track: -0.02em;
+  --display-vs: "wdth" 75, "opsz" 96;
+  --heading: "DiskWhy Kai", var(--cjk);
+  --heading-w: 700;
+
+  --r: 12px;
+  --r-lg: 18px;
+  --r-pill: 999px;
+  --bw: 2px;
+  --stroke: #141412;
+  --shadow: 4px 4px 0 #141412;
+  --shadow-hard: 6px 6px 0 #141412;
+  --shadow-pop: 8px 8px 0 #141412;
+  --btn-bg: #141412;
+  --btn-ink: #d4f24c;
+  --btn-shadow: 4px 4px 0 #141412;
+  --overlay: rgba(20, 20, 18, 0.45);
+  --hover: #ffffff;
+  --tag-hard-ink: #141412;
+  --grain-opacity: 0;
+  --grain-blend: normal;
 }

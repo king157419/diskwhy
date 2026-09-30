@@ -13,13 +13,14 @@
     "windows": [
       {
         "label": "main",
-        "title": "DiskWhy — C 盘每一块都说清楚",
-        "width": 1360,
-        "height": 860,
+        "title": "DiskWhy",
+        "width": 1440,
+        "height": 900,
         "minWidth": 1100,
         "minHeight": 720,
         "center": true,
-        "theme": "Dark"
+        "decorations": false,
+        "shadow": true
       }
     ],
     "security": {
@@ -28,7 +29,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

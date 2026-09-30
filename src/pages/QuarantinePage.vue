@@ -1,10 +1,10 @@
 <script setup lang="ts">
+// 隔离区：选“隔离到其他盘”清理的文件按批次放在别的盘，可以整批还原；彻底删除要再确认一次。
+// DiskWhy 不会自动删隔离区，超过保留天数只提醒。
 import { computed, onMounted, ref } from "vue";
-import { Archive, Clock, FolderOpen, RefreshCw, RotateCcw, Trash2, TriangleAlert } from "lucide-vue-next";
 import { listQuarantine, purgeBatch, restoreBatch, type BatchInfo } from "../api";
-import { fmtInt, fmtTime, humanBytes } from "../format";
-import PageHeader from "../components/ui/PageHeader.vue";
-import EmptyState from "../components/ui/EmptyState.vue";
+import { gbNum, sizeParts } from "../capacity";
+import { shortPath } from "../labels";
 import { actEnv, onQuarantineChanged } from "../store";
 
 const batches = ref<BatchInfo[]>([]);
@@ -12,12 +12,11 @@ const loading = ref(true);
 const busy = ref("");
 const msg = ref("");
 const err = ref("");
-/** 彻底清空的二次确认：第一次点击记下批次，第二次点“确定彻底删除”才执行 */
+/** 彻底删除的二次确认：第一次点击记下批次，第二次点“确定删除”才执行 */
 const confirmPurge = ref<string | null>(null);
 
 const keepDays = computed(() => actEnv.value?.keep_days ?? 7);
 const totalBytes = computed(() => batches.value.reduce((s, b) => s + b.bytes, 0));
-const expiredCount = computed(() => batches.value.filter((b) => b.expired).length);
 
 async function load() {
   loading.value = true;
@@ -40,7 +39,7 @@ async function doRestore(b: BatchInfo) {
   try {
     const r = await restoreBatch(b.manifest_path);
     const rep = r.report;
-    msg.value = `已还原 ${rep.restored} 个文件（${humanBytes(rep.restored_bytes)}）到原来的位置${rep.skipped ? `，跳过 ${rep.skipped}` : ""}${rep.failed ? `，失败 ${rep.failed}` : ""}。`;
+    msg.value = `已还原 ${rep.restored} 个文件（${sizeParts(rep.restored_bytes).join(" ")}）${rep.skipped ? `，跳过 ${rep.skipped}` : ""}${rep.failed ? `，失败 ${rep.failed}` : ""}`;
     if (rep.problems.length) err.value = rep.problems.slice(0, 5).map(([p, w]) => `${p}：${w}`).join("\n");
     await onQuarantineChanged(r.summary);
     await load();
@@ -61,260 +60,215 @@ async function doPurge(b: BatchInfo) {
   err.value = "";
   try {
     const r = await purgeBatch(b.manifest_path);
-    msg.value = r.removed
-      ? `已彻底删除这一批 ${r.deleted_entries} 个文件，${b.dest_root} 腾出约 ${humanBytes(r.freed_bytes)}。`
-      : `没能全部删掉：${r.error ?? ""}`;
+    msg.value = r.removed ? `已彻底删除 ${r.deleted_entries} 个文件，${b.dest_root} 腾出 ${sizeParts(r.freed_bytes).join(" ")}` : `没能全部删掉：${r.error ?? ""}`;
     confirmPurge.value = null;
     await onQuarantineChanged(null);
     await load();
   } catch (e) {
-    err.value = `清空失败：${e}`;
+    err.value = `删除失败：${e}`;
   } finally {
     busy.value = "";
   }
 }
 
-function dayOf(unix: number): { d: string; m: string } {
+function day(unix: number) {
   const t = new Date(unix * 1000);
-  return { d: String(t.getDate()).padStart(2, "0"), m: `${t.getFullYear()}.${String(t.getMonth() + 1).padStart(2, "0")}` };
+  return `${t.getMonth() + 1} 月 ${t.getDate()} 日`;
 }
 </script>
 
 <template>
-  <div class="page">
-    <PageHeader title="隔离区" :subtitle="`选“隔离到其他盘”清理的文件放在这里，按批次保存，保留 ${keepDays} 天；DiskWhy 不会自动删除，超过 ${keepDays} 天只会提醒你`">
-      <button class="btn" :disabled="loading" @click="load"><RefreshCw :size="15" /> 刷新</button>
-    </PageHeader>
-
-    <div class="page-body">
-      <div v-if="msg" class="callout ok"><RotateCcw :size="16" /><span>{{ msg }}</span></div>
-      <div v-if="err" class="callout danger"><TriangleAlert :size="16" /><span style="white-space: pre-line">{{ err }}</span></div>
-
-      <p v-if="loading && !batches.length" class="muted loading">正在读取…</p>
-      <div v-else-if="!batches.length" class="center">
-        <EmptyState
-          kind="quarantine"
-          title="隔离区是空的"
-          :text="`清理时选“隔离到其他盘”，文件会先挪到别的盘的 DiskWhy-Quarantine 文件夹，C 盘立刻腾出空间；${keepDays} 天内可以一键整批还原。`"
-        />
+  <div class="q">
+    <div class="top">
+      <div class="k">隔离区</div>
+      <div class="big"><span class="v num">{{ gbNum(totalBytes) }}</span><span class="u">GB</span></div>
+      <div class="meta">
+        <span><b class="num">{{ batches.length }}</b> 批</span><span>保留 <b class="num">{{ keepDays }}</b> 天</span>
+        <button class="quiet" :disabled="loading" @click="load">刷新</button>
       </div>
+    </div>
 
-      <template v-else>
-        <div class="stats">
-          <div class="stat card">
-            <span class="s-ico"><Archive :size="18" /></span>
-            <div><div class="s-k">批次</div><div class="s-v num">{{ batches.length }}</div></div>
-          </div>
-          <div class="stat card">
-            <span class="s-ico"><FolderOpen :size="18" /></span>
-            <div><div class="s-k">占用其他盘</div><div class="s-v num">{{ humanBytes(totalBytes) }}</div></div>
-          </div>
-          <div class="stat card" :class="{ warn: expiredCount > 0 }">
-            <span class="s-ico"><Clock :size="18" /></span>
-            <div><div class="s-k">超过 {{ keepDays }} 天</div><div class="s-v num">{{ expiredCount }}</div></div>
-          </div>
+    <div class="list">
+      <div v-if="msg" class="note ok">{{ msg }}</div>
+      <div v-if="err" class="note err">{{ err }}</div>
+      <div v-if="!loading && !batches.length" class="empty">空的</div>
+      <div v-for="b in batches" :key="b.manifest_path" class="row" :class="{ expired: b.expired }">
+        <div class="when">
+          <b>{{ day(b.created_at) }}</b>
+          <span v-if="b.expired" class="tag">已过 {{ keepDays }} 天</span>
+          <span v-else class="d">第 {{ b.age_days + 1 }} 天</span>
         </div>
-
-        <TransitionGroup tag="div" name="batch" class="batches">
-          <article v-for="b in batches" :key="b.manifest_path" class="batch card" :class="{ expired: b.expired }">
-            <div class="date">
-              <div class="date-d num">{{ dayOf(b.created_at).d }}</div>
-              <div class="date-m num">{{ dayOf(b.created_at).m }}</div>
-            </div>
-            <div class="b-main">
-              <div class="b-head">
-                <span class="b-size num">{{ humanBytes(b.bytes) }}</span>
-                <span class="faint small"><span class="num">{{ fmtInt(b.stored_entries) }}</span> 个文件 · {{ fmtTime(b.created_at) }}</span>
-                <span v-if="b.expired" class="tag warn">已超过 {{ keepDays }} 天</span>
-                <span v-else class="tag">第 {{ b.age_days + 1 }} 天</span>
-              </div>
-              <div class="b-items">
-                <span class="faint small">原来在</span>
-                <span v-for="p in b.items" :key="p" class="b-item mono" :title="p">{{ p }}</span>
-              </div>
-              <div class="b-loc faint small mono" :title="b.batch_dir">位置：{{ b.batch_dir }} · 批次 {{ b.batch_id }}</div>
-              <div v-if="confirmPurge === b.manifest_path" class="confirm callout danger">
-                <TriangleAlert :size="16" />
-                <span class="grow">彻底删除后<b>无法恢复</b>（不进回收站）。确定吗？</span>
-                <button class="btn danger sm" :disabled="!!busy" @click="doPurge(b)">确定彻底删除</button>
-                <button class="btn sm" :disabled="!!busy" @click="confirmPurge = null">算了</button>
-              </div>
-            </div>
-            <div class="b-actions">
-              <button class="btn primary" :disabled="!!busy" @click="doRestore(b)">
-                <RotateCcw :size="15" /> {{ busy === b.manifest_path ? "请稍候…" : "还原整批" }}
-              </button>
-              <button v-if="confirmPurge !== b.manifest_path" class="btn subtle-danger" :disabled="!!busy" @click="doPurge(b)">
-                <Trash2 :size="15" /> 彻底清空…
-              </button>
-            </div>
-          </article>
-        </TransitionGroup>
-      </template>
+        <div class="what">
+          <span v-for="p in b.items.slice(0, 3)" :key="p" class="mono" :title="p">{{ shortPath(p) }}</span>
+          <span v-if="b.items.length > 3" class="more">等 {{ b.items.length }} 处</span>
+          <span class="loc mono" :title="b.batch_dir">{{ b.batch_dir }}</span>
+        </div>
+        <div class="sz num">{{ sizeParts(b.bytes)[0] }}<small>{{ sizeParts(b.bytes)[1] }}</small></div>
+        <div class="acts">
+          <template v-if="confirmPurge === b.manifest_path">
+            <span class="warn">删了找不回来</span>
+            <button class="quiet danger" :disabled="!!busy" @click="doPurge(b)">确定删除</button>
+            <button class="quiet" :disabled="!!busy" @click="confirmPurge = null">算了</button>
+          </template>
+          <template v-else>
+            <button class="link" :disabled="!!busy" @click="doRestore(b)">{{ busy === b.manifest_path ? "请稍候" : "还原" }}</button>
+            <button class="quiet" :disabled="!!busy" @click="doPurge(b)">彻底删除</button>
+          </template>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.page {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
+.top {
+  position: absolute;
+  left: var(--gutter);
+  top: 92px;
+  right: var(--gutter);
 }
-.page-body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 6px var(--sp-8) var(--sp-8);
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.k {
+  font-size: var(--fs-group);
+  font-weight: var(--w-med);
+  color: var(--ink2);
 }
-.page-body > * {
-  flex-shrink: 0;
+[data-theme="C"] .k {
+  font-family: var(--heading);
+  font-weight: 700;
+  font-size: 22px;
+  color: var(--ink);
 }
-.center {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.loading {
-  padding: 40px;
-  text-align: center;
-}
-.stats {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-}
-.stat {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 16px 18px;
-}
-.s-ico {
-  width: 38px;
-  height: 38px;
-  border-radius: 11px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-}
-.stat.warn .s-ico {
-  background: var(--warn-bg);
-  color: var(--warn);
-}
-.s-k {
-  font-size: var(--fs-2xs);
-  color: var(--text-3);
-}
-.s-v {
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-.batches {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.batch {
-  display: flex;
-  gap: 18px;
-  padding: 18px 20px;
-  align-items: flex-start;
-  transition: border-color var(--dur-1) var(--ease);
-}
-.batch:hover {
-  border-color: var(--border-2);
-}
-.batch.expired {
-  border-color: var(--warn-border);
-}
-.date {
-  width: 64px;
-  flex: none;
-  text-align: center;
-  padding: 8px 0 9px;
-  border-radius: var(--r-md);
-  background: var(--surface-2);
-}
-.date-d {
-  font-size: var(--fs-2xl);
-  font-weight: 600;
-  line-height: 1.05;
-}
-.date-m {
-  font-size: var(--fs-2xs);
-  color: var(--text-3);
-}
-.b-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.b-head {
+.big {
   display: flex;
   align-items: baseline;
-  gap: 10px;
-  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 12px;
 }
-.b-size {
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  letter-spacing: -0.02em;
+.big .v {
+  font-family: var(--display);
+  font-weight: var(--display-w);
+  letter-spacing: var(--display-track);
+  font-variation-settings: var(--display-vs);
+  font-size: 120px;
+  line-height: 0.85;
 }
-.b-items {
+[data-theme="B"] .big .v {
+  color: var(--accent);
+}
+.big .u {
+  font-size: 28px;
+  color: var(--ink2);
+  font-weight: var(--w-med);
+}
+[data-theme="A"] .big .u {
+  font-family: var(--display);
+  font-style: italic;
+  font-size: 40px;
+}
+.meta {
+  margin-top: 22px;
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
   align-items: center;
+  gap: 18px;
+  font-size: var(--fs-sub);
+  color: var(--ink3);
 }
-.b-item {
-  font-size: var(--fs-2xs);
-  padding: 3px 8px;
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  border: 1px solid var(--border-1);
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.meta b {
+  color: var(--ink);
+  font-weight: var(--w-med);
 }
-.b-loc {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.list {
+  position: absolute;
+  left: var(--gutter);
+  right: var(--gutter);
+  top: 330px;
+  bottom: 40px;
+  overflow-y: auto;
+  border-top: var(--bw) solid var(--line2);
+  scrollbar-width: thin;
 }
-.confirm {
+.row {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr) 110px 210px;
   align-items: center;
+  gap: 16px;
+  min-height: 64px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
 }
-.confirm .grow {
-  flex: 1;
-}
-.b-actions {
+.when {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  flex: none;
+  gap: 4px;
+  align-items: flex-start;
 }
-.batch-enter-active,
-.batch-leave-active {
-  transition:
-    opacity var(--dur-2) var(--ease),
-    transform var(--dur-2) var(--ease);
+.when b {
+  font-weight: var(--w-semi);
 }
-.batch-enter-from,
-.batch-leave-to {
-  opacity: 0;
-  transform: translateY(6px);
+.when .d {
+  font-size: var(--fs-meta);
+  color: var(--ink3);
+}
+.what {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.what .mono {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink2);
+}
+.what .loc {
+  color: var(--ink3);
+  font-size: 11px;
+}
+.what .more {
+  font-size: var(--fs-meta);
+  color: var(--ink3);
+}
+.sz {
+  text-align: right;
+  font-size: var(--fn-row);
+  font-weight: var(--w-med);
+}
+.sz small {
+  font-size: 12px;
+  color: var(--ink3);
+  margin-left: 3px;
+}
+.acts {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 16px;
+}
+.warn {
+  font-size: var(--fs-meta);
+  color: var(--danger);
+}
+.quiet.danger {
+  color: var(--danger);
+  font-weight: var(--w-semi);
+}
+.note {
+  padding: 10px 0;
+  font-size: var(--fs-sub);
+  border-bottom: 1px solid var(--line);
+  white-space: pre-line;
+  user-select: text;
+}
+.note.ok {
+  color: var(--safe-label);
+}
+.note.err {
+  color: var(--danger);
+}
+.empty {
+  padding: 48px 0;
+  color: var(--ink3);
+  font-size: var(--fs-body);
 }
 </style>

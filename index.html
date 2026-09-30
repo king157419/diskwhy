@@ -1,22 +1,23 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="A">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark light" />
+    <meta name="color-scheme" content="light dark" />
     <title>DiskWhy</title>
     <script>
-      // 在样式加载前就设好主题，避免启动时闪一下另一种颜色（默认深色；src/theme.ts 负责之后的切换）
+      // 样式加载前就设好主题（A 浅色 / B 深色 / C 趣味），避免启动时闪一下别的颜色。
+      // 真正的存档在 %LOCALAPPDATA%\DiskWhy\ui.json，src/theme.ts 启动后会再读一次。
       try {
-        var t = localStorage.getItem("diskwhy.theme");
-        if (t === "light") document.documentElement.setAttribute("data-theme", "light");
-        else if (t === "system") document.documentElement.removeAttribute("data-theme");
+        var t = localStorage.getItem("diskwhy.theme3");
+        if (t !== "A" && t !== "B" && t !== "C") t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "B" : "A";
+        document.documentElement.setAttribute("data-theme", t);
       } catch (e) {}
     </script>
     <style>
-      html { background: #0e0e11; }
-      html[data-theme="light"] { background: #efeff3; }
-      @media (prefers-color-scheme: light) { html:not([data-theme]) { background: #efeff3; } }
+      html { background: #f3f1ec; }
+      html[data-theme="B"] { background: #14110e; }
+      html[data-theme="C"] { background: #f4f0e6; }
     </style>
   </head>
   <body>

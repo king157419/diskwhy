@@ -1,6 +1,6 @@
-// 全局界面状态 + 动作（阶段 E 从 App.vue 挪出来，让侧栏的各个页面共用）。
-// 这里只调用 api.ts 里已有的后端命令，没有新增 / 修改任何 IPC 接口。
-import { computed, ref, watch } from "vue";
+// 全局界面状态 + 动作（阶段 F：首页 / 清理 / 看看都是什么 / 确认弹层 / 隔离区 / 设置）。
+// 只调用 api.ts 里的后端命令；清理候选由后端算好（ScanSummary.candidates），这里只管勾选和预检。
+import { computed, ref } from "vue";
 import {
   actionEnv,
   cancelScan,
@@ -8,9 +8,7 @@ import {
   getTreemap,
   listDir,
   listDrives,
-  nodeInfo,
   openSnapshot,
-  pickScanFolder,
   previewPlan,
   relaunchAsAdmin,
   saveSnapshot,
@@ -19,7 +17,7 @@ import {
   startupSnapshot,
   tmKey,
   type ActionEnv,
-  type CartItem,
+  type CandidateGroup,
   type DirListing,
   type DriveInfo,
   type EnvInfo,
@@ -27,89 +25,101 @@ import {
   type LlmSettings,
   type NodeView,
   type PreflightReport,
-  type PseudoKey,
   type ScanProgress,
   type ScanSummary,
   type Strategy,
-  type TmSelect,
   type TreemapNode,
 } from "./api";
-import { fmtDuration, fmtTime } from "./format";
-import { pseudoView } from "./pseudo";
+import { cleanCat, type CleanCat } from "./labels";
+import { collapseChain } from "./treemap";
 
 export type Phase = "idle" | "scanning" | "done";
-export type Page = "overview" | "analysis" | "cleanup" | "quarantine" | "settings";
-export type ViewMode = "list" | "map";
+export type Page = "home" | "cleanup" | "explore" | "quarantine" | "settings";
+export type ExploreView = "map" | "split" | "list";
 
 // ───── 基本状态 ─────
-export const page = ref<Page>("overview");
+export const page = ref<Page>("home");
 export const env = ref<EnvInfo | null>(null);
 export const drives = ref<DriveInfo[]>([]);
-export const selectedDrive = ref("");
-/** 用户选的文件夹（不是整个盘） */
-export const customRoot = ref("");
+export const scanRoot = ref("");
 export const phase = ref<Phase>("idle");
 export const progress = ref<ScanProgress | null>(null);
 export const summary = ref<ScanSummary | null>(null);
-/** 空间分析页当前打开的目录 */
-export const listing = ref<DirListing | null>(null);
-/** 扫描根目录的列表（概览页“最大的目录”用，不随下钻变化） */
-export const rootListing = ref<DirListing | null>(null);
-export const tm = ref<TreemapNode | null>(null);
-export const tmLoading = ref(false);
-export const selected = ref<NodeView | null>(null);
-export const selectedKey = ref<string | null>(null);
+export const scanFinishedAt = ref<number | null>(null);
 export const message = ref("");
 export const notice = ref("");
-export const toast = ref<{ text: string; action?: { label: string; page: Page } } | null>(null);
 export const cancelling = ref(false);
 export const relaunching = ref(false);
 export const snapBusy = ref(false);
 export const llmReady = computed(() => env.value?.llm_ready ?? false);
 
-let toastTimer: ReturnType<typeof setTimeout> | undefined;
-export function showToast(text: string, action?: { label: string; page: Page }) {
-  toast.value = { text, action };
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (toast.value = null), 4200);
-}
-
-function loadViewMode(): ViewMode {
-  try {
-    const v = localStorage.getItem("diskwhy.view2");
-    if (v === "list" || v === "map") return v;
-  } catch {
-    /* 存储不可用时用默认 */
-  }
-  return "list";
-}
-export const viewMode = ref<ViewMode>(loadViewMode());
-watch(viewMode, (v) => {
-  try {
-    localStorage.setItem("diskwhy.view2", v);
-  } catch {
-    /* 忽略 */
-  }
+/** 扫描的盘（C:）的信息（容量读数用） */
+export const drive = computed(() => {
+  const r = (summary.value?.root ?? scanRoot.value).toUpperCase();
+  return drives.value.find((d) => r.startsWith(d.root.toUpperCase())) ?? null;
 });
 
-export const detailNode = computed(() => selected.value ?? listing.value?.node ?? null);
-export const isScanRoot = computed(() => !!summary.value && !!listing.value && listing.value.node.path === summary.value.root);
+// ───── 清理候选 / 勾选 ─────
+export const candidates = computed<CandidateGroup[]>(() => summary.value?.candidates ?? []);
+/** 勾选的候选组（key） */
+export const checked = ref<Set<string>>(new Set());
 
-// ───── 清理清单 / 预览 / 隔离区（阶段 D） ─────
+export function canCheck(g: CandidateGroup): boolean {
+  return g.deletable_bytes > 0;
+}
+
+/** 默认勾选：可放心清理且能直接删的全选，需你判断的一律不选 */
+export function resetSelection() {
+  checked.value = new Set(candidates.value.filter((g) => g.tier === "safe" && canCheck(g)).map((g) => g.key));
+}
+
+export function toggleGroup(key: string) {
+  const g = candidates.value.find((x) => x.key === key);
+  if (!g || !canCheck(g)) return;
+  const s = new Set(checked.value);
+  if (s.has(key)) s.delete(key);
+  else s.add(key);
+  checked.value = s;
+}
+
+export function setGroups(keys: string[], on: boolean) {
+  const s = new Set(checked.value);
+  for (const k of keys) {
+    const g = candidates.value.find((x) => x.key === k);
+    if (!g || !canCheck(g)) continue;
+    if (on) s.add(k);
+    else s.delete(k);
+  }
+  checked.value = s;
+}
+
+export const checkedGroups = computed(() => candidates.value.filter((g) => checked.value.has(g.key) && canCheck(g)));
+export const checkedBytes = computed(() => checkedGroups.value.reduce((a, g) => a + g.deletable_bytes, 0));
+
+/** 首页：能直接删的“可放心清理”合计（= 主按钮清理的量） */
+export const safeGroups = computed(() => candidates.value.filter((g) => g.tier === "safe" && canCheck(g)));
+export const safeBytes = computed(() => safeGroups.value.reduce((a, g) => a + g.deletable_bytes, 0));
+/** 首页：“需你判断”合计（清理页里需你判断的全部行） */
+export const reviewBytes = computed(() => candidates.value.filter((g) => g.tier === "review").reduce((a, g) => a + g.bytes, 0));
+
+export function groupCat(g: CandidateGroup): CleanCat {
+  return cleanCat(g.group, g.category);
+}
+
+/** 首页一行小字：可放心清理按分类拆开（大到小） */
+export const safeByCat = computed(() => {
+  const m = new Map<CleanCat, number>();
+  for (const g of safeGroups.value) m.set(groupCat(g), (m.get(groupCat(g)) ?? 0) + g.deletable_bytes);
+  return [...m.entries()].sort((a, b) => b[1] - a[1]);
+});
+
+// ───── 预检 / 确认 / 执行（阶段 D 的护栏逻辑原样保留，后端重新判断每一项） ─────
 export const actEnv = ref<ActionEnv | null>(null);
-export const cart = ref<CartItem[]>([]);
-/** 清单里被取消勾选的项（小写路径）：预览时不带上 */
-export const unchecked = ref<Set<string>>(new Set());
 export const previewBusy = ref(false);
 export const report = ref<PreflightReport | null>(null);
-export const cartPaths = computed(() => new Set(cart.value.map((c) => c.path.toLowerCase())));
-export const checkedCart = computed(() => cart.value.filter((c) => !unchecked.value.has(c.path.toLowerCase())));
-
-/** 删到哪里：回收站 / 隔离到其他盘（清理清单页的选择；预览里“改为隔离到 X”会改它） */
+/** 删到哪里：回收站（默认）/ 隔离到其他盘 */
 export const cleanupMode = ref<"recycle" | "quarantine">("recycle");
-export const CUSTOM_DEST = "__custom__";
 export const qDest = ref("");
-export const qCustom = ref("");
 
 export async function refreshActionEnv() {
   try {
@@ -119,156 +129,92 @@ export async function refreshActionEnv() {
   }
 }
 
-export function addToCart(n: NodeView) {
-  const e = n.explanation;
-  if (!e || cartPaths.value.has(n.path.toLowerCase())) return;
-  cart.value.push({
-    path: n.path,
-    name: n.name,
-    kind: n.kind,
-    allocated: n.allocated,
-    tier: e.tier,
-    rule_id: e.source.kind === "rule" ? e.source.id : null,
-    what: e.what,
-    lose: e.lose,
-  });
-  showToast(`已把「${n.name}」加入清理清单（共 ${cart.value.length} 项）。加入不会马上删除。`, { label: "去清理清单", page: "cleanup" });
+export function currentStrategy(): Strategy {
+  if (cleanupMode.value === "quarantine" && qDest.value) return { kind: "quarantine", dest_root: qDest.value };
+  return { kind: "recycle_bin" };
 }
 
-export function removeFromCart(path: string) {
-  const k = path.toLowerCase();
-  cart.value = cart.value.filter((c) => c.path.toLowerCase() !== k);
-  if (unchecked.value.has(k)) {
-    const s = new Set(unchecked.value);
-    s.delete(k);
-    unchecked.value = s;
-  }
-}
-
-export function toggleChecked(path: string) {
-  const k = path.toLowerCase();
-  const s = new Set(unchecked.value);
-  if (s.has(k)) s.delete(k);
-  else s.add(k);
-  unchecked.value = s;
-}
-
-export function clearCart() {
-  cart.value = [];
-  unchecked.value = new Set();
-}
-
-export async function doPreview(strategy: Strategy) {
-  const items = checkedCart.value;
+/** 预检：把勾选组里能直接删的路径交给后端（带着规则 id，后端会核对说明有没有变） */
+export async function doPreview(strategy: Strategy = currentStrategy()) {
+  const items = checkedGroups.value.flatMap((g) => g.paths.filter((p) => p.deletable).map((p) => ({ path: p.path, expect_rule: g.rule_id })));
   if (!items.length) return;
   previewBusy.value = true;
   message.value = "";
   try {
-    report.value = await previewPlan(
-      items.map((c) => ({ path: c.path, expect_rule: c.rule_id })),
-      strategy,
-    );
+    report.value = await previewPlan(items, strategy);
   } catch (e) {
-    message.value = `预览失败：${e}`;
+    message.value = `预检失败：${e}`;
   } finally {
     previewBusy.value = false;
   }
 }
 
-/** 预览里点“改为隔离到 X”：切换策略并重新预览 */
-export async function onRequote(s: Strategy) {
+/** 改删到哪里（回收站 ↔ 隔离到某个盘）：重新预检 */
+export async function requote(s: Strategy) {
   if (s.kind === "quarantine") {
     cleanupMode.value = "quarantine";
-    const d = (actEnv.value?.drives ?? drives.value).find((x) => x.root === s.dest_root);
-    if (d) qDest.value = d.root;
-    else {
-      qDest.value = CUSTOM_DEST;
-      qCustom.value = s.dest_root;
-    }
-  }
-  report.value = null;
+    qDest.value = s.dest_root;
+  } else cleanupMode.value = "recycle";
   await doPreview(s);
 }
 
 export async function onExecuted(o: ExecOutcome) {
-  if (o.summary) summary.value = o.summary;
-  const done = new Set(o.report.items.filter((i) => !i.blocked && i.failed === 0).map((i) => i.path.toLowerCase()));
-  cart.value = cart.value.filter((c) => !done.has(c.path.toLowerCase()));
+  if (o.summary) {
+    summary.value = o.summary;
+    resetSelection();
+  }
   await reloadViews();
   await refreshActionEnv();
 }
 
 export async function onQuarantineChanged(s: ScanSummary | null) {
-  if (s) summary.value = s;
-  if (s) await reloadViews();
+  if (s) {
+    summary.value = s;
+    resetSelection();
+    await reloadViews();
+  }
   await refreshActionEnv();
 }
 
-/** 动作之后：重新读取当前目录和根目录（后端已经只重扫了受影响的子树） */
-async function reloadViews() {
-  if (listing.value) await open(listing.value.node.path, true);
-  if (summary.value) {
-    try {
-      rootListing.value = await listDir(summary.value.root, 12);
-    } catch {
-      /* 忽略 */
-    }
-  }
-}
-
-// ───── 扫描 / 浏览 ─────
+// ───── 扫描 ─────
 export async function init() {
   try {
     env.value = await getEnv();
     drives.value = await listDrives();
     const c = drives.value.find((d) => d.root.toUpperCase() === "C:\\");
-    selectedDrive.value = (c ?? drives.value[0])?.root ?? "";
-    await refreshActionEnv();
-    // 用 “diskwhy.exe 某个快照.dwsnap” 启动（或双击关联的快照文件）时直接打开
+    scanRoot.value = (c ?? drives.value[0])?.root ?? "C:\\";
+    void refreshActionEnv();
+    // 用快照启动（diskwhy.exe x.dwsnap）或 --scan <文件夹> 时按参数来；否则一打开就扫 C 盘
     const snap = await startupSnapshot();
-    if (snap) await doOpenSnapshot(snap);
-    const dir = await startupScanDir();
-    if (dir && !snap) {
-      customRoot.value = dir;
-      selectedDrive.value = dir;
-      await doScan();
+    if (snap) {
+      await doOpenSnapshot(snap);
+      return;
     }
+    const dir = await startupScanDir();
+    if (dir) scanRoot.value = dir;
+    await doScan();
   } catch (e) {
     message.value = `初始化失败：${e}`;
   }
 }
 
-export async function doPickFolder() {
-  try {
-    const p = await pickScanFolder();
-    if (!p) return;
-    customRoot.value = p;
-    selectedDrive.value = p;
-    await doScan();
-  } catch (e) {
-    message.value = `选择文件夹失败：${e}`;
-  }
-}
-
 export async function doScan() {
-  if (!selectedDrive.value || phase.value === "scanning") return;
+  if (!scanRoot.value || phase.value === "scanning") return;
   message.value = "";
-  notice.value = "";
   phase.value = "scanning";
-  if (page.value !== "overview" && page.value !== "analysis") page.value = "overview";
   progress.value = null;
   summary.value = null;
   listing.value = null;
-  rootListing.value = null;
   tm.value = null;
-  selected.value = null;
+  focus.value = null;
   cancelling.value = false;
-  clearCart();
+  checked.value = new Set();
   try {
-    const s = await startScan(selectedDrive.value, (p) => (progress.value = p));
+    const s = await startScan(scanRoot.value, (p) => (progress.value = p));
     summary.value = s;
+    scanFinishedAt.value = Date.now();
     phase.value = "done";
-    await afterResult(s);
+    resetSelection();
   } catch (e) {
     phase.value = "idle";
     message.value = String(e);
@@ -277,26 +223,51 @@ export async function doScan() {
   }
 }
 
-async function afterResult(s: ScanSummary) {
-  await open(s.root);
-  rootListing.value = listing.value;
-}
-
 export async function doCancel() {
   cancelling.value = true;
   await cancelScan();
 }
 
-export async function open(path: string, keepSelection = false) {
+// ───── 看看都是什么（方块图 + 列表） ─────
+/** 方块图的根（当前文件夹） */
+export const listing = ref<DirListing | null>(null);
+export const tm = ref<TreemapNode | null>(null);
+export const tmLoading = ref(false);
+/** 右边列表展示的文件夹（当前文件夹里选中的那一块；默认最大的子文件夹） */
+export const focus = ref<DirListing | null>(null);
+export const focusKey = ref<string | null>(null);
+/** 列表里展开说明的那一行 */
+export const openRow = ref<string | null>(null);
+export const exploreView = ref<ExploreView>(loadView());
+
+function loadView(): ExploreView {
+  try {
+    const v = localStorage.getItem("diskwhy.explore");
+    if (v === "map" || v === "split" || v === "list") return v;
+  } catch {
+    /* 用默认 */
+  }
+  return "split";
+}
+export function setExploreView(v: ExploreView) {
+  exploreView.value = v;
+  try {
+    localStorage.setItem("diskwhy.explore", v);
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 打开一个文件夹作为方块图的根；focusPath 给了就把它当右边列表，否则挑最大的子文件夹 */
+export async function openDir(path: string, focusPath?: string) {
   try {
     tmLoading.value = true;
     const [l, t] = await Promise.all([listDir(path), getTreemap(path, 3)]);
     listing.value = l;
     tm.value = t;
-    if (!keepSelection) {
-      selected.value = null;
-      selectedKey.value = null;
-    }
+    openRow.value = null;
+    const target = focusPath ?? defaultFocus(t);
+    await setFocus(target ?? null);
   } catch (e) {
     message.value = String(e);
   } finally {
@@ -304,42 +275,61 @@ export async function open(path: string, keepSelection = false) {
   }
 }
 
-/** 从概览等页面跳到空间分析并打开某个目录 */
-export async function openInAnalysis(path: string, selectNode?: NodeView) {
-  page.value = "analysis";
-  await open(path);
-  if (selectNode) select(selectNode);
+/** 默认的右边列表：最大的子文件夹；它如果只是个“外壳”（Users 里几乎全是 king），就再往里走一层 */
+function defaultFocus(t: TreemapNode): string | undefined {
+  const dirs = t.children.filter((c) => c.kind === "Dir" && c.children.length > 0);
+  if (!dirs.length) return undefined;
+  const big = dirs.reduce((a, b) => (b.allocated > a.allocated ? b : a));
+  return collapseChain(big).node.path;
 }
 
-export function goUp() {
-  const bc = listing.value?.breadcrumb;
-  if (bc && bc.length > 1) open(bc[bc.length - 2].path);
-}
-
-export function select(n: NodeView) {
-  selected.value = n;
-  selectedKey.value = tmKey(n);
-}
-
-export async function onTmSelect(s: TmSelect) {
-  selectedKey.value = s.key;
-  if (s.pseudo) {
-    selected.value = pseudoView(s.pseudo as PseudoKey, summary.value!);
-    return;
-  }
-  if (!s.node) return; // “其他”块：只高亮
-  const direct = listing.value?.children.find((c) => tmKey(c) === s.key);
-  if (direct) {
-    selected.value = direct;
+export async function setFocus(path: string | null) {
+  openRow.value = null;
+  if (!path) {
+    focus.value = listing.value;
+    focusKey.value = null;
     return;
   }
   try {
-    selected.value = await nodeInfo(s.node.path, s.node.kind);
-  } catch (e) {
-    message.value = String(e);
+    focus.value = await listDir(path, 200);
+    focusKey.value = path;
+  } catch {
+    focus.value = listing.value;
+    focusKey.value = null;
   }
 }
 
+/** 进入列表里的某个文件夹：它的父文件夹成为方块图的根，它自己成为右边列表 */
+export async function enterRow(n: NodeView) {
+  if (n.kind !== "Dir" || !focus.value) return;
+  await openDir(focus.value.node.path, n.path);
+}
+
+/** 进入方块图里的某一块（双击） */
+export async function enterBlock(path: string) {
+  await openDir(path);
+}
+
+export async function goUp() {
+  const bc = listing.value?.breadcrumb;
+  if (bc && bc.length > 1) await openDir(bc[bc.length - 2].path, listing.value!.node.path);
+}
+
+export async function goExplore() {
+  page.value = "explore";
+  if (!listing.value && summary.value) await openDir(summary.value.root);
+}
+
+export function selectKeyOf(n: { kind: NodeView["kind"]; path: string }): string {
+  return tmKey(n);
+}
+
+/** 动作之后重新读当前视图（后端已经只重扫了受影响的子树） */
+async function reloadViews() {
+  if (listing.value) await openDir(listing.value.node.path, focusKey.value ?? undefined);
+}
+
+// ───── 其他 ─────
 export async function doRelaunch() {
   relaunching.value = true;
   try {
@@ -370,13 +360,14 @@ export async function doOpenSnapshot(path?: string) {
     const s = await openSnapshot(path);
     if (!s) return;
     summary.value = s;
+    scanRoot.value = s.root;
+    scanFinishedAt.value = s.snapshot ? s.snapshot.meta.saved_at * 1000 : Date.now();
     phase.value = "done";
-    clearCart();
-    const sn = s.snapshot;
-    notice.value = sn
-      ? `正在查看快照：${sn.path}（${sn.meta.kind === "snapshot" ? `保存于 ${fmtTime(sn.meta.saved_at)}` : "CLI --json 输出，目录树可能只有几层"}，读取用时 ${fmtDuration(sn.load_ms)}）。说明是按当前规则库现算的。`
-      : "";
-    await afterResult(s);
+    listing.value = null;
+    focus.value = null;
+    resetSelection();
+    if (s.snapshot) notice.value = `正在查看快照：${s.snapshot.path}`;
+    page.value = "home";
   } catch (e) {
     message.value = `打开快照失败：${e}`;
   } finally {

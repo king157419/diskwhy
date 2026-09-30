@@ -1,11 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口能力：core 默认权限 + opener 默认权限 + 切换窗口标题栏深浅色（设置页的主题选择）（opener 只允许用默认浏览器打开 http/https/mailto/tel 链接，用于规则里的参考链接）。快照的保存/打开对话框在 Rust 侧弹出，前端不需要 dialog 权限；应用自定义命令按 Tauri 2 规则默认对所有窗口可用",
-  "windows": ["main"],
+  "description": "主窗口能力：core 默认权限 + opener 默认权限 + 自绘标题栏（最小化 / 最大化 / 关闭 / 拖动）+ 切换窗口深浅色（主题 A/C 浅色、B 深色）。opener 只允许用默认浏览器打开 http/https/mailto/tel 链接（规则里的参考链接）。快照的保存/打开对话框在 Rust 侧弹出，前端不需要 dialog 权限；应用自定义命令按 Tauri 2 规则默认对所有窗口可用",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-set-theme",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
     "opener:default"
   ]
 }

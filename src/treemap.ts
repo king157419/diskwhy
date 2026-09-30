@@ -239,3 +239,30 @@ export function hitTest(items: TmItem[], x: number, y: number): TmItem | null {
   }
   return null;
 }
+
+// ───── 单子项链合并（阶段 F） ─────
+
+export interface ChainNode {
+  name: string;
+  kind: string;
+  allocated: number;
+  children: ChainNode[];
+}
+
+/**
+ * “外壳”文件夹合并：一个文件夹里 ≥ share 的空间都在唯一一个最大的子文件夹里（比如 C:\Users 里几乎全是 king），
+ * 就把两层合成一块、名字写成 “Users \ king”，最多合并 maxHops 层。内层的子项还没发过来（children 为空）时不合并。
+ */
+export function collapseChain<T extends ChainNode>(n: T, share = 0.95, maxHops = 3): { node: T; name: string } {
+  let node = n;
+  let name = n.name;
+  for (let hop = 0; hop < maxHops; hop++) {
+    const dirs = node.children.filter((c) => c.kind === "Dir");
+    if (!dirs.length || node.allocated <= 0) break;
+    const big = dirs.reduce((a, b) => (b.allocated > a.allocated ? b : a));
+    if (big.allocated < node.allocated * share || !big.children.length) break;
+    node = big as T;
+    name = `${name} \\ ${big.name}`;
+  }
+  return { node, name };
+}

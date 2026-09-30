@@ -1,11 +1,9 @@
 <script setup lang="ts">
+// 设置：主题（三个小色块 + 名字）、AI 推测（可选）、数据（规则 / 权限 / 快照 / 隔离区 / 版本）。
 import { onMounted, ref } from "vue";
-import { Bot, BookOpen, CircleCheck, KeyRound, Monitor, Moon, Palette, PlugZap, Sun, TriangleAlert } from "lucide-vue-next";
 import { getSettings, saveSettings, testLlm, type LlmSettings } from "../api";
-import { fmtInt } from "../format";
-import PageHeader from "../components/ui/PageHeader.vue";
-import { setTheme, themePref, type ThemePref } from "../theme";
-import { actEnv, env, onSettingsSaved } from "../store";
+import { THEMES, setTheme, theme } from "../theme";
+import { actEnv, doOpenSnapshot, doRelaunch, doSaveSnapshot, env, onSettingsSaved, page, relaunching, snapBusy, summary } from "../store";
 
 const s = ref<LlmSettings>({ enabled: false, base_url: "", model: "", api_key: "" });
 const testing = ref(false);
@@ -17,7 +15,7 @@ onMounted(async () => {
   try {
     s.value = await getSettings();
   } catch (e) {
-    result.value = `读取设置失败：${e}`;
+    result.value = `读取失败：${e}`;
   }
 });
 
@@ -33,7 +31,7 @@ async function doTest() {
     result.value = await testLlm(s.value);
     resultOk.value = true;
   } catch (e) {
-    result.value = `连接失败：${e}`;
+    result.value = `连不上：${e}`;
     resultOk.value = false;
   } finally {
     testing.value = false;
@@ -43,9 +41,9 @@ async function doTest() {
 async function doSave() {
   saving.value = true;
   try {
-    const p = await saveSettings(s.value);
+    await saveSettings(s.value);
     onSettingsSaved({ ...s.value });
-    result.value = `已保存到 ${p}`;
+    result.value = "已保存";
     resultOk.value = true;
   } catch (e) {
     result.value = `保存失败：${e}`;
@@ -54,300 +52,214 @@ async function doSave() {
     saving.value = false;
   }
 }
-
-const themes: { key: ThemePref; label: string; sub: string; icon: unknown }[] = [
-  { key: "dark", label: "深色", sub: "默认", icon: Moon },
-  { key: "light", label: "浅色", sub: "白天更清楚", icon: Sun },
-  { key: "system", label: "跟随系统", sub: "随 Windows 切换", icon: Monitor },
-];
 </script>
 
 <template>
-  <div class="page">
-    <PageHeader title="设置" subtitle="外观、AI 推测（可选）和规则库信息" />
+  <div class="settings">
+    <div class="wrap">
+      <section class="sec">
+        <h3>主题</h3>
+        <div class="themes" role="radiogroup" aria-label="主题">
+          <button
+            v-for="t in THEMES"
+            :key="t.id"
+            class="th"
+            :class="{ on: theme === t.id }"
+            role="radio"
+            :aria-checked="theme === t.id"
+            :aria-label="'主题：' + t.name"
+            @click="setTheme(t.id)"
+          >
+            <span class="pv" :class="'pv-' + t.id"><i class="n">32</i><i class="bar"></i></span>
+            <span class="nm">{{ t.name }}</span>
+          </button>
+        </div>
+      </section>
 
-    <div class="page-body">
-      <div class="col">
-        <!-- 外观 -->
-        <section class="sec card">
-          <div class="sec-head">
-            <span class="sec-ico"><Palette :size="17" /></span>
-            <div>
-              <div class="card-title">外观</div>
-              <div class="muted small">选择只保存在这台电脑上</div>
-            </div>
+      <section class="sec">
+        <h3>
+          AI 推测
+          <label class="switch">
+            <input v-model="s.enabled" type="checkbox" aria-label="启用 AI 推测" />
+            <span class="track"><span class="thumb"></span></span>
+            <span class="sw">{{ s.enabled ? "开" : "关" }}</span>
+          </label>
+        </h3>
+        <div class="form">
+          <label for="llm-url">地址</label>
+          <div class="with">
+            <input id="llm-url" v-model.trim="s.base_url" class="input mono" placeholder="http://localhost:11434/v1" spellcheck="false" />
+            <button class="quiet" type="button" @click="useOllama">本机 Ollama</button>
           </div>
-          <div class="themes" role="radiogroup" aria-label="主题">
-            <button
-              v-for="t in themes"
-              :key="t.key"
-              class="theme"
-              :class="{ on: themePref === t.key }"
-              role="radio"
-              :aria-checked="themePref === t.key"
-              :aria-label="'主题：' + t.label"
-              @click="setTheme(t.key)"
-            >
-              <span class="preview" :class="'pv-' + t.key">
-                <span class="pv-side"></span>
-                <span class="pv-main"><i></i><i></i><i class="short"></i></span>
-              </span>
-              <span class="theme-label"><component :is="t.icon" :size="14" /> {{ t.label }}</span>
-              <span class="faint small">{{ t.sub }}</span>
-            </button>
-          </div>
-        </section>
+          <label for="llm-model">模型</label>
+          <input id="llm-model" v-model.trim="s.model" class="input mono" placeholder="qwen2.5:7b" spellcheck="false" />
+          <label for="llm-key">Key</label>
+          <input id="llm-key" v-model.trim="s.api_key" class="input mono" type="password" placeholder="本机 Ollama 留空" autocomplete="off" />
+        </div>
+        <p class="fine">只发文件夹名和大小，不发文件内容 · Key 明文存在 %LOCALAPPDATA%\DiskWhy\settings.json</p>
+        <div class="acts">
+          <button class="quiet" :disabled="testing || !s.base_url || !s.model" @click="doTest">{{ testing ? "测试中" : "测试连接" }}</button>
+          <span v-if="result" class="res" :class="{ ok: resultOk }">{{ result }}</span>
+          <button class="btn" :disabled="saving" @click="doSave">保存</button>
+        </div>
+      </section>
 
-        <!-- AI -->
-        <section class="sec card">
-          <div class="sec-head">
-            <span class="sec-ico"><Bot :size="17" /></span>
-            <div class="grow">
-              <div class="card-title">AI 推测（可选）</div>
-              <div class="muted small">规则库和启发式都认不出来的文件夹，可以点“问 AI”让大模型猜一猜。默认关闭；支持任何 OpenAI 兼容接口，包括本机运行的 Ollama（不联网、不需要密钥）。</div>
-            </div>
-            <label class="switch">
-              <input type="checkbox" v-model="s.enabled" aria-label="启用 AI 推测" />
-              <span class="track"><span class="thumb"></span></span>
-              <span class="sw-label">{{ s.enabled ? "已启用" : "已关闭" }}</span>
-            </label>
-          </div>
-
-          <div class="form">
-            <label for="llm-url">接口地址</label>
-            <div class="with-btn">
-              <input id="llm-url" v-model.trim="s.base_url" class="input" placeholder="http://localhost:11434/v1" spellcheck="false" />
-              <button class="btn" type="button" @click="useOllama">填入本机 Ollama</button>
-            </div>
-            <label for="llm-model">模型名</label>
-            <input id="llm-model" v-model.trim="s.model" class="input" placeholder="例如 qwen2.5:7b、gpt-4o-mini" spellcheck="false" />
-            <label for="llm-key">API Key</label>
-            <input id="llm-key" v-model.trim="s.api_key" class="input" type="password" placeholder="本机 Ollama 留空即可" autocomplete="off" />
-          </div>
-
-          <div class="privacy">
-            <div><b>会发送什么：</b>文件夹名、父路径（C:\Users\你的用户名 会换成 ~）、最大的 10 个子项名和大小、文件类型分布、总大小、修改日期。</div>
-            <div><b>绝不发送：</b>任何文件的内容。AI 的回答一律标“AI 推测 · 需要你来判断”，不会被当成“可以放心清理”。</div>
-            <div class="faint">设置保存在 %LOCALAPPDATA%\DiskWhy\settings.json。</div>
-          </div>
-
-          <div class="callout warn" role="note">
-            <KeyRound :size="16" />
-            <span>
-              API Key 目前<b>明文</b>保存在上面的 settings.json 里，没有加密：能登录这台电脑这个账户的人或程序都能读到。建议只用本机 Ollama（不需要 Key），或给 DiskWhy 单独建一个额度很低、随时可以作废的 Key。
-            </span>
-          </div>
-
-          <div v-if="result" class="callout" :class="resultOk ? 'ok' : 'danger'">
-            <CircleCheck v-if="resultOk" :size="16" />
-            <TriangleAlert v-else :size="16" />
-            <span>{{ result }}</span>
-          </div>
-
-          <div class="actions">
-            <button class="btn" :disabled="testing || !s.base_url || !s.model" @click="doTest">
-              <PlugZap :size="15" /> {{ testing ? "测试中…" : "测试连接" }}
-            </button>
-            <span class="spacer"></span>
-            <button class="btn primary" :disabled="saving" @click="doSave">保存</button>
-          </div>
-        </section>
-
-        <!-- 规则库 -->
-        <section class="sec card">
-          <div class="sec-head">
-            <span class="sec-ico"><BookOpen :size="17" /></span>
-            <div>
-              <div class="card-title">规则库与数据</div>
-              <div class="muted small">说明文字来自内置规则库（可在 %LOCALAPPDATA%\DiskWhy\rules 放自己的规则）</div>
-            </div>
-          </div>
-          <dl class="kv">
-            <dt>规则</dt>
-            <dd class="num">{{ env ? fmtInt(env.rules_total) : "—" }} 条</dd>
-            <dt>已登记的软件</dt>
-            <dd class="num">{{ env ? fmtInt(env.registry_apps) : "—" }} 个（从注册表读取，用来推断文件夹属于谁）</dd>
-            <dt>权限</dt>
-            <dd>{{ env ? (env.elevated ? "管理员" : "普通用户") : "—" }}</dd>
-            <dt>动作日志</dt>
-            <dd class="mono path">{{ actEnv?.log_path ?? "—" }}</dd>
-            <dt>版本</dt>
-            <dd class="num">{{ env?.version ?? "—" }}</dd>
-          </dl>
-          <div v-if="env && env.rule_warnings.length" class="callout warn">
-            <TriangleAlert :size="16" />
-            <div>
-              <b>规则库警告</b>
-              <ul class="warns">
-                <li v-for="w in env.rule_warnings" :key="w">{{ w }}</li>
-              </ul>
-            </div>
-          </div>
-        </section>
-      </div>
+      <section class="sec">
+        <h3>数据</h3>
+        <dl class="kv">
+          <dt>规则</dt>
+          <dd class="num">{{ env?.rules_total ?? "—" }} 条</dd>
+          <dt>权限</dt>
+          <dd>
+            {{ env ? (env.elevated ? "管理员" : "普通") : "—" }}
+            <button v-if="env && !env.elevated" class="quiet" :disabled="relaunching" @click="doRelaunch">以管理员重启</button>
+          </dd>
+          <dt>快照</dt>
+          <dd>
+            <button class="quiet" :disabled="snapBusy" @click="doOpenSnapshot()">打开</button>
+            <button class="quiet" :disabled="snapBusy || !summary" @click="doSaveSnapshot">保存</button>
+          </dd>
+          <dt>隔离区</dt>
+          <dd>
+            <span class="num">{{ actEnv?.batches.length ?? 0 }}</span> 批
+            <button class="quiet" @click="page = 'quarantine'">查看</button>
+          </dd>
+          <dt>版本</dt>
+          <dd class="num">{{ env?.version ?? "—" }}</dd>
+        </dl>
+        <ul v-if="env && env.rule_warnings.length" class="warns">
+          <li v-for="w in env.rule_warnings" :key="w">{{ w }}</li>
+        </ul>
+      </section>
     </div>
   </div>
 </template>
 
 <style scoped>
-.page {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
-}
-.page-body {
-  flex: 1;
-  min-height: 0;
+.settings {
   overflow-y: auto;
-  padding: 6px var(--sp-8) var(--sp-10);
 }
-.col {
-  max-width: 820px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+.wrap {
+  width: min(720px, calc(100% - 2 * var(--gutter)));
+  margin: 88px 0 48px var(--gutter);
 }
 .sec {
-  padding: 20px 22px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+  padding: 26px 0 30px;
+  border-top: var(--bw) solid var(--line2);
 }
-.sec-head {
-  display: flex;
-  gap: 14px;
-  align-items: flex-start;
+.sec:first-child {
+  border-top: 0;
+  padding-top: 0;
 }
-.sec-head .small {
-  margin-top: 2px;
-  line-height: 1.6;
-}
-.grow {
-  flex: 1;
-  min-width: 0;
-}
-.sec-ico {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  flex: none;
+h3 {
   display: flex;
   align-items: center;
-  justify-content: center;
-  background: var(--accent-soft);
-  color: var(--accent);
+  gap: 16px;
+  font-family: var(--heading);
+  font-size: var(--fs-group);
+  font-weight: var(--heading-w);
+  margin-bottom: 18px;
 }
 .themes {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+  display: flex;
+  gap: 18px;
 }
-.theme {
+.th {
   display: flex;
   flex-direction: column;
+  gap: 8px;
   align-items: flex-start;
-  gap: 4px;
-  padding: 10px 10px 12px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--border-2);
-  background: var(--surface-2);
-  cursor: pointer;
-  text-align: left;
-  transition:
-    border-color var(--dur-1) var(--ease),
-    background var(--dur-1) var(--ease),
-    transform var(--dur-1) var(--ease);
 }
-.theme:hover {
-  border-color: var(--border-3);
-}
-.theme:active {
-  transform: scale(0.99);
-}
-.theme.on {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.preview {
-  width: 100%;
-  height: 64px;
+.pv {
+  width: 132px;
+  height: 84px;
   border-radius: 8px;
-  display: flex;
+  position: relative;
   overflow: hidden;
-  margin-bottom: 6px;
-  border: 1px solid var(--border-1);
+  border: 1px solid var(--line2);
+  transition: transform var(--dur-1) var(--ease);
 }
-.pv-side {
-  width: 26%;
+.th:hover .pv {
+  transform: translateY(-2px);
 }
-.pv-main {
-  flex: 1;
-  padding: 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.th.on .pv {
+  outline: 2px solid var(--ink);
+  outline-offset: 3px;
 }
-.pv-main i {
-  display: block;
-  height: 8px;
-  border-radius: 3px;
+.pv .n {
+  position: absolute;
+  left: 12px;
+  top: 10px;
+  font-style: normal;
+  font-size: 44px;
+  line-height: 1;
 }
-.pv-main i.short {
-  width: 55%;
+.pv .bar {
+  position: absolute;
+  right: 14px;
+  top: 12px;
+  bottom: 12px;
+  width: 16px;
+  border-radius: 2px;
 }
-.pv-dark .pv-side {
-  background: #0e0e11;
+.pv-A {
+  background: #f3f1ec;
 }
-.pv-dark .pv-main {
-  background: #16161a;
+.pv-A .n {
+  font-family: "Instrument Serif", serif;
+  color: #1c1b18;
 }
-.pv-dark .pv-main i {
-  background: #2a2a31;
+.pv-A .bar {
+  background: linear-gradient(#e6e2da 20%, #2a7a5a 20% 45%, #bc7a22 45% 65%, #cbc4b7 65%);
 }
-.pv-dark .pv-main i:first-child {
-  background: #6c6df0;
-  width: 40%;
+.pv-B {
+  background: #14110e;
 }
-.pv-light .pv-side {
-  background: #efeff3;
+.pv-B .n {
+  font-family: "Geist", sans-serif;
+  font-weight: 200;
+  color: #ebc47a;
 }
-.pv-light .pv-main {
-  background: #ffffff;
+.pv-B .bar {
+  background: linear-gradient(#2a241e 20%, #ebc47a 20% 45%, #e3876b 45% 65%, #4a4138 65%);
 }
-.pv-light .pv-main i {
-  background: #e6e6ec;
+.pv-C {
+  background: #d4f24c;
+  border: 2px solid #141412;
 }
-.pv-light .pv-main i:first-child {
-  background: #5b5de6;
-  width: 40%;
+.pv-C .n {
+  font-family: "Bricolage Grotesque", sans-serif;
+  font-weight: 800;
+  font-variation-settings: "wdth" 75, "opsz" 96;
+  color: #141412;
 }
-.pv-system {
-  background: linear-gradient(135deg, #16161a 50%, #ffffff 50%);
+.pv-C .bar {
+  border: 2px solid #141412;
+  background: linear-gradient(#fff 20%, #d4f24c 20% 45%, #ff8a76 45% 65%, #d6d0c1 65%);
 }
-.pv-system .pv-side {
-  background: linear-gradient(135deg, #0e0e11 50%, #efeff3 50%);
+.nm {
+  font-size: var(--fs-sub);
+  color: var(--ink2);
+  font-weight: var(--w-med);
 }
-.pv-system .pv-main i {
-  background: rgba(128, 128, 140, 0.35);
+.th.on .nm {
+  color: var(--ink);
+  font-weight: var(--w-semi);
 }
-.pv-system .pv-main i:first-child {
-  background: #6c6df0;
-  width: 40%;
+[data-theme="C"] .nm {
+  font-family: var(--heading);
+  font-weight: 700;
 }
-.theme-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 600;
-  font-size: var(--fs-sm);
-}
+
 .switch {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  flex: none;
+  font-family: var(--ui);
+  font-size: var(--fs-sub);
+  font-weight: var(--w-reg);
+  color: var(--ink2);
 }
 .switch input {
   position: absolute;
@@ -356,99 +268,115 @@ const themes: { key: ThemePref; label: string; sub: string; icon: unknown }[] = 
   height: 1px;
 }
 .track {
-  width: 38px;
-  height: 22px;
-  border-radius: 11px;
-  background: var(--surface-3);
-  border: 1px solid var(--border-2);
+  width: 34px;
+  height: 20px;
+  border-radius: 10px;
+  background: var(--line2);
   position: relative;
-  transition: background var(--dur-2) var(--ease);
+  transition: background-color var(--dur-2) var(--ease);
 }
 .thumb {
   position: absolute;
-  top: 2px;
   left: 2px;
+  top: 2px;
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: var(--text-2);
-  transition:
-    transform var(--dur-2) var(--ease),
-    background var(--dur-2) var(--ease);
+  background: var(--surface);
+  transition: transform var(--dur-2) var(--ease);
 }
 .switch input:checked + .track {
-  background: var(--accent-fill);
-  border-color: transparent;
+  background: var(--accent);
 }
 .switch input:checked + .track .thumb {
-  transform: translateX(16px);
-  background: #fff;
+  transform: translateX(14px);
 }
 .switch input:focus-visible + .track {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-.sw-label {
-  font-size: var(--fs-xs);
-  color: var(--text-2);
-  width: 42px;
 }
 .form {
   display: grid;
-  grid-template-columns: 90px 1fr;
-  gap: 10px 14px;
+  grid-template-columns: 64px 1fr;
+  gap: 10px 16px;
   align-items: center;
-  font-size: var(--fs-sm);
 }
 .form label {
-  color: var(--text-2);
+  font-size: var(--fs-sub);
+  color: var(--ink3);
 }
-.with-btn {
+.with {
   display: flex;
-  gap: 8px;
-}
-.with-btn .input {
-  flex: 1;
-}
-.privacy {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 12px 14px;
-  border-radius: var(--r-md);
-  background: var(--surface-inset);
-  border: 1px solid var(--border-1);
-  font-size: var(--fs-xs);
-  color: var(--text-2);
-  line-height: 1.65;
-}
-.privacy b {
-  color: var(--text-1);
-}
-.actions {
-  display: flex;
-  gap: 8px;
+  gap: 12px;
   align-items: center;
+}
+.with .quiet {
+  white-space: nowrap;
+}
+.input {
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border-radius: var(--r);
+  border: var(--bw) solid var(--line2);
+  background: var(--surface);
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+}
+.input:focus {
+  border-color: var(--accent);
+}
+[data-theme="A"] .input:focus {
+  border-color: var(--ink);
+}
+.fine {
+  margin-top: 14px;
+  font-size: var(--fs-meta);
+  color: var(--ink3);
+}
+.acts {
+  margin-top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+.acts .btn {
+  margin-left: auto;
+  height: 44px;
+  min-width: 120px;
+}
+.res {
+  font-size: var(--fs-sub);
+  color: var(--danger);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 360px;
+}
+.res.ok {
+  color: var(--safe-label);
 }
 .kv {
   display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 8px 14px;
-  margin: 0;
-  font-size: var(--fs-sm);
+  grid-template-columns: 64px 1fr;
+  gap: 12px 16px;
+  font-size: var(--fs-sub);
 }
 .kv dt {
-  color: var(--text-3);
+  color: var(--ink3);
 }
 .kv dd {
-  margin: 0;
-}
-.kv .path {
-  font-size: var(--fs-xs);
-  word-break: break-all;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--ink);
 }
 .warns {
-  margin: 4px 0 0;
+  margin-top: 14px;
   padding-left: 18px;
+  font-size: var(--fs-meta);
+  color: var(--review-label);
+  user-select: text;
 }
 </style>

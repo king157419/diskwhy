@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DiskWhy C 清理</title>
+<style>
+  :root{
+    --lime:#D3F24B; --ink:#121410; --ink2:#4A4E44; --ink3:#8B8F83;
+    --cream:#F4F1E8; --paper:#FFFFFF; --cost:#FF8A7A; --cost-soft:#FFE3DD;
+    --sans:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
+    --num:"Bahnschrift","Segoe UI Variable Display","Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:1440px;height:900px;overflow:hidden}
+  body{background:var(--cream);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased;position:relative}
+  .num{font-family:var(--num);font-variant-numeric:tabular-nums}
+  svg.i{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+  .spacer{flex:1}
+
+  .titlebar{height:56px;display:flex;align-items:center;padding-left:20px}
+  .back{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:700}
+  .back .c{width:36px;height:36px;border-radius:18px;border:2px solid var(--ink);display:grid;place-items:center;background:var(--paper)}
+  .win{display:flex}
+  .win span{width:46px;height:56px;display:grid;place-items:center;color:var(--ink2)}
+
+  .chips{position:absolute;left:56px;right:56px;top:76px;display:flex;gap:10px}
+  .chip{height:48px;padding:0 20px 0 16px;border-radius:24px;border:2px solid var(--ink);background:var(--paper);display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600}
+  .chip .n{font-size:15px;color:var(--ink2);font-weight:600}
+  .chip.on{background:var(--ink);color:var(--lime)}
+  .chip.on .n{color:var(--lime);opacity:.75}
+
+  .head{position:absolute;left:56px;right:56px;top:160px;display:flex;align-items:flex-end}
+  .head h1{font-size:40px;font-weight:800;letter-spacing:1px;line-height:1}
+  .head .sel{font-size:15px;font-weight:600;color:var(--ink2);margin-left:18px;margin-bottom:4px}
+  .head .all{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:700;margin-bottom:2px}
+
+  .grid{position:absolute;left:56px;right:56px;top:232px;display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  .card{height:232px;border-radius:26px;border:2px solid var(--ink);background:var(--paper);padding:22px 22px 20px 24px;position:relative;display:flex;flex-direction:column}
+  .card.on{background:var(--lime);box-shadow:6px 6px 0 var(--ink)}
+  .card .top{display:flex;align-items:center;gap:14px}
+  .card .ic{width:48px;height:48px;border-radius:14px;border:2px solid var(--ink);background:var(--paper);display:grid;place-items:center;font-size:13px;font-weight:800}
+  .card.on .ic{background:var(--ink);color:var(--lime);border-color:var(--ink)}
+  .card .nm{font-size:18px;font-weight:700}
+  .card .sub{font-size:13px;color:var(--ink2);margin-top:2px}
+  .chk{position:absolute;right:20px;top:20px;width:34px;height:34px;border-radius:17px;border:2px solid var(--ink);display:grid;place-items:center;background:var(--paper)}
+  .card.on .chk{background:var(--ink);color:var(--lime)}
+  .card .sz{margin-top:auto;display:flex;align-items:baseline;font-weight:700;line-height:1}
+  .card .sz b{font-size:68px;letter-spacing:-2px}
+  .card .sz small{font-size:24px;margin-left:8px}
+  .card:not(.on) .sz{color:var(--ink2)}
+  .tag{position:absolute;right:22px;bottom:24px;height:28px;padding:0 12px;border-radius:14px;background:var(--cost);border:2px solid var(--ink);font-size:13px;font-weight:700;display:flex;align-items:center}
+  .info{position:absolute;right:20px;bottom:20px;width:34px;height:34px;border-radius:17px;display:grid;place-items:center;color:var(--ink)}
+  .card:has(.tag) .info{right:112px}
+
+  .bottom{position:absolute;left:0;right:0;bottom:0;height:96px;background:var(--ink);display:flex;align-items:center;padding:0 24px 0 56px;color:var(--cream)}
+  .bottom .a{font-size:16px;color:#A9AD9F;display:flex;align-items:baseline;gap:8px}
+  .bottom .a b{font-size:34px;color:var(--cream);font-weight:700}
+  .bottom .a .g{font-size:52px;color:var(--lime);letter-spacing:-1px}
+  .bottom .sep{width:2px;height:34px;background:#2E3129;margin:0 32px}
+  .go{height:64px;width:220px;border-radius:32px;background:var(--lime);color:var(--ink);font-size:21px;font-weight:800;letter-spacing:8px;display:flex;align-items:center;justify-content:center;gap:10px}
+</style>
+</head>
+<body>
+  <div class="titlebar">
+    <div class="back"><span class="c"><svg class="i" width="18" height="18" viewBox="0 0 24 24" stroke-width="2.6"><path d="m15 18-6-6 6-6"/></svg></span>清理</div>
+    <div class="spacer"></div>
+    <div class="win">
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor"/></svg></span>
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor"/></svg></span>
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor"/></svg></span>
+    </div>
+  </div>
+
+  <div class="chips">
+    <div class="chip">系统缓存<span class="n num">16.5</span></div>
+    <div class="chip">浏览器<span class="n num">8.1</span></div>
+    <div class="chip on">开发工具<span class="n num">13.5</span></div>
+    <div class="chip">AI 模型<span class="n num">27.4</span></div>
+    <div class="chip">应用缓存<span class="n num">11.6</span></div>
+    <div class="chip">大文件<span class="n num">4.6</span></div>
+  </div>
+
+  <div class="head">
+    <h1>开发工具</h1><span class="sel num">已选 4 / 6</span>
+    <div class="spacer"></div>
+    <div class="all"><span class="chk" style="position:static;width:28px;height:28px;background:var(--ink);color:var(--lime)"><svg class="i" width="14" height="14" viewBox="0 0 24 24" stroke-width="3.4"><path d="M6 12h12"/></svg></span>全选</div>
+  </div>
+
+  <div class="grid">
+    <div class="card on">
+      <div class="top"><div class="ic">npm</div><div><div class="nm">npm 缓存</div><div class="sub">包缓存</div></div></div>
+      <div class="chk"><svg class="i" width="16" height="16" viewBox="0 0 24 24" stroke-width="3.4"><path d="M20 6 9 17l-5-5"/></svg></div>
+      <div class="sz num"><b>1.55</b><small>GB</small></div>
+      <div class="info"><svg class="i" width="20" height="20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+    </div>
+    <div class="card on">
+      <div class="top"><div class="ic"><svg class="i" width="22" height="22" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></div><div><div class="nm">Cargo 缓存</div><div class="sub">包缓存</div></div></div>
+      <div class="chk"><svg class="i" width="16" height="16" viewBox="0 0 24 24" stroke-width="3.4"><path d="M20 6 9 17l-5-5"/></svg></div>
+      <div class="sz num"><b>1.03</b><small>GB</small></div>
+      <div class="info"><svg class="i" width="20" height="20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+    </div>
+    <div class="card on">
+      <div class="top"><div class="ic">pip</div><div><div class="nm">pip 缓存</div><div class="sub">包缓存</div></div></div>
+      <div class="chk"><svg class="i" width="16" height="16" viewBox="0 0 24 24" stroke-width="3.4"><path d="M20 6 9 17l-5-5"/></svg></div>
+      <div class="sz num"><b>1.02</b><small>GB</small></div>
+      <div class="info"><svg class="i" width="20" height="20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+    </div>
+    <div class="card on">
+      <div class="top"><div class="ic"><svg class="i" width="22" height="22" viewBox="0 0 24 24"><path d="M4 17 10 11 4 5M12 19h8"/></svg></div><div><div class="nm">VS Code 缓存</div><div class="sub">编辑器缓存</div></div></div>
+      <div class="chk"><svg class="i" width="16" height="16" viewBox="0 0 24 24" stroke-width="3.4"><path d="M20 6 9 17l-5-5"/></svg></div>
+      <div class="sz num"><b>612</b><small>MB</small></div>
+      <div class="info"><svg class="i" width="20" height="20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+    </div>
+    <div class="card">
+      <div class="top"><div class="ic"><svg class="i" width="22" height="22" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></svg></div><div><div class="nm">Rust 编译产物</div><div class="sub num">target · 38 个</div></div></div>
+      <div class="chk"></div>
+      <div class="sz num"><b>6.80</b><small>GB</small></div>
+      <div class="tag">有代价</div>
+      <div class="info"><svg class="i" width="20" height="20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+    </div>
+    <div class="card">
+      <div class="top"><div class="ic"><svg class="i" width="22" height="22" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></div><div><div class="nm">Docker 构建缓存</div><div class="sub">构建缓存</div></div></div>
+      <div class="chk"></div>
+      <div class="sz num"><b>2.50</b><small>GB</small></div>
+      <div class="tag">有代价</div>
+      <div class="info"><svg class="i" width="20" height="20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+    </div>
+  </div>
+
+  <div class="bottom">
+    <div class="a num">已选<b>17</b>项</div>
+    <div class="sep"></div>
+    <div class="a num">可释放<b class="g">32.1</b><span style="color:var(--lime);font-size:22px;font-weight:700">GB</span></div>
+    <div class="spacer"></div>
+    <div class="go">清理<svg class="i" width="22" height="22" viewBox="0 0 24 24" stroke-width="2.8"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+  </div>
+</body>
+</html>

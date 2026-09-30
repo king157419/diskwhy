@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DiskWhy A 首页</title>
+<style>
+  :root{
+    --bg:#F5F7F6; --surface:#FFFFFF; --line:#E6EAE8;
+    --ink:#16201D; --ink2:#5B6663; --ink3:#9AA3A0;
+    --accent:#0F9E8C; --accent-2:#0B8374; --accent-soft:#E1F3EF;
+    --cost:#E0A03A; --used:#CDD4D1; --free:#EDF0EF;
+    --sans:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
+    --display:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:1440px;height:900px;overflow:hidden}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased;position:relative}
+  .num{font-family:var(--display);font-variant-numeric:tabular-nums lining-nums}
+
+  /* 背景：一圈极淡的同心圆，暗示"磁盘" */
+  .halo{position:absolute;left:50%;top:450px;transform:translate(-50%,-50%);width:980px;height:980px;border-radius:50%;
+    background:radial-gradient(circle,rgba(15,158,140,.10) 0%,rgba(15,158,140,.04) 32%,rgba(15,158,140,0) 62%);pointer-events:none}
+  .ring{position:absolute;left:50%;top:450px;transform:translate(-50%,-50%);border-radius:50%;border:1px solid rgba(15,158,140,.10)}
+
+  .titlebar{height:48px;display:flex;align-items:center;padding:0 0 0 20px;position:relative;z-index:2}
+  .brand{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--ink2);letter-spacing:.2px}
+  .mark{width:18px;height:18px}
+  .spacer{flex:1}
+  .iconbtn{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;color:var(--ink2)}
+  .win{display:flex;margin-left:8px}
+  .win span{width:46px;height:48px;display:grid;place-items:center;color:var(--ink3)}
+
+  .stage{position:absolute;left:0;right:0;top:48px;bottom:0;display:flex;flex-direction:column;align-items:center;z-index:1}
+  .drive{margin-top:156px;display:flex;align-items:center;gap:8px;height:30px;padding:0 14px 0 10px;border-radius:15px;
+    background:var(--surface);border:1px solid var(--line);font-size:13px;color:var(--ink2)}
+  .drive b{font-weight:600;color:var(--ink)}
+  .label{margin-top:44px;font-size:18px;color:var(--ink2);display:flex;align-items:center;gap:8px}
+  .label i{width:8px;height:8px;border-radius:50%;background:var(--accent);display:inline-block}
+  .big{margin-top:2px;display:flex;align-items:baseline;gap:14px;line-height:1}
+  .big .n{font-size:176px;font-weight:600;letter-spacing:-6px;color:var(--ink)}
+  .big .u{font-size:44px;font-weight:500;color:var(--ink2)}
+
+  .bar{margin-top:40px;width:520px;height:8px;border-radius:4px;display:flex;overflow:hidden;background:var(--free);gap:2px}
+  .bar div{height:100%}
+  .legend{margin-top:14px;width:520px;display:flex;justify-content:space-between;font-size:13px;color:var(--ink3)}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .legend i{width:7px;height:7px;border-radius:50%;display:inline-block}
+  .legend b{font-weight:600;color:var(--ink2);margin-left:2px}
+
+  .actions{margin-top:52px;display:flex;flex-direction:column;align-items:center;gap:18px}
+  .primary{width:240px;height:58px;border-radius:29px;background:var(--accent);color:#fff;font-size:19px;font-weight:600;letter-spacing:6px;
+    display:grid;place-items:center;box-shadow:0 10px 28px -10px rgba(15,158,140,.55),0 1px 0 rgba(255,255,255,.25) inset}
+  .ghost{font-size:15px;color:var(--ink2);display:flex;align-items:center;gap:4px;height:36px;padding:0 14px;border-radius:18px}
+  .foot{position:absolute;bottom:26px;left:0;right:0;text-align:center;font-size:12px;color:var(--ink3);display:flex;justify-content:center;align-items:center;gap:6px}
+</style>
+</head>
+<body>
+  <div class="halo"></div>
+  <div class="ring" style="width:520px;height:520px"></div>
+  <div class="ring" style="width:720px;height:720px;opacity:.6"></div>
+  <div class="ring" style="width:940px;height:940px;opacity:.35"></div>
+
+  <div class="titlebar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="#CFE9E4" stroke-width="3"/><path d="M12 3a9 9 0 0 1 8.5 6" stroke="#0F9E8C" stroke-width="3" stroke-linecap="round"/></svg>
+      DiskWhy
+    </div>
+    <div class="spacer"></div>
+    <div class="iconbtn">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+    </div>
+    <div class="win">
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor"/></svg></span>
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor"/></svg></span>
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor"/></svg></span>
+    </div>
+  </div>
+
+  <div class="stage">
+    <div class="drive">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M5.5 13 8 4h8l2.5 9"/><path d="M6 17h.01M10 17h.01"/></svg>
+      <b>C 盘</b><span class="num">185 / 199 GB</span>
+    </div>
+
+    <div class="label"><i></i>可放心清理</div>
+    <div class="big num"><span class="n">32.1</span><span class="u">GB</span></div>
+
+    <div class="bar">
+      <div style="width:16.1%;background:var(--accent)"></div>
+      <div style="width:24.9%;background:var(--cost)"></div>
+      <div style="width:51.9%;background:var(--used)"></div>
+    </div>
+    <div class="legend num">
+      <span><i style="background:var(--accent)"></i>可清理<b>32.1 GB</b></span>
+      <span><i style="background:var(--cost)"></i>有代价<b>49.6 GB</b></span>
+      <span><i style="background:var(--used)"></i>其他<b>103 GB</b></span>
+      <span><i style="background:#DDE2E0;outline:1px solid #CFD6D3"></i>剩余<b>14.0 GB</b></span>
+    </div>
+
+    <div class="actions">
+      <div class="primary">清理</div>
+      <div class="ghost">看看都是什么
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#0F9E8C" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+    <span class="num">扫描完成 · 55 秒</span>
+  </div>
+</body>
+</html>

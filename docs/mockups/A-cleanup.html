@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DiskWhy A 清理</title>
+<style>
+  :root{
+    --bg:#F5F7F6; --surface:#FFFFFF; --line:#E8ECEA; --line2:#F0F3F2;
+    --ink:#16201D; --ink2:#5B6663; --ink3:#9AA3A0;
+    --accent:#0F9E8C; --accent-soft:#E3F4F0; --cost:#C9851C; --cost-soft:#FBF1DF;
+    --sans:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
+    --display:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:1440px;height:900px;overflow:hidden}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased;position:relative}
+  .num{font-family:var(--display);font-variant-numeric:tabular-nums lining-nums}
+  svg.i{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+  .titlebar{height:48px;display:flex;align-items:center;padding-left:12px}
+  .back{display:flex;align-items:center;gap:6px;height:36px;padding:0 12px 0 8px;border-radius:10px;font-size:15px;font-weight:600;color:var(--ink)}
+  .back svg{color:var(--ink2)}
+  .spacer{flex:1}
+  .win{display:flex}
+  .win span{width:46px;height:48px;display:grid;place-items:center;color:var(--ink3)}
+
+  .main{position:absolute;top:48px;left:0;right:0;bottom:96px;display:flex;gap:20px;padding:12px 32px 0 24px}
+
+  /* 左：分类 */
+  .cats{width:272px;display:flex;flex-direction:column;gap:2px;padding-top:6px}
+  .cat{height:60px;border-radius:12px;display:flex;align-items:center;gap:14px;padding:0 16px 0 14px;color:var(--ink2);position:relative}
+  .cat .ic{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:#EDF1EF;color:var(--ink2)}
+  .cat .nm{flex:1;font-size:15px;color:var(--ink)}
+  .cat .nm small{display:block;font-size:12px;color:var(--ink3);margin-top:1px}
+  .cat .sz{font-size:14px;font-weight:600;color:var(--ink2)}
+  .cat.on{background:var(--surface);box-shadow:0 1px 2px rgba(22,32,29,.05),0 0 0 1px var(--line)}
+  .cat.on::before{content:"";position:absolute;left:0;top:18px;bottom:18px;width:3px;border-radius:2px;background:var(--accent)}
+  .cat.on .ic{background:var(--accent-soft);color:var(--accent)}
+  .cat.on .sz{color:var(--ink)}
+
+  /* 右：清单 */
+  .panel{flex:1;background:var(--surface);border-radius:16px;box-shadow:0 0 0 1px var(--line);position:relative;overflow:visible}
+  .ph{height:76px;display:flex;align-items:center;padding:0 28px 0 28px;border-bottom:1px solid var(--line2)}
+  .ph h2{font-size:22px;font-weight:600;letter-spacing:.5px}
+  .ph .cnt{margin-left:12px;font-size:13px;color:var(--ink3)}
+  .ph .all{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink2)}
+
+  .row{height:66px;display:flex;align-items:center;padding:0 22px 0 28px;border-bottom:1px solid var(--line2);position:relative}
+  .row:last-child{border-bottom:0}
+  .cb{width:20px;height:20px;border-radius:6px;border:1.5px solid #C4CCC9;display:grid;place-items:center;flex:none;background:#fff}
+  .cb.on{background:var(--accent);border-color:var(--accent)}
+  .cb.part{background:var(--accent);border-color:var(--accent)}
+  .ri{width:36px;height:36px;border-radius:10px;background:#F1F4F3;display:grid;place-items:center;margin-left:18px;color:var(--ink2);font-size:12px;font-weight:700}
+  .rn{margin-left:14px;flex:1;display:flex;flex-direction:column;gap:2px}
+  .rn .t{font-size:15px;color:var(--ink);display:flex;align-items:center;gap:8px}
+  .rn .s{font-size:12px;color:var(--ink3)}
+  .tag{font-size:11px;font-weight:600;color:var(--cost);background:var(--cost-soft);height:20px;padding:0 7px;border-radius:10px;display:inline-flex;align-items:center}
+  .rs{font-size:16px;font-weight:600;width:110px;text-align:right}
+  .row.off .rs{color:var(--ink2);font-weight:500}
+  .info{width:32px;height:32px;border-radius:16px;display:grid;place-items:center;color:#B8C0BD;margin-left:14px}
+  .info.hot{background:var(--accent-soft);color:var(--accent)}
+  .row.hover{background:#FAFBFB}
+
+  /* 解释卡片 */
+  .pop{position:absolute;right:26px;top:58px;width:300px;background:#fff;border-radius:14px;padding:16px 18px;z-index:5;
+    box-shadow:0 18px 40px -12px rgba(22,32,29,.22),0 0 0 1px rgba(22,32,29,.06)}
+  .pop::before{content:"";position:absolute;right:26px;top:-6px;width:12px;height:12px;background:#fff;transform:rotate(45deg);
+    box-shadow:-1px -1px 0 rgba(22,32,29,.06)}
+  .pop .l{display:flex;gap:14px;font-size:14px;line-height:22px}
+  .pop .l + .l{margin-top:8px}
+  .pop .k{width:64px;color:var(--ink3);font-size:12px;flex:none;line-height:22px}
+  .pop .v{color:var(--ink)}
+
+  /* 底栏 */
+  .bottom{position:absolute;left:24px;right:32px;bottom:20px;height:64px;background:var(--surface);border-radius:16px;box-shadow:0 0 0 1px var(--line),0 8px 24px -16px rgba(22,32,29,.25);
+    display:flex;align-items:center;padding:0 10px 0 28px;gap:10px}
+  .bottom .a{font-size:14px;color:var(--ink2)}
+  .bottom .a b{font-size:20px;font-weight:600;color:var(--ink);margin:0 3px}
+  .bottom .a .g{font-size:26px;color:var(--accent)}
+  .bottom .dot{color:#CBD2CF;margin:0 10px}
+  .go{width:168px;height:46px;border-radius:23px;background:var(--accent);color:#fff;font-size:16px;font-weight:600;letter-spacing:4px;display:grid;place-items:center;
+    box-shadow:0 8px 20px -10px rgba(15,158,140,.6)}
+</style>
+</head>
+<body>
+  <div class="titlebar">
+    <div class="back">
+      <svg class="i" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>清理
+    </div>
+    <div class="spacer"></div>
+    <div class="win">
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor"/></svg></span>
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor"/></svg></span>
+      <span><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor"/></svg></span>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="cats">
+      <div class="cat">
+        <div class="ic"><svg class="i" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div>
+        <div class="nm">系统缓存<small class="num">5 项</small></div><div class="sz num">16.5 GB</div>
+      </div>
+      <div class="cat">
+        <div class="ic"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20M2 12h20"/></svg></div>
+        <div class="nm">浏览器<small class="num">3 项</small></div><div class="sz num">8.1 GB</div>
+      </div>
+      <div class="cat on">
+        <div class="ic"><svg class="i" viewBox="0 0 24 24"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg></div>
+        <div class="nm">开发工具<small class="num">6 项</small></div><div class="sz num">13.5 GB</div>
+      </div>
+      <div class="cat">
+        <div class="ic"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16l.6 1.9 1.9.6-1.9.6L19 21l-.6-1.9-1.9-.6 1.9-.6z"/></svg></div>
+        <div class="nm">AI 模型<small class="num">4 项</small></div><div class="sz num">27.4 GB</div>
+      </div>
+      <div class="cat">
+        <div class="ic"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></div>
+        <div class="nm">应用缓存<small class="num">7 项</small></div><div class="sz num">11.6 GB</div>
+      </div>
+      <div class="cat">
+        <div class="ic"><svg class="i" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg></div>
+        <div class="nm">大文件<small class="num">2 项</small></div><div class="sz num">4.6 GB</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="ph">
+        <h2>开发工具</h2><span class="cnt num">已选 4 / 6</span>
+        <div class="spacer"></div>
+        <div class="all"><div class="cb part"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 5h6" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/></svg></div>全选</div>
+      </div>
+
+      <div class="row">
+        <div class="cb on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <div class="ri">npm</div>
+        <div class="rn"><div class="t">npm 缓存</div><div class="s">包缓存</div></div>
+        <div class="rs num">1.55 GB</div>
+        <div class="info"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+      </div>
+      <div class="row">
+        <div class="cb on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <div class="ri"><svg class="i" viewBox="0 0 24 24"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></div>
+        <div class="rn"><div class="t">Cargo 缓存</div><div class="s">包缓存</div></div>
+        <div class="rs num">1.03 GB</div>
+        <div class="info"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+      </div>
+      <div class="row">
+        <div class="cb on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <div class="ri">pip</div>
+        <div class="rn"><div class="t">pip 缓存</div><div class="s">包缓存</div></div>
+        <div class="rs num">1.02 GB</div>
+        <div class="info"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+      </div>
+      <div class="row">
+        <div class="cb on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+        <div class="ri"><svg class="i" viewBox="0 0 24 24"><path d="M4 17 10 11 4 5M12 19h8"/></svg></div>
+        <div class="rn"><div class="t">VS Code 缓存</div><div class="s">编辑器缓存</div></div>
+        <div class="rs num">612 MB</div>
+        <div class="info"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+      </div>
+      <div class="row off hover">
+        <div class="cb"></div>
+        <div class="ri"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></svg></div>
+        <div class="rn"><div class="t">Rust 编译产物<span class="tag">有代价</span></div><div class="s num">target · 38 个</div></div>
+        <div class="rs num">6.80 GB</div>
+        <div class="info hot"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+        <div class="pop">
+          <div class="l"><span class="k">这是什么</span><span class="v">Rust 项目的编译中间文件</span></div>
+          <div class="l"><span class="k">删了会怎样</span><span class="v">下次编译要多等几分钟</span></div>
+        </div>
+      </div>
+      <div class="row off">
+        <div class="cb"></div>
+        <div class="ri"><svg class="i" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></div>
+        <div class="rn"><div class="t">Docker 构建缓存<span class="tag">有代价</span></div><div class="s">构建缓存</div></div>
+        <div class="rs num">2.50 GB</div>
+        <div class="info"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom">
+    <div class="a num">已选<b>17</b>项<span class="dot">·</span>可释放<b class="g">32.1</b><span style="color:var(--accent);font-weight:600">GB</span></div>
+    <div class="spacer"></div>
+    <div class="go">清理</div>
+  </div>
+</body>
+</html>

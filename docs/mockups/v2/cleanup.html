@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DiskWhy v2 · 清理</title>
+<script>
+  const q=new URLSearchParams(location.search);
+  document.documentElement.dataset.theme=(q.get('t')||'A').toUpperCase();
+  if(q.get('modal')) document.documentElement.classList.add('modal-open');
+</script>
+<link rel="stylesheet" href="theme.css">
+<style>
+  /* ── 左：分类（纯文字行，不是卡片） ── */
+  .rail{position:absolute;left:24px;top:60px;width:272px;bottom:88px;padding-right:24px;border-right:1px solid var(--line)}
+  .rail h6{font-size:var(--fs-meta);font-weight:var(--w-med);color:var(--ink3);letter-spacing:.08em;padding:12px 16px 10px}
+  .cat{position:relative;padding:12px 16px 13px;display:grid;grid-template-columns:1fr auto;row-gap:8px;align-items:baseline}
+  .cat .nm{font-size:var(--fs-body);color:var(--ink2);font-weight:var(--w-med)}
+  .cat .sz{font-family:var(--ui);font-variant-numeric:tabular-nums;font-size:14px;color:var(--ink3);font-weight:var(--w-med)}
+  .cat .cbar{grid-column:1/3;height:3px;background:var(--sunk);border-radius:2px;display:flex;overflow:hidden}
+  .cat .cbar i{display:block;height:100%}
+  .cat .cbar .s{background:var(--safe)} .cat .cbar .r{background:var(--review);opacity:.75}
+  .cat.on .nm{color:var(--ink);font-weight:var(--w-bold)}
+  .cat.on .sz{color:var(--ink)}
+  .cat.on::before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:2px;background:var(--ink);border-radius:2px}
+  [data-theme="B"] .cat.on::before{background:var(--accent)}
+  [data-theme="A"] .cat.on::before{background:var(--accent)}
+  [data-theme="C"] .cat.on{background:var(--accent);border:2px solid #141412;border-radius:12px;box-shadow:3px 3px 0 #141412;margin:2px 0}
+  [data-theme="C"] .cat.on::before{display:none}
+  [data-theme="C"] .cat.on .cbar{background:rgba(20,20,18,.12)}
+  [data-theme="C"] .cat.on .cbar .s{background:#141412}
+  [data-theme="C"] .cat .nm{font-family:var(--heading);font-weight:700;font-size:16px}
+  [data-theme="C"] .rail h6{font-family:var(--heading);font-weight:700}
+  .rail-foot{position:absolute;left:16px;right:24px;bottom:4px;font-size:var(--fs-meta);color:var(--ink3);display:flex;align-items:center;gap:8px;line-height:1.5}
+
+  /* ── 右：列表 ── */
+  .main{position:absolute;left:320px;right:40px;top:60px;bottom:88px}
+  .head{display:flex;align-items:baseline;gap:16px;padding:6px 0 18px}
+  .head h1{font-family:var(--heading);font-size:var(--fs-title);font-weight:var(--heading-w);letter-spacing:.01em}
+  [data-theme="C"] .head h1{font-size:30px}
+  .head .meta{font-size:var(--fs-sub);color:var(--ink3)}
+  .head .meta b{font-family:var(--ui);font-weight:var(--w-med);color:var(--ink2);font-variant-numeric:tabular-nums}
+  .head .sel{margin-left:auto;font-size:var(--fs-sub);color:var(--ink2);display:flex;align-items:baseline;gap:6px}
+  .head .sel b{font-family:var(--ui);font-size:20px;font-weight:var(--w-semi);color:var(--ink);font-variant-numeric:tabular-nums}
+
+  .grid{display:grid;grid-template-columns:40px minmax(0,1fr) 330px 96px 28px;align-items:center}
+  .cols{height:34px;border-bottom:1px solid var(--line2);font-size:var(--fs-meta);color:var(--ink3);letter-spacing:.04em}
+  .cols .r{text-align:right}
+  .grp{height:44px;display:flex;align-items:center;gap:10px;font-size:var(--fs-sub);font-weight:var(--w-semi);color:var(--ink);padding-left:40px;border-bottom:1px solid var(--line)}
+  .grp .c{font-family:var(--ui);font-weight:var(--w-reg);color:var(--ink3);font-variant-numeric:tabular-nums}
+  .grp .hint{margin-left:auto;margin-right:28px;font-weight:var(--w-reg);font-size:var(--fs-meta);color:var(--ink3)}
+  [data-theme="C"] .grp{font-family:var(--heading);font-weight:700;font-size:16px}
+  .row{height:50px;border-bottom:1px solid var(--line)}
+  .row .nm{display:flex;align-items:center;gap:10px;font-size:var(--fs-body);font-weight:var(--w-med);color:var(--ink);min-width:0}
+  .row .nm .own{font-family:var(--ui);font-weight:var(--w-reg);color:var(--ink3);font-size:var(--fs-sub)}
+  .row .loc{font-family:var(--mono);font-size:var(--fn-path);color:var(--ink3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .loc.cjk{font-family:var(--ui);font-size:var(--fs-sub)}
+  .row .sz{text-align:right;font-family:var(--ui);font-variant-numeric:tabular-nums;font-size:var(--fn-row);font-weight:var(--w-med);color:var(--ink)}
+  .row .sz small{font-size:12px;color:var(--ink3);margin-left:3px;font-weight:var(--w-med)}
+  .row.off .nm,.row.off .sz{color:var(--ink2)}
+  .row .more{justify-self:end;color:var(--ink3);display:grid;place-items:center}
+  .row .more svg{width:16px;height:16px}
+  .row.hover{background:linear-gradient(90deg,transparent,var(--sunk) 6%,var(--sunk) 94%,transparent)}
+  [data-theme="B"] .row.hover{background:linear-gradient(90deg,transparent,rgba(255,255,255,.035) 6%,rgba(255,255,255,.035) 94%,transparent)}
+  [data-theme="C"] .row.hover{background:#fff}
+  .row.open{border-bottom:0}
+  .row.open .more{color:var(--ink)}
+
+  /* 行内展开的说明：左边一条竖线，三行 */
+  .detail{padding:2px 124px 16px 40px;border-bottom:1px solid var(--line)}
+  .detail dl{border-left:2px solid var(--review);padding:4px 0 4px 16px;display:grid;grid-template-columns:72px 1fr;row-gap:8px;column-gap:16px;font-size:var(--fs-sub);line-height:1.6}
+  .detail dt{color:var(--ink3)}
+  .detail dd{color:var(--ink2)}
+  .detail dd b{color:var(--ink);font-weight:var(--w-semi)}
+  .detail code{font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--sunk);padding:1px 6px;border-radius:4px}
+  [data-theme="C"] .detail dl{border-left:3px solid #141412}
+
+  /* ── 底部固定栏：通栏细线，不是浮动卡片 ── */
+  .bar{position:absolute;left:0;right:0;bottom:0;height:88px;border-top:1px solid var(--line2);display:flex;align-items:center;padding:0 40px 0 40px;gap:40px;background:var(--bg)}
+  .bar .k{font-size:var(--fs-sub);color:var(--ink3);display:block;margin-bottom:2px}
+  .bar .v{font-family:var(--ui);font-variant-numeric:tabular-nums;font-size:26px;font-weight:var(--w-semi);color:var(--ink);line-height:1.1}
+  .bar .v small{font-size:14px;color:var(--ink3);margin-left:4px;font-weight:var(--w-med)}
+  .bar .big .v{font-family:var(--display);font-weight:var(--display-w);letter-spacing:var(--display-track);font-size:44px;line-height:.9}
+  [data-theme="A"] .bar .big .v{font-size:50px;color:var(--accent)}
+  [data-theme="B"] .bar .big .v{font-weight:300;color:var(--accent)}
+  [data-theme="C"] .bar .big .v{font-variation-settings:"wdth" 75,"opsz" 96}
+  .bar .sep{width:1px;height:40px;background:var(--line)}
+  .bar .free{font-size:var(--fs-sub);color:var(--ink3);display:flex;align-items:center;gap:10px}
+  .bar .free b{font-family:var(--ui);font-weight:var(--w-semi);color:var(--ink);font-variant-numeric:tabular-nums;font-size:15px}
+  .bar .free .arr{color:var(--ink3)}
+  .bar .btn{margin-left:auto;height:52px;min-width:200px}
+  [data-theme="C"] .bar{background:#141412;border-top:0;color:#F4F0E6}
+  [data-theme="C"] .bar .k{color:rgba(244,240,230,.6)}
+  [data-theme="C"] .bar .v{color:#F4F0E6}
+  [data-theme="C"] .bar .big .v{color:var(--accent)}
+  [data-theme="C"] .bar .sep{background:rgba(244,240,230,.2)}
+  [data-theme="C"] .bar .free{color:rgba(244,240,230,.6)} [data-theme="C"] .bar .free b{color:#F4F0E6}
+  [data-theme="C"] .bar .btn{background:var(--accent);color:#141412;border-color:var(--accent);box-shadow:none}
+
+  /* ── 确认弹层（?modal=1） ── */
+  .scrim,.modal{display:none}
+  .modal-open .scrim{display:block;position:absolute;inset:0;background:var(--overlay);z-index:30}
+  [data-theme="A"].modal-open .scrim{backdrop-filter:blur(2px)}
+  .modal-open .modal{display:block;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:540px;z-index:31;
+    background:var(--surface);border-radius:var(--r-lg);padding:26px 28px 24px;
+    box-shadow:0 30px 80px -20px rgba(0,0,0,.35),0 0 0 1px var(--line)}
+  [data-theme="B"].modal-open .modal{background:#1E1A15;box-shadow:0 40px 100px -20px rgba(0,0,0,.8),0 0 0 1px #342C25}
+  [data-theme="C"].modal-open .modal{border:2px solid #141412;box-shadow:8px 8px 0 #141412;border-radius:22px}
+  .m-top{display:flex;align-items:center;justify-content:space-between}
+  .m-top h2{font-family:var(--heading);font-size:var(--fs-group);font-weight:var(--heading-w)}
+  [data-theme="C"] .m-top h2{font-size:22px}
+  .m-top .x{color:var(--ink3)}
+  .m-total{margin-top:14px;display:flex;align-items:baseline;gap:16px}
+  .m-total .v{font-family:var(--display);font-weight:var(--display-w);letter-spacing:var(--display-track);font-size:64px;line-height:.9;color:var(--ink)}
+  .m-total .v small{font-family:var(--ui);font-size:20px;color:var(--ink3);letter-spacing:0;margin-left:6px;font-weight:var(--w-med)}
+  [data-theme="B"] .m-total .v{font-weight:300;color:var(--accent)}
+  [data-theme="C"] .m-total .v{font-variation-settings:"wdth" 75,"opsz" 96}
+  .m-total .after{font-size:var(--fs-sub);color:var(--ink3);margin-left:auto}
+  .m-total .after b{font-family:var(--ui);color:var(--ink);font-weight:var(--w-semi);font-variant-numeric:tabular-nums}
+  .m-list{margin-top:20px;border-top:1px solid var(--line)}
+  .m-lh{height:38px;display:flex;align-items:center;font-size:var(--fs-meta);color:var(--ink3);letter-spacing:.04em}
+  .m-lh span:last-child{margin-left:auto;display:flex;align-items:center;gap:4px;color:var(--ink2)}
+  .m-row{height:40px;display:flex;align-items:center;gap:10px;font-size:14px;color:var(--ink2);border-top:1px solid var(--line)}
+  .m-row .n{color:var(--ink);font-weight:var(--w-med)}
+  .m-row .c{font-family:var(--ui);color:var(--ink3);font-size:var(--fs-sub);font-variant-numeric:tabular-nums}
+  .m-row .s{margin-left:auto;font-family:var(--ui);font-variant-numeric:tabular-nums;font-weight:var(--w-med);color:var(--ink);font-size:15px}
+  .m-row .chev{color:var(--ink3)} .m-row .chev svg{width:14px;height:14px}
+  .m-row.rv{background:var(--review-soft);margin:0 -12px;padding:0 12px;border-radius:6px;border-top-color:transparent}
+  [data-theme="C"] .m-row.rv{border:2px solid #141412;border-radius:10px;background:var(--review-soft)}
+  .m-skip{height:40px;display:flex;align-items:center;gap:8px;font-size:var(--fs-sub);color:var(--ink3);border-top:1px solid var(--line)}
+  .m-skip b{color:var(--ink2);font-weight:var(--w-med)}
+  .m-skip svg{width:14px;height:14px}
+  .m-ack{margin-top:14px;display:flex;align-items:center;gap:10px;font-size:14px;color:var(--ink);font-weight:var(--w-med)}
+  .m-ack .c{margin-left:auto;font-size:var(--fs-meta);color:var(--ink3);font-weight:var(--w-reg)}
+  .modal .btn{margin-top:18px;width:100%;height:50px}
+</style>
+</head>
+<body>
+  <div class="titlebar">
+    <div class="back"><svg class="i" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>清理</div>
+    <div class="tb-spacer"></div>
+    <div class="win">
+      <span><svg viewBox="0 0 10 10"><path d="M0 5h10"/></svg></span>
+      <span><svg viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9"/></svg></span>
+      <span><svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg></span>
+    </div>
+  </div>
+
+  <!-- 分类：条长 = 分类大小 / 最大分类(27.4)，绿=可放心、橙=需你判断 -->
+  <nav class="rail">
+    <h6>分类</h6>
+    <div class="cat"><span class="nm">系统缓存</span><span class="sz">16.5 GB</span><span class="cbar"><i class="s" style="width:52.6%"></i><i class="r" style="width:7.7%"></i></span></div>
+    <div class="cat"><span class="nm">浏览器</span><span class="sz">8.1 GB</span><span class="cbar"><i class="s" style="width:29.6%"></i></span></div>
+    <div class="cat on"><span class="nm">开发工具</span><span class="sz">13.5 GB</span><span class="cbar"><i class="s" style="width:15.3%"></i><i class="r" style="width:33.9%"></i></span></div>
+    <div class="cat"><span class="nm">AI 模型</span><span class="sz">27.4 GB</span><span class="cbar"><i class="r" style="width:100%"></i></span></div>
+    <div class="cat"><span class="nm">应用缓存</span><span class="sz">11.6 GB</span><span class="cbar"><i class="s" style="width:19.7%"></i><i class="r" style="width:22.6%"></i></span></div>
+    <div class="cat"><span class="nm">大文件</span><span class="sz">4.6 GB</span><span class="cbar"><i class="r" style="width:16.8%"></i></span></div>
+    <div class="rail-foot"><span class="dot keep"></span>先别动的 94 项不在这里</div>
+  </nav>
+
+  <main class="main">
+    <div class="head">
+      <h1>开发工具</h1>
+      <span class="meta"><b>9</b> 项 · <b>13.5</b> GB</span>
+      <span class="sel">本类已选<b>4.20</b>GB</span>
+    </div>
+
+    <div class="grid cols"><span><span class="cb part"></span></span><span>名称</span><span>位置</span><span class="r">大小</span><span></span></div>
+
+    <div class="grp"><span class="dot safe"></span>可放心清理<span class="c">5</span><span class="hint">删了会自动重新生成</span></div>
+    <div class="grid row"><span class="cb on"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span><span class="nm">npm 缓存</span><span class="loc">%LOCALAPPDATA%\npm-cache</span><span class="sz">1.55<small>GB</small></span><span class="more"></span></div>
+    <div class="grid row hover"><span class="cb on"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span><span class="nm">Cargo 依赖缓存</span><span class="loc">%USERPROFILE%\.cargo\registry</span><span class="sz">1.03<small>GB</small></span><span class="more"><svg class="i" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span></div>
+    <div class="grid row"><span class="cb on"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span><span class="nm">pip 缓存</span><span class="loc">%LOCALAPPDATA%\pip\cache</span><span class="sz">1.02<small>GB</small></span><span class="more"></span></div>
+    <div class="grid row"><span class="cb on"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span><span class="nm">Gradle 缓存</span><span class="loc">%USERPROFILE%\.gradle\caches</span><span class="sz">380<small>MB</small></span><span class="more"></span></div>
+    <div class="grid row"><span class="cb on"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span><span class="nm">Yarn 缓存</span><span class="loc">%LOCALAPPDATA%\Yarn\Cache</span><span class="sz">220<small>MB</small></span><span class="more"></span></div>
+
+    <div class="grp"><span class="dot review"></span>需你判断<span class="c">4</span><span class="hint">默认不选</span></div>
+    <div class="grid row off"><span class="cb"></span><span class="nm">Rust 编译产物 <span class="tag">删了变慢</span></span><span class="loc cjk">38 个项目的 target 文件夹</span><span class="sz">4.10<small>GB</small></span><span class="more"></span></div>
+    <div class="grid row off"><span class="cb"></span><span class="nm">node_modules <span class="tag">要重下载</span></span><span class="loc cjk">12 个项目</span><span class="sz">2.50<small>GB</small></span><span class="more"></span></div>
+    <div class="grid row off"><span class="cb"></span><span class="nm">Rust 工具链 <span class="tag">要重装</span></span><span class="loc">%USERPROFILE%\.rustup</span><span class="sz">1.62<small>GB</small></span><span class="more"></span></div>
+    <div class="grid row off open"><span class="cb"></span><span class="nm">Maven 仓库 <span class="tag hard">找不回来</span></span><span class="loc">%USERPROFILE%\.m2\repository</span><span class="sz">1.08<small>GB</small></span><span class="more"><svg class="i" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></svg></span></div>
+    <div class="detail"><dl>
+      <dt>这是什么</dt><dd>Maven 本地仓库，下载过的 Java 依赖</dd>
+      <dt>删了会怎样</dt><dd>大部分能重新下载；<b>用 mvn install 装过的自己的包或公司内部包，删了可能找不回来</b></dd>
+      <dt>怎么清</dt><dd>确认没有只在本机的包后删除，下次构建自动重新下载</dd>
+    </dl></div>
+  </main>
+
+  <footer class="bar">
+    <div><span class="k">已选</span><span class="v">17<small>项</small></span></div>
+    <div class="sep"></div>
+    <div class="big"><span class="k">可释放</span><span class="v num">32.1<small>GB</small></span></div>
+    <div class="sep"></div>
+    <div class="free">C 盘剩余 <b>14.0</b><span class="arr">→</span><b>46.1 GB</b></div>
+    <span class="btn">清理 <span class="num">32.1 GB</span></span>
+  </footer>
+
+  <!-- 确认弹层 -->
+  <div class="scrim"></div>
+  <div class="modal">
+    <div class="m-top"><h2>清理 18 项</h2><span class="x"><svg class="i" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></span></div>
+    <div class="m-total"><span class="v num">36.2<small>GB</small></span><span class="after">C 盘剩余 <b>14.0 → 50.2 GB</b></span></div>
+    <div class="m-list">
+      <div class="m-lh"><span>清单</span><span>收起<svg class="i" viewBox="0 0 24 24" style="width:14px;height:14px"><path d="m18 15-6-6-6 6"/></svg></span></div>
+      <div class="m-row rv"><span class="dot review"></span><span class="n">Rust 编译产物</span><span class="tag">删了变慢</span><span class="s">4.10 GB</span></div>
+      <div class="m-row"><span class="dot safe"></span><span class="n">系统缓存</span><span class="c">6 项</span><span class="s">14.4 GB</span><span class="chev"><svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span></div>
+      <div class="m-row"><span class="dot safe"></span><span class="n">浏览器</span><span class="c">3 项</span><span class="s">8.10 GB</span><span class="chev"><svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span></div>
+      <div class="m-row"><span class="dot safe"></span><span class="n">应用缓存</span><span class="c">3 项</span><span class="s">5.40 GB</span><span class="chev"><svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span></div>
+      <div class="m-row"><span class="dot safe"></span><span class="n">开发工具</span><span class="c">5 项</span><span class="s">4.20 GB</span><span class="chev"><svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span></div>
+      <div class="m-skip"><b>跳过 4 项</b>正在使用<svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></div>
+    </div>
+    <div class="m-ack"><span class="cb on"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>我知道这些删了的后果<span class="c">1 项需你判断</span></div>
+    <span class="btn">清理 <span class="num">36.2 GB</span></span>
+  </div>
+<script>
+  // 弹层态：背景页同步成"又勾了 Rust 编译产物"的状态
+  if(q.get('modal')){
+    const r=document.querySelector('.row.off .cb');
+    r.classList.add('on');r.innerHTML='<svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>';
+    r.closest('.row').classList.remove('off');
+    document.querySelector('.bar .v').innerHTML='18<small>项</small>';
+    document.querySelector('.bar .big .v').innerHTML='36.2<small>GB</small>';
+    document.querySelector('.bar .free').innerHTML='C 盘剩余 <b>14.0</b><span class="arr">→</span><b>50.2 GB</b>';
+    document.querySelector('.bar .btn').innerHTML='清理 <span class="num">36.2 GB</span>';
+    document.querySelector('.head .sel b').textContent='8.30';
+  }
+</script>
+</body>
+</html>

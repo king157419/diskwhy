@@ -132,3 +132,22 @@ describe("layoutTreemap", () => {
     expect(ms).toBeLessThan(50);
   });
 });
+
+import { collapseChain, type ChainNode } from "./treemap";
+
+describe("collapseChain（外壳文件夹合并）", () => {
+  const dir = (name: string, allocated: number, children: ChainNode[] = []): ChainNode => ({ name, kind: "Dir", allocated, children });
+  it("几乎全是一个子文件夹时合成一块", () => {
+    const king = dir("king", 99, [dir("AppData", 60, [dir("x", 1)]), dir("下载", 39)]);
+    const users = dir("Users", 100, [king, dir("Public", 1)]);
+    const r = collapseChain(users);
+    expect(r.node).toBe(king);
+    expect(r.name).toBe("Users \\ king");
+  });
+  it("子文件夹不够大、或者没有更深的数据时不合并", () => {
+    const a = dir("a", 100, [dir("b", 80, [dir("c", 80)]), dir("d", 20)]);
+    expect(collapseChain(a).node).toBe(a);
+    const e = dir("e", 100, [dir("f", 100)]);
+    expect(collapseChain(e).node).toBe(e);
+  });
+});

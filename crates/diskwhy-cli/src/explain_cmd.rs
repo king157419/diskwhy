@@ -206,11 +206,12 @@ pub fn run(r: &ScanResult, args: &Args) {
     );
     for g in candidates.iter().take(args.top) {
         println!(
-            "  {:<6} {:>10} {:>10}  {:<12} {:<24} {} 个位置  {}",
+            "  {:<6} {:>10} {:>10}  {:<12} {:<10} {:<24} {} 个位置  {}",
             if g.tier == Tier::Safe { "可清理" } else { "需判断" },
             human_bytes(g.bytes),
             human_bytes(g.deletable_bytes),
             g.lose_kind.map(|k| k.as_str()).unwrap_or("-"),
+            g.lose_short.as_deref().unwrap_or("-"),
             clip(&g.name, 24),
             g.paths.len(),
             g.paths.first().map(|p| p.path.as_str()).unwrap_or("")

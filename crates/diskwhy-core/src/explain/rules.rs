@@ -8,6 +8,7 @@
 //! category = "cache"      # cache | log | installer | build | model | userdata | system | vm | trash | app
 //! tier = "safe"           # safe | review | keep
 //! lose_kind = "slower"    # review 档必填：删了最坏会怎样（见下）
+//! lose_short = "下次会慢一点"  # review 档必填：这一项删了具体会怎样，≤ 8 个字，界面上的标签
 //! match = ["%LOCALAPPDATA%\\npm-cache"]   # %ENV%、* 和 ** 通配；大小写不敏感
 //! what = "..."  why = "..."  lose = "..."
 //! how = "delete"          # 或数组：delete | builtin_tool | migrate | manual | none
@@ -26,6 +27,10 @@
 //! relogin（要重登录）> feature（功能变少）> redownload（要重下载）> slower（删了变慢）。
 //! `review` 档必须写；`safe` / `keep` 可以不写。写了不认识的值就是错误。
 //!
+//! `lose_short`（阶段 H）：清理页标签上显示的具体后果，比如“不能休眠”“微信要重新登录”，一看就懂；
+//! 最多 [`LOSE_SHORT_MAX`] 个字（按字符数，空格和字母也算），太长就改短，界面上从不截断。
+//! `lose_kind` 仍然决定标签颜色和排序。`review` 档必须写。
+//!
 //! 校验（[`validate`]）：字段齐全、枚举合法、id 唯一、模式以白名单环境变量开头、
 //! `safe` 不许落在桌面/文档/图片/视频/音乐/下载/OneDrive 之下、`keep` 不许 `how = delete`、
 //! `builtin_tool`/`migrate` 必须写 `how_detail`、`verified_on` 是 YYYY-MM-DD、
@@ -38,6 +43,9 @@ use crate::model::{Node, NodeKind};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
+
+/// `lose_short` 最多几个字（按字符数）。
+pub const LOSE_SHORT_MAX: usize = 8;
 
 /// 编译期嵌入的规则文件（文件名即分组名）。
 pub const EMBEDDED: &[(&str, &str)] = &[
@@ -90,6 +98,9 @@ pub struct RuleDef {
     /// 删了最坏会怎样（字符串，校验时转成 [`LoseKind`]，不认识的值报错）。
     #[serde(default)]
     pub lose_kind: Option<String>,
+    /// 这一项删了具体会怎样（≤ 8 个字，界面标签）。review 档必填。
+    #[serde(default)]
+    pub lose_short: Option<String>,
     how: OneOrMany,
     pub how_detail: String,
     pub refs: Vec<String>,
@@ -132,6 +143,7 @@ pub struct Rule {
     pub why: String,
     pub lose: String,
     pub lose_kind: Option<LoseKind>,
+    pub lose_short: Option<String>,
     pub how: Vec<How>,
     pub how_detail: String,
     pub refs: Vec<String>,
@@ -211,6 +223,13 @@ pub fn validate(def: &RuleDef, seen_ids: &mut HashSet<String>) -> Vec<String> {
             e.push(format!("lose_kind `{k}` 不认识（只能是 {}）", all.join(" / ")));
         }
         None if def.tier == Tier::Review => e.push("review 档必须写 lose_kind（删了最坏会怎样）".into()),
+        _ => {}
+    }
+    match def.lose_short.as_deref().map(str::trim) {
+        Some("") | None if def.tier == Tier::Review => e.push("review 档必须写 lose_short（删了具体会怎样，≤ 8 个字）".into()),
+        Some(s) if s.chars().count() > LOSE_SHORT_MAX => {
+            e.push(format!("lose_short `{s}` 有 {} 个字，最多 {LOSE_SHORT_MAX} 个（改短，界面不截断）", s.chars().count()))
+        }
         _ => {}
     }
     if def.category == Category::Unknown {
@@ -313,6 +332,7 @@ impl RuleSet {
             why: def.why,
             lose: def.lose,
             lose_kind: def.lose_kind.as_deref().and_then(LoseKind::parse),
+            lose_short: def.lose_short.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             how,
             how_detail: def.how_detail,
             refs: def.refs,

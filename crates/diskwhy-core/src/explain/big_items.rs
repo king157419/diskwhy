@@ -107,6 +107,7 @@ fn hint(
         owner,
         clues,
         lose_kind: None,
+        lose_short: None,
     }
 }
 
@@ -1056,6 +1057,7 @@ fn dominant_child(t: &Target, depth: u8) -> Option<Hint> {
         confidence: (h.confidence - 0.1).max(0.3),
         // 后果跟着认出来的那个子文件夹走，不是“dominant-child”这个名字。
         lose_kind: h.lose_kind.or_else(|| super::heuristics::heuristic_lose_kind(h.name, h.tier)),
+        lose_short: h.lose_short.or_else(|| super::heuristics::heuristic_lose_short(h.name)),
         ..h
     })
 }

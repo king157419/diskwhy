@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 设置：主题（三个小色块 + 名字）、AI 推测（可选）、数据（规则 / 权限 / 快照 / 隔离区 / 版本）。
+// 设置：主题（三个小色块 + 名字）、AI 猜文件夹（可选）、其他（识别规则 / 权限 / 扫描存档 / 隔离区 / 版本）。
 import { onMounted, ref } from "vue";
 import { getSettings, saveSettings, testLlm, type LlmSettings } from "../api";
 import { THEMES, setTheme, theme } from "../theme";
@@ -78,9 +78,9 @@ async function doSave() {
 
       <section class="sec">
         <h3>
-          AI 推测
+          AI 猜文件夹
           <label class="switch">
-            <input v-model="s.enabled" type="checkbox" aria-label="启用 AI 推测" />
+            <input v-model="s.enabled" type="checkbox" aria-label="启用 AI 猜文件夹" />
             <span class="track"><span class="thumb"></span></span>
             <span class="sw">{{ s.enabled ? "开" : "关" }}</span>
           </label>
@@ -93,10 +93,10 @@ async function doSave() {
           </div>
           <label for="llm-model">模型</label>
           <input id="llm-model" v-model.trim="s.model" class="input mono" placeholder="qwen2.5:7b" spellcheck="false" />
-          <label for="llm-key">Key</label>
+          <label for="llm-key">密钥</label>
           <input id="llm-key" v-model.trim="s.api_key" class="input mono" type="password" placeholder="本机 Ollama 留空" autocomplete="off" />
         </div>
-        <p class="fine">只发文件夹名和大小，不发文件内容 · Key 明文存在 %LOCALAPPDATA%\DiskWhy\settings.json</p>
+        <p class="fine">只发文件夹名和大小，不发文件内容 · 密钥明文存在 %LOCALAPPDATA%\DiskWhy\settings.json</p>
         <div class="acts">
           <button class="quiet" :disabled="testing || !s.base_url || !s.model" @click="doTest">{{ testing ? "测试中" : "测试连接" }}</button>
           <span v-if="result" class="res" :class="{ ok: resultOk }">{{ result }}</span>
@@ -105,16 +105,16 @@ async function doSave() {
       </section>
 
       <section class="sec">
-        <h3>数据</h3>
+        <h3>其他</h3>
         <dl class="kv">
-          <dt>规则</dt>
+          <dt>识别规则</dt>
           <dd class="num">{{ env?.rules_total ?? "—" }} 条</dd>
           <dt>权限</dt>
           <dd>
             {{ env ? (env.elevated ? "管理员" : "普通") : "—" }}
             <button v-if="env && !env.elevated" class="quiet" :disabled="relaunching" @click="doRelaunch">以管理员重启</button>
           </dd>
-          <dt>快照</dt>
+          <dt>扫描存档</dt>
           <dd>
             <button class="quiet" :disabled="snapBusy" @click="doOpenSnapshot()">打开</button>
             <button class="quiet" :disabled="snapBusy || !summary" @click="doSaveSnapshot">保存</button>

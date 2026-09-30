@@ -1,11 +1,12 @@
 <script setup lang="ts">
 // 清理页：左边分类是纯文字行（名字 + 大小 + 细条），右边是表格式列表（名称 / 位置 / 大小），
 // 按“可放心清理”“需你判断”分组，行高 50px、细线分隔；需你判断的行只挂一个后果标签（来自规则的 lose_kind）。
-// 点一行在行内展开说明（这是什么 / 删了会怎样 / 怎么清，文字直接取规则）。底部通栏 + 一个主按钮。
+// 点一行在行内展开说明（这是什么 / 删了会怎样 / 建议，阶段 H）。底部通栏 + 一个主按钮。
+// 行上的标签是规则写的具体后果（lose_short，比如“不能休眠”），颜色按 lose_kind（找不回来实心、其余浅底）。
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import type { CandidateGroup } from "../api";
+import { getGuidance, openSystemSettings, type CandidateGroup } from "../api";
 import { gbNum, sizeParts } from "../capacity";
-import { CLEAN_CATS, isHardTag, loseLabel, shortPath, type CleanCat } from "../labels";
+import { advice, CLEAN_CATS, isHardTag, loseTag, shortPath, type CleanCat } from "../labels";
 import {
   canCheck,
   candidates,
@@ -64,6 +65,19 @@ function toggleOpen(k: string) {
   open.value = open.value === k ? null : k;
 }
 
+// 建议是“用 Windows 自带工具清”时，能一键打开对应的系统设置页就给个按钮（阶段 E 的 get_guidance / open_system_settings）
+const toolUri = ref<Record<string, string | null>>({});
+watch(open, async (k) => {
+  const g = k ? candidates.value.find((x) => x.key === k) : null;
+  if (!g || !g.paths.length || k! in toolUri.value || advice(g.tier, g.how, g.how_detail, g.group).kind !== "tool") return;
+  try {
+    const gs = await getGuidance(g.paths[0].path, "Dir");
+    toolUri.value = { ...toolUri.value, [g.key]: gs.find((x) => x.settings_uri)?.settings_uri ?? null };
+  } catch {
+    toolUri.value = { ...toolUri.value, [g.key]: null };
+  }
+});
+
 function loc(g: CandidateGroup): { text: string; mono: boolean } {
   if (g.paths.length === 1) return { text: shortPath(g.paths[0].path), mono: true };
   if (g.heuristic) return { text: `${g.paths.length} 个项目`, mono: false };
@@ -71,9 +85,9 @@ function loc(g: CandidateGroup): { text: string; mono: boolean } {
 }
 
 function manualLabel(g: CandidateGroup): string {
-  if (g.how.includes("builtin_tool")) return "用工具清";
-  if (g.how.includes("migrate") && !g.how.includes("manual")) return "可迁移";
-  return "手动清";
+  if (g.how.includes("builtin_tool")) return "用自带工具";
+  if (g.how.includes("migrate") && !g.how.includes("manual")) return "搬到 D 盘";
+  return "要手动删";
 }
 
 // 点「清理」后先做快速计划（不到 1 秒），确认弹层马上出现，逐个文件的检查在弹层里显示进度（阶段 G）；
@@ -134,7 +148,7 @@ const totalChecked = computed(() => checkedGroups.value.length);
           <template v-if="grp.rows.length">
             <div class="grp">
               <span class="dot" :class="grp.t"></span>{{ grp.t === "safe" ? "可放心清理" : "需你判断" }}<span class="c num">{{ grp.rows.length }}</span>
-              <span class="hint">{{ grp.t === "safe" ? "删了会自动重新生成" : "默认不选" }}</span>
+              <span class="hint">{{ grp.t === "safe" ? "删了会自动重建" : "看过再勾" }}</span>
             </div>
             <template v-for="g in grp.rows" :key="g.key">
               <div class="grid row" :class="{ off: !checked.has(g.key), open: open === g.key }">
@@ -152,7 +166,7 @@ const totalChecked = computed(() => checkedGroups.value.length);
                 <span v-else class="cb na" :title="manualLabel(g)"></span>
                 <button class="nm" :aria-label="'展开：' + g.name" :aria-expanded="open === g.key" @click="toggleOpen(g.key)">
                   <span class="nm-t">{{ g.name }}</span>
-                  <span v-if="g.tier === 'review' && loseLabel(g.lose_kind)" class="tag" :class="{ hard: isHardTag(g.lose_kind) }">{{ loseLabel(g.lose_kind) }}</span>
+                  <span v-if="g.tier === 'review' && loseTag(g)" class="tag" :class="{ hard: isHardTag(g.lose_kind) }">{{ loseTag(g) }}</span>
                   <span v-if="!canCheck(g) && g.tier === 'safe'" class="tag plain">{{ manualLabel(g) }}</span>
                 </button>
                 <span class="loc" :class="{ cjk: !loc(g).mono }" :title="g.paths.map((p) => p.path).join('\n')" @click="toggleOpen(g.key)">{{ loc(g).text }}</span>
@@ -166,9 +180,12 @@ const totalChecked = computed(() => checkedGroups.value.length);
                   <dt>这是什么</dt>
                   <dd>{{ g.what }}</dd>
                   <dt>删了会怎样</dt>
-                  <dd :class="{ strong: g.tier === 'review' }">{{ g.lose }}</dd>
-                  <dt>怎么清</dt>
-                  <dd>{{ g.how_detail || (canCheck(g) ? "勾选后清理，默认进回收站" : "按上面的说法手动处理") }}</dd>
+                  <dd><b v-if="g.tier === 'review' && loseTag(g)" class="lead">{{ loseTag(g) }}。</b>{{ g.lose }}</dd>
+                  <dt>建议</dt>
+                  <dd>
+                    <b class="lead">{{ advice(g.tier, g.how, g.how_detail, g.group).head }}。</b>{{ advice(g.tier, g.how, g.how_detail, g.group).detail }}
+                    <button v-if="toolUri[g.key]" class="link small tool" @click="openSystemSettings(toolUri[g.key]!)">打开存储设置</button>
+                  </dd>
                   <template v-if="g.paths.length > 1">
                     <dt>位置</dt>
                     <dd class="paths">
@@ -190,7 +207,7 @@ const totalChecked = computed(() => checkedGroups.value.length);
     <footer class="bar">
       <div><span class="k">已选</span><span class="v num">{{ totalChecked }}<small>项</small></span></div>
       <div class="sep"></div>
-      <div class="big"><span class="k">可释放</span><span class="v num">{{ gbNum(checkedBytes) }}<small>GB</small></span></div>
+      <div class="big"><span class="k">能腾出</span><span class="v num">{{ gbNum(checkedBytes) }}<small>GB</small></span></div>
       <div class="sep"></div>
       <div class="free">C 盘剩余 <b class="num">{{ gbNum(free) }}</b><span class="arr">→</span><b class="num">{{ gbNum(free + checkedBytes) }} GB</b></div>
       <button class="btn" :disabled="!totalChecked || previewBusy" @click="doPreview()">
@@ -545,9 +562,13 @@ const totalChecked = computed(() => checkedGroups.value.length);
 .detail dd {
   color: var(--ink2);
 }
-.detail dd.strong {
+.detail dd .lead {
   color: var(--ink);
   font-weight: var(--w-semi);
+}
+.detail dd .tool {
+  margin-left: 10px;
+  font-size: var(--fs-sub);
 }
 .detail code {
   font-family: var(--mono);

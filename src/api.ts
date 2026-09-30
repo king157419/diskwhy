@@ -44,6 +44,8 @@ export interface Explanation {
   why: string;
   lose: string;
   lose_kind: LoseKind | null;
+  /** 删了具体会怎样（≤ 8 个字的标签，阶段 H）；没有时退回 lose_kind 的通用说法 */
+  lose_short?: string | null;
   how: How[];
   how_detail: string;
   gain_bytes: number;
@@ -166,6 +168,7 @@ export interface CandidateGroup {
   category: Category;
   tier: "safe" | "review";
   lose_kind: LoseKind | null;
+  lose_short?: string | null;
   how: How[];
   what: string;
   lose: string;
@@ -215,6 +218,7 @@ export interface TreemapNode {
   what: string;
   owner: string | null;
   lose_kind: LoseKind | null;
+  lose_short?: string | null;
   category: Category;
   inaccessible: boolean;
   reparse_skipped: boolean;

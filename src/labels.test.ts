@@ -1,18 +1,18 @@
 import { describe, expect, it } from "vitest";
 import type { LoseKind } from "./api";
-import { checkLine, cleanCat, clipWidth, isHardTag, LOSE_LABEL, LOSE_ORDER, loseLabel, worstLose } from "./labels";
+import { advice, checkLine, cleanCat, clipWidth, isHardTag, LOSE_LABEL, LOSE_ORDER, loseLabel, loseTag, worstLose } from "./labels";
 
 describe("后果标签 lose_kind → 中文", () => {
   it("八种都有固定的标签", () => {
     const want: Record<LoseKind, string> = {
       irreversible: "找不回来",
-      repair: "影响修复",
-      unsure: "需你确认",
-      reinstall: "要重装",
-      relogin: "要重登录",
-      feature: "功能变少",
-      redownload: "要重下载",
-      slower: "删了变慢",
+      repair: "以后修不了",
+      unsure: "可能有你的东西",
+      reinstall: "删了要重装",
+      relogin: "要重新登录",
+      feature: "少一个功能",
+      redownload: "要重新下载",
+      slower: "下次会慢一点",
     };
     expect(LOSE_LABEL).toEqual(want);
     for (const k of LOSE_ORDER) expect(loseLabel(k)).toBe(want[k]);
@@ -81,5 +81,29 @@ describe("预检进度一行（阶段 G）", () => {
     for (let i = 1; i < seq.length; i++) expect(seq[i]).toBeGreaterThanOrEqual(seq[i - 1]);
     expect(Math.max(...seq)).toBeLessThanOrEqual(100);
     expect(checkLine({ ...base, phase: "check", checked: 0, to_check: 0 }).pct).toBe(5);
+  });
+});
+
+describe("具体后果标签和建议（阶段 H）", () => {
+  it("行上的标签优先用规则写的具体短语，没有再退回通用说法", () => {
+    expect(loseTag({ lose_short: "不能休眠", lose_kind: "feature" })).toBe("不能休眠");
+    expect(loseTag({ lose_short: "  ", lose_kind: "feature" })).toBe("少一个功能");
+    expect(loseTag({ lose_short: null, lose_kind: "irreversible" })).toBe("找不回来");
+    expect(loseTag({ lose_kind: null })).toBeNull();
+    for (const k of LOSE_ORDER) expect([...LOSE_LABEL[k]].length).toBeLessThanOrEqual(8);
+  });
+  it("建议由档位 + 怎么清推出来，how_detail 是第二句", () => {
+    expect(advice("safe", ["delete"]).head).toBe("可以删，会自动重建");
+    expect(advice("review", ["delete"]).head).toBe("看一眼里面，确定不要了再删");
+    expect(advice("review", ["migrate", "delete"]).head).toBe("看一眼里面，确定不要了再删");
+    expect(advice("review", ["manual"]).head).toBe("自己打开看看，手动删");
+    expect(advice("review", ["builtin_tool"], "", "windows-system").head).toBe("别直接删，用 Windows 自带工具清");
+    expect(advice("review", ["builtin_tool"], "", "cn-apps").head).toBe("别直接删，用软件自带的清理");
+    expect(advice("review", ["migrate"]).head).toBe("别删，搬到 D 盘更好");
+    expect(advice("keep", ["migrate"]).head).toBe("别删，搬到 D 盘更好");
+    expect(advice("review", ["none"]).head).toBe("别动");
+    expect(advice("keep", ["none"]).head).toBe("别动");
+    expect(advice("safe", ["delete"], "  关掉 Chrome 后删  ").detail).toBe("关掉 Chrome 后删");
+    expect(advice("safe", ["delete"]).detail).toBe("");
   });
 });

@@ -152,6 +152,9 @@ pub struct Explanation {
     /// 删了最坏会怎样（review 档一定有；safe 可能没有；keep 可以没有）。
     #[serde(default)]
     pub lose_kind: Option<LoseKind>,
+    /// 这一项删了具体会怎样（≤ 8 个字，界面标签，比如“不能休眠”）。review 档一定有；没有时界面退回 lose_kind 的通用说法。
+    #[serde(default)]
+    pub lose_short: Option<String>,
     pub how: Vec<How>,
     pub how_detail: String,
     /// 能腾出的字节（safe/review 且可删时 = 实际占用；keep 为 0）。
@@ -413,6 +416,9 @@ fn explain_rest(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) 
     e
 }
 
+/// safe 规则落在个人文件夹下被降成 review、规则本身又没写 lose_short 时的标签。
+pub const DOWNGRADED_SHORT: &str = "在你的文件夹里";
+
 /// 规则 → 解释。
 fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&str>, ctx: &ExplainCtx) -> Explanation {
     let mut notes = Vec::new();
@@ -441,6 +447,11 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         (Tier::Review, None) => Some(LoseKind::Unsure),
         (_, k) => k,
     };
+    let lose_short = match (tier, &rule.lose_short) {
+        (_, Some(s)) => Some(s.clone()),
+        (Tier::Review, None) => Some(DOWNGRADED_SHORT.to_string()),
+        _ => None,
+    };
     Explanation {
         tier,
         owner,
@@ -449,6 +460,7 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         why: rule.why.clone(),
         lose: rule.lose.clone(),
         lose_kind,
+        lose_short,
         how,
         how_detail: rule.how_detail.clone(),
         gain_bytes,

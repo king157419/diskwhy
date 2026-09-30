@@ -50,6 +50,9 @@ pub struct CandidateGroup {
     pub category: Category,
     pub tier: Tier,
     pub lose_kind: Option<LoseKind>,
+    /// 删了具体会怎样（≤ 8 个字，行上的标签；阶段 H）。
+    #[serde(default)]
+    pub lose_short: Option<String>,
     pub how: Vec<How>,
     pub what: String,
     pub lose: String,
@@ -346,6 +349,11 @@ impl<'a> Walker<'a> {
             (Tier::Review, None) => Some(LoseKind::Unsure),
             (_, k) => k,
         };
+        let lose_short = match (tier, &r.lose_short) {
+            (_, Some(s)) => Some(s.clone()),
+            (Tier::Review, None) => Some(super::DOWNGRADED_SHORT.to_string()),
+            _ => None,
+        };
         let make = || CandidateGroup {
             key: key.clone(),
             rule_id: Some(r.id.clone()),
@@ -363,6 +371,7 @@ impl<'a> Walker<'a> {
             category: r.category,
             tier,
             lose_kind,
+            lose_short: lose_short.clone(),
             how: r.how.clone(),
             what: r.what.clone(),
             lose: r.lose.clone(),
@@ -405,6 +414,7 @@ impl<'a> Walker<'a> {
             category: e.category,
             tier: Tier::Review,
             lose_kind: e.lose_kind,
+            lose_short: e.lose_short.clone(),
             how: e.how.clone(),
             what: e.what.clone(),
             lose: e.lose.clone(),

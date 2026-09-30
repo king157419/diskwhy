@@ -321,8 +321,9 @@ body::after {
   border-radius: 999px;
   background: var(--review-soft);
   color: #141412;
-  font-family: var(--heading);
-  font-weight: 700;
+  /* 标签文字来自规则（lose_short，用户规则也能写），手写体子集只含界面固定文案，缺字会混排：用界面字体 */
+  font-family: var(--ui);
+  font-weight: var(--w-semi);
 }
 [data-theme="C"] .tag.hard {
   background: var(--review);

@@ -279,6 +279,9 @@ pub fn ask(t: &Target, ctx: &ExplainCtx) -> Result<Explanation, String> {
     Ok(to_explanation(a, s.model.trim(), t.node.allocated))
 }
 
+/// AI 推测结果的标签。
+pub const LLM_SHORT: &str = "还没确认是什么";
+
 /// 模型回答 → 解释。永远 review，永远不能变成 safe。
 pub fn to_explanation(a: LlmAnswer, model: &str, allocated: u64) -> Explanation {
     let how = vec![How::Manual];
@@ -290,6 +293,7 @@ pub fn to_explanation(a: LlmAnswer, model: &str, allocated: u64) -> Explanation 
         why: a.why.trim().to_string(),
         lose: if a.lose.trim().is_empty() { "AI 没说清楚。请先确认再决定。".into() } else { a.lose.trim().to_string() },
         lose_kind: Some(super::LoseKind::Unsure),
+        lose_short: Some(LLM_SHORT.to_string()),
         how,
         how_detail: "这是 AI 根据名字和大小做的推测，不是确认。删之前请自己再核实一下（搜一下文件夹名、看看里面的文件）。".into(),
         gain_bytes: 0,

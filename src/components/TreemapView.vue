@@ -4,7 +4,7 @@
 // 认不出来 / 合并的“其他”画成混合色。单击选中一个顶层块（右边列表跟着变），双击进入。
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { tmKey, type ScanSummary, type TreemapNode } from "../api";
-import { isHardTag, loseLabel } from "../labels";
+import { isHardTag, loseTag } from "../labels";
 import { collapseChain, layoutTreemap, type TmInput, type TmItem } from "../treemap";
 import { sizeParts } from "../capacity";
 
@@ -124,6 +124,7 @@ const tip = computed(() => {
     tone: tone(it),
     what: n?.what ?? (it.kind === "other" ? `${it.mergedCount} 个小项合计` : ""),
     lose: n && n.tier === "review" ? n.lose_kind : null,
+    loseText: n && n.tier === "review" ? loseTag(n) : null,
   };
 });
 
@@ -178,7 +179,7 @@ function gb(v: number) {
     <div v-if="tip" class="tip" :style="{ left: tipPos.x + 'px', top: tipPos.y + 'px' }">
       <div class="t1"><i class="dot" :class="tip.tone"></i>{{ tip.name }}<span class="s num">{{ tip.size }}</span></div>
       <div v-if="tip.what" class="t2">{{ tip.what }}</div>
-      <div v-if="loseLabel(tip.lose)" class="t3"><span class="tag" :class="{ hard: isHardTag(tip.lose) }">{{ loseLabel(tip.lose) }}</span></div>
+      <div v-if="tip.loseText" class="t3"><span class="tag" :class="{ hard: isHardTag(tip.lose) }">{{ tip.loseText }}</span></div>
     </div>
   </div>
 </template>

@@ -221,6 +221,9 @@ pub struct TreemapNode {
     /// 删了最坏会怎样（阶段 F：方块图悬停卡片上的后果标签）。
     #[serde(default)]
     pub lose_kind: Option<explain::LoseKind>,
+    /// 删了具体会怎样（≤ 8 个字；阶段 H）。
+    #[serde(default)]
+    pub lose_short: Option<String>,
     /// 分类（阶段 F：列表里的灰色类别）。
     #[serde(default = "unknown_category")]
     pub category: explain::Category,
@@ -265,7 +268,7 @@ fn tm_node(
     ctx: Option<&ExplainCtx>,
 ) -> TreemapNode {
     let _ = result;
-    let (tier, what, owner, lose_kind, category) = match ctx {
+    let (tier, what, owner, lose_kind, lose_short, category) = match ctx {
         Some(ctx) => {
             let t = Target { node: n, path, parent: ancestors.last().copied(), ancestors };
             let e = match inherited {
@@ -282,9 +285,9 @@ fn tm_node(
                     explain::Tier::Keep => "keep",
                 }
             };
-            (tier.to_string(), e.what, e.owner, e.lose_kind, e.category)
+            (tier.to_string(), e.what, e.owner, e.lose_kind, e.lose_short, e.category)
         }
-        None => ("unknown".to_string(), String::new(), None, None, explain::Category::Unknown),
+        None => ("unknown".to_string(), String::new(), None, None, None, explain::Category::Unknown),
     };
     TreemapNode {
         name: n.name.clone(),
@@ -295,6 +298,7 @@ fn tm_node(
         what,
         owner,
         lose_kind,
+        lose_short,
         category,
         inaccessible: n.inaccessible,
         reparse_skipped: n.reparse_skipped,

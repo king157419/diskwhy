@@ -1141,7 +1141,7 @@ fn lose_kind_validation() {
     let review = GOOD.replace("tier = \"safe\"", "tier = \"review\"");
     let errs = validate(&def(&review), &mut HashSet::new());
     assert!(errs.iter().any(|e| e.contains("lose_kind")), "review 没写 lose_kind 应该报错：{errs:?}");
-    let ok = review.replace("refs = []", "refs = []\nlose_kind = \"slower\"");
+    let ok = review.replace("refs = []", "refs = []\nlose_kind = \"slower\"\nlose_short = \"下次会慢一点\"");
     assert!(validate(&def(&ok), &mut HashSet::new()).is_empty());
     let bad = review.replace("refs = []", "refs = []\nlose_kind = \"maybe\"");
     let errs = validate(&def(&bad), &mut HashSet::new());
@@ -1364,4 +1364,100 @@ verified_on = "2026-09-30"
     assert_eq!(short_name("Google Chrome（谷歌浏览器）", Category::Cache), "Google Chrome 缓存");
     assert_eq!(short_name("微信", Category::Log), "微信日志");
     assert_eq!(short_name("回收站", Category::Trash), "回收站");
+}
+
+// ───────────────────────── 阶段 H：具体后果短语 lose_short ─────────────────────────
+
+use diskwhy_core::explain::heuristics::{heuristic_lose_short, UNKNOWN_SHORT};
+use diskwhy_core::explain::rules::LOSE_SHORT_MAX;
+
+#[test]
+fn every_review_rule_has_short_concrete_tag() {
+    let ctx = embedded_ctx();
+    let mut n = 0;
+    for r in &ctx.rules.rules {
+        if let Some(s) = &r.lose_short {
+            assert!(s.chars().count() <= LOSE_SHORT_MAX, "规则 {} 的 lose_short `{s}` 超过 {LOSE_SHORT_MAX} 个字", r.id);
+        }
+        if r.tier == Tier::Review {
+            n += 1;
+            assert!(r.lose_short.as_deref().is_some_and(|s| !s.trim().is_empty()), "review 规则 {} 没有 lose_short", r.id);
+        }
+    }
+    assert_eq!(n, 75);
+    let s = |id: &str| ctx.rules.by_id(id).and_then(|r| r.lose_short.clone()).unwrap_or_default();
+    assert_eq!(s("hiberfil"), "不能休眠");
+    assert_eq!(s("windows-old"), "不能退回旧系统");
+    assert_eq!(s("package-cache"), "卸载软件会出错");
+    assert_eq!(s("nvidia-driver-installers"), "重装驱动要重下");
+    assert_eq!(s("wechat-appdata"), "微信要重新登录");
+    assert_eq!(s("huggingface-hub"), "模型要重新下载");
+    assert_eq!(s("ollama-models"), "模型要重新下载");
+    assert_eq!(s("rustup-toolchains"), "Rust 要重装");
+    assert_eq!(s("vscode-family-extensions"), "编辑器插件要重装");
+    assert_eq!(s("root-tmp-dir"), "可能有你放的文件");
+    assert_eq!(s("root-temp-dir"), "可能有你放的文件");
+    assert_eq!(s("maven-repo"), "要重新下载依赖");
+    assert_eq!(s("dot-cache-root"), "里面混着别的东西");
+}
+
+#[test]
+fn lose_short_validation() {
+    let review = GOOD.replace("tier = \"safe\"", "tier = \"review\"").replace("refs = []", "refs = []\nlose_kind = \"slower\"");
+    let errs = validate(&def(&review), &mut HashSet::new());
+    assert!(errs.iter().any(|e| e.contains("lose_short")), "review 没写 lose_short 应该报错：{errs:?}");
+    let empty = review.replace("refs = []", "refs = []\nlose_short = \"  \"");
+    assert!(!validate(&def(&empty), &mut HashSet::new()).is_empty(), "空的 lose_short 也算没写");
+    let long = review.replace("refs = []", "refs = []\nlose_short = \"回收站里的东西没了\"");
+    let errs = validate(&def(&long), &mut HashSet::new());
+    assert!(errs.iter().any(|e| e.contains("9 个字")), "超过 8 个字应该报错：{errs:?}");
+    let ok = review.replace("refs = []", "refs = []\nlose_short = \"Rust 要重装\"");
+    assert!(validate(&def(&ok), &mut HashSet::new()).is_empty(), "8 个字（含空格和字母）正好可以");
+    // safe 可以不写，写了也不能超长
+    assert!(validate(&def(GOOD), &mut HashSet::new()).is_empty());
+    let long_safe = GOOD.replace("refs = []", "refs = []\nlose_short = \"一二三四五六七八九\"");
+    assert!(!validate(&def(&long_safe), &mut HashSet::new()).is_empty());
+}
+
+#[test]
+fn explanations_and_candidates_carry_lose_short() {
+    let ctx = embedded_ctx();
+    let t = tree(&[
+        (r"C:\Users\bob\.m2\repository\org\a.jar", 100),
+        (r"C:\Users\bob\AppData\Local\npm-cache\x", 10),
+        (r"C:\mystery\x", 5),
+        (r"C:\proj\node_modules\left-pad\index.js", 60),
+        (r"C:\proj\package.json", 1),
+    ]);
+    let maven = ex(&t, r"C:\Users\bob\.m2\repository", &ctx);
+    assert_eq!(maven.lose_short.as_deref(), Some("要重新下载依赖"));
+    assert!(serde_json::to_string(&maven).unwrap().contains("\"lose_short\":\"要重新下载依赖\""));
+    assert_eq!(ex(&t, r"C:\Users\bob\AppData\Local\npm-cache", &ctx).lose_short, None);
+    assert_eq!(ex(&t, r"C:\mystery", &ctx).lose_short.as_deref(), Some(UNKNOWN_SHORT));
+    let a = llm::parse_answer(r#"{"what":"w","owner":"","why":"y","lose":"l","confidence":0.5}"#).unwrap();
+    assert!(llm::to_explanation(a, "m", 1).lose_short.is_some());
+    let nm = ex(&t, r"C:\proj\node_modules", &ctx);
+    assert_eq!(nm.lose_short.as_deref(), Some("项目要重装依赖"), "{:?}", nm.source);
+    let groups = cleanup_candidates(&t, &ctx, &|_: &str| false);
+    let g = groups.iter().find(|g| g.rule_id.as_deref() == Some("maven-repo")).unwrap();
+    assert_eq!(g.lose_short.as_deref(), Some("要重新下载依赖"));
+}
+
+#[test]
+fn heuristic_review_results_have_short_tags() {
+    for name in [
+        "chromium-cache", "python-venv", "python-env", "node-modules", "rust-target", "dotnet-build", "model-weights", "logs-dumps",
+        "downloaded-installer", "temp-files", "media-files", "registry-install-dir", "registry-program-dir", "registry-appdata",
+        "chat-files-cache", "game-highlights", "steam-cache", "steam-workshop", "python-runtime", "conda-pkgs", "android-sdk", "android-sdk-part",
+        "android-user-home", "android-avd", "gradle-home", "gradle-cache", "flutter-sdk", "flutter-cache", "pub-cache", "dev-sdk-container",
+        "pnpm-store", "ollama-models-dir", "visual-studio-install", "app-install-elsewhere", "driver-packages", "virtual-disk", "vm-vmware",
+        "vm-virtualbox", "vm-hyperv", "user-projects", "chat-files", "conda-envs", "conda-env", "conda-base", "conda-root",
+    ] {
+        let s = heuristic_lose_short(name).unwrap_or_else(|| panic!("{name} 没有 lose_short"));
+        assert!(s.chars().count() <= LOSE_SHORT_MAX, "{name}: {s}");
+    }
+    assert!(UNKNOWN_SHORT.chars().count() <= LOSE_SHORT_MAX && llm::LLM_SHORT.chars().count() <= LOSE_SHORT_MAX);
+    assert_eq!(heuristic_lose_short("model-weights"), Some("模型要重新下载"));
+    assert_eq!(heuristic_lose_short("vm-vmware"), Some("虚拟机会没了"));
+    assert_eq!(heuristic_lose_short("whatever-new"), None);
 }

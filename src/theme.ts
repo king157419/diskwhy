@@ -10,7 +10,7 @@ export type ThemeId = "A" | "B" | "C";
 export const THEMES: { id: ThemeId; name: string }[] = [
   { id: "A", name: "浅色" },
   { id: "B", name: "深色" },
-  { id: "C", name: "趣味" },
+  { id: "C", name: "卡通" },
 ];
 const KEY = "diskwhy.theme3";
 

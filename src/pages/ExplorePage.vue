@@ -20,7 +20,7 @@ import {
 import TreemapView from "../components/TreemapView.vue";
 import { askAi, type Category, type Explanation, type NodeView } from "../api";
 import { sizeParts, gbNum } from "../capacity";
-import { CATEGORY_LABEL, clipWidth, isHardTag, loseLabel } from "../labels";
+import { advice, CATEGORY_LABEL, clipWidth, isHardTag, loseTag } from "../labels";
 import {
   enterBlock,
   enterRow,
@@ -87,7 +87,7 @@ function icon(n: NodeView) {
   return ICON[n.explanation?.category ?? "unknown"] ?? Folder;
 }
 function catText(n: NodeView): string {
-  if (n.kind === "Rest") return `零散 ${n.files.toLocaleString("zh-CN")} 项`;
+  if (n.kind === "Rest") return `小文件 ${n.files.toLocaleString("zh-CN")} 个`;
   const e = n.explanation;
   if (!e || e.source.kind === "unknown") return n.kind === "Dir" ? `混合 ${n.child_count} 项` : "未知";
   if (e.category === "userdata") return e.tier === "keep" ? "你的文件" : "数据";
@@ -124,6 +124,11 @@ async function doAsk(n: NodeView) {
   }
 }
 const aiOf = (p: string) => ai.value[p];
+
+/** 展开行的「建议」（阶段 H） */
+function adviceOf(e: Explanation) {
+  return advice(e.source.kind === "unknown" ? "keep" : e.tier, e.how, e.how_detail, e.source.kind === "rule" ? e.source.group : null);
+}
 
 function onKey(e: KeyboardEvent) {
   if (e.key === "Backspace" && !(e.target instanceof HTMLInputElement)) {
@@ -195,13 +200,15 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
                 <dd>{{ n.explanation.what }}</dd>
                 <dt>删了会怎样</dt>
                 <dd>
-                  <span v-if="loseLabel(n.explanation.lose_kind) && n.explanation.tier === 'review'" class="tag" :class="{ hard: isHardTag(n.explanation.lose_kind) }">{{
-                    loseLabel(n.explanation.lose_kind)
+                  <span v-if="loseTag(n.explanation) && n.explanation.tier === 'review'" class="tag" :class="{ hard: isHardTag(n.explanation.lose_kind) }">{{
+                    loseTag(n.explanation)
                   }}</span>
                   {{ n.explanation.lose }}
                 </dd>
-                <dt>怎么清</dt>
-                <dd>{{ n.explanation.how_detail || n.explanation.gain_note }}</dd>
+                <dt>建议</dt>
+                <dd>
+                  <b class="lead">{{ adviceOf(n.explanation).head }}。</b>{{ adviceOf(n.explanation).detail }}
+                </dd>
                 <template v-if="n.explanation.clues.length">
                   <dt>线索</dt>
                   <dd>{{ n.explanation.clues.join("；") }}</dd>
@@ -511,6 +518,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 }
 .detail dd .tag {
   margin-right: 6px;
+}
+.detail dd .lead {
+  color: var(--ink);
+  font-weight: var(--w-semi);
 }
 .detail .path {
   margin-top: 8px;

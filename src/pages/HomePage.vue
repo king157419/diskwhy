@@ -5,6 +5,7 @@ import { computed } from "vue";
 import CapacityColumn, { type ColSeg } from "../components/CapacityColumn.vue";
 import { gbNum } from "../capacity";
 import { CLEAN_CAT_NAME } from "../labels";
+import { elapsedText, filesCount, scanSegs } from "../scanview";
 import { THEMES, setTheme, theme } from "../theme";
 import {
   actEnv,
@@ -33,17 +34,13 @@ const free = computed(() => summary.value?.free_bytes ?? drive.value?.free_bytes
 const used = computed(() => summary.value?.used_bytes ?? Math.max(0, total.value - free.value));
 const usedPct = computed(() => (total.value ? Math.round((used.value * 100) / total.value) : 0));
 
-const bigNumber = computed(() => (scanning.value ? gbNum(progress.value?.bytes ?? 0) : gbNum(safeBytes.value)));
+// 扫描中不显示扫描字节（去重前的原始数，可能比整个盘还大）：大数字是看过的文件数，容量柱只画剩余 / 已用（阶段 H）
+const scanCount = computed(() => filesCount(progress.value?.files ?? 0));
+const bigNumber = computed(() => (scanning.value ? scanCount.value.n : gbNum(safeBytes.value)));
+const bigUnit = computed(() => (scanning.value ? scanCount.value.u : "GB"));
 
 const segs = computed<ColSeg[]>(() => {
-  if (scanning.value) {
-    const scanned = Math.min(progress.value?.bytes ?? 0, used.value);
-    return [
-      { key: "free", kind: "free", label: "剩余", bytes: free.value },
-      { key: "scanned", kind: "scanned", label: "已扫描", bytes: scanned },
-      { key: "pending", kind: "pending", label: "扫描中", bytes: Math.max(0, used.value - scanned) },
-    ];
-  }
+  if (scanning.value) return scanSegs(free.value, used.value);
   const safe = safeBytes.value;
   const review = Math.min(reviewBytes.value, Math.max(0, used.value - safe));
   return [
@@ -76,11 +73,11 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
       <div class="hero-in">
         <div class="eyebrow">
           <span class="dot safe"></span>
-          <template v-if="scanning">正在扫描<span class="cnt num">{{ (progress?.files ?? 0).toLocaleString("zh-CN") }} 个文件</span></template>
+          <template v-if="scanning">正在扫描<span class="cnt num">{{ elapsedText(progress?.elapsed_ms ?? 0) }}</span></template>
           <template v-else>可放心清理<span class="cnt num">{{ safeGroups.length }} 项</span></template>
         </div>
         <div class="big">
-          <span class="n display num">{{ bigNumber }}</span><span class="u">GB</span>
+          <span class="n display num">{{ bigNumber }}</span><span class="u" :class="{ cjk: scanning }">{{ bigUnit }}</span>
         </div>
         <div v-if="scanning" class="split scan-path mono">{{ progress?.current_path || "C:\\" }}</div>
         <div v-else class="split">
@@ -432,6 +429,17 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
 [data-theme="C"] .scanning .big .n,
 [data-theme="C"] .home.scanning .big .n {
   color: rgba(20, 20, 18, 0.45);
+}
+
+/* 扫描中的单位是中文（“万个文件”）：展示字体只有数字，统一用界面字体 */
+.home .big .u.cjk {
+  font-family: var(--ui);
+  font-style: normal;
+  font-weight: var(--w-med);
+  font-variation-settings: normal;
+  font-size: 40px;
+  color: var(--ink3);
+  letter-spacing: 0.02em;
 }
 
 /* A：衬线大数字 + 斜体 GB；B：金色细体 + 柔光 */

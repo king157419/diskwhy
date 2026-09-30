@@ -8,7 +8,7 @@
 import { computed, ref } from "vue";
 import { executePlan, pickFolder, type ExecOutcome, type ExecProgress, type ItemReport, type LoseKind, type PreflightReport } from "../api";
 import { gbNum, sizeParts } from "../capacity";
-import { checkLine, CLEAN_CAT_NAME, isHardTag, loseLabel, shortPath, type CleanCat } from "../labels";
+import { checkLine, CLEAN_CAT_NAME, isHardTag, loseTag, shortPath, type CleanCat } from "../labels";
 import { candidates, checkProgress, groupCat, onExecuted, page, report as reportRef, requote, summary } from "../store";
 
 const props = defineProps<{ report: PreflightReport }>();
@@ -39,11 +39,11 @@ const blocked = computed(() => props.report.items.filter((i) => i.blocked));
 
 /** 需你判断的项：按候选组合并（一组可能有好几个位置） */
 const reviewRows = computed(() => {
-  const m = new Map<string, { key: string; name: string; lose: LoseKind | null; bytes: number }>();
+  const m = new Map<string, { key: string; name: string; lose: LoseKind | null; short: string | null; bytes: number }>();
   for (const it of live.value.filter((i) => i.tier === "review")) {
     const g = groupOf(it.path);
     const key = g?.key ?? it.path;
-    const cur = m.get(key) ?? { key, name: g?.name ?? it.what, lose: g?.lose_kind ?? null, bytes: 0 };
+    const cur = m.get(key) ?? { key, name: g?.name ?? it.what, lose: g?.lose_kind ?? null, short: g ? loseTag(g) : null, bytes: 0 };
     cur.bytes += it.will_delete_bytes;
     m.set(key, cur);
   }
@@ -243,7 +243,7 @@ const pct = computed(() => {
           <div v-if="listOpen" class="m-rows">
             <div v-for="r in reviewRows" :key="r.key" class="m-row rv">
               <span class="dot review"></span><span class="n">{{ r.name }}</span>
-              <span v-if="loseLabel(r.lose)" class="tag" :class="{ hard: isHardTag(r.lose) }">{{ loseLabel(r.lose) }}</span>
+              <span v-if="r.short" class="tag" :class="{ hard: isHardTag(r.lose) }">{{ r.short }}</span>
               <span class="s num">{{ sizeParts(r.bytes).join(" ") }}</span>
             </div>
             <template v-for="c in safeCats" :key="c.cat">

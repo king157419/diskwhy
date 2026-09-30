@@ -1101,3 +1101,267 @@ fn user_big_items_on_any_drive() {
     // 启发式的参考链接
     assert!(ex(&t, r"C:\conda\pkgs", &ctx).refs.iter().any(|r| r.contains("conda")));
 }
+
+// ───────────────────────── 阶段 F：后果类型 lose_kind + 清理候选 ─────────────────────────
+
+use diskwhy_core::explain::candidates::{cleanup_candidates, short_name};
+use diskwhy_core::explain::heuristics::heuristic_lose_kind;
+use diskwhy_core::explain::{Category, LoseKind};
+
+#[test]
+fn every_review_rule_has_lose_kind() {
+    let ctx = embedded_ctx();
+    let mut n = 0;
+    for r in &ctx.rules.rules {
+        if r.tier == Tier::Review {
+            n += 1;
+            assert!(r.lose_kind.is_some(), "review 规则 {} 没有 lose_kind", r.id);
+        }
+    }
+    // 72 条原有 review 规则 + 阶段 F 新增的 C:\tmp / C:\Temp / C:\AMD 三条
+    assert_eq!(n, 75, "review 规则条数变了：{n}");
+    // 抽查几条 README 里的例子
+    let k = |id: &str| ctx.rules.by_id(id).and_then(|r| r.lose_kind);
+    assert_eq!(k("recycle-bin"), Some(LoseKind::Irreversible));
+    assert_eq!(k("maven-repo"), Some(LoseKind::Irreversible));
+    assert_eq!(k("package-cache"), Some(LoseKind::Repair));
+    assert_eq!(k("dot-cache-root"), Some(LoseKind::Unsure));
+    assert_eq!(k("vscode-family-extensions"), Some(LoseKind::Reinstall));
+    assert_eq!(k("wechat-appdata"), Some(LoseKind::Relogin));
+    assert_eq!(k("hiberfil"), Some(LoseKind::Feature));
+    assert_eq!(k("huggingface-hub"), Some(LoseKind::Redownload));
+    assert_eq!(k("visual-studio-cache"), Some(LoseKind::Slower));
+    assert_eq!(k("root-tmp-dir"), Some(LoseKind::Unsure));
+    assert_eq!(k("root-temp-dir"), Some(LoseKind::Unsure));
+    assert_eq!(k("amd-installer-files"), Some(LoseKind::Repair));
+}
+
+#[test]
+fn lose_kind_validation() {
+    let review = GOOD.replace("tier = \"safe\"", "tier = \"review\"");
+    let errs = validate(&def(&review), &mut HashSet::new());
+    assert!(errs.iter().any(|e| e.contains("lose_kind")), "review 没写 lose_kind 应该报错：{errs:?}");
+    let ok = review.replace("refs = []", "refs = []\nlose_kind = \"slower\"");
+    assert!(validate(&def(&ok), &mut HashSet::new()).is_empty());
+    let bad = review.replace("refs = []", "refs = []\nlose_kind = \"maybe\"");
+    let errs = validate(&def(&bad), &mut HashSet::new());
+    assert!(errs.iter().any(|e| e.contains("maybe")), "不认识的 lose_kind 应该报错：{errs:?}");
+    let bad_safe = GOOD.replace("refs = []", "refs = []\nlose_kind = \"Slower\"");
+    assert!(!validate(&def(&bad_safe), &mut HashSet::new()).is_empty(), "safe 写了不认识的值也要报错");
+    // safe / keep 可以不写
+    assert!(validate(&def(GOOD), &mut HashSet::new()).is_empty());
+    // 整个文件里有一条不认识的值：这条规则加载失败，错误信息带出规则 id
+    let (rs, errs) = RuleSet::from_sources(&[("t", &bad)], &fake_env());
+    assert!(rs.rules.is_empty() && errs.iter().any(|e| e.contains("`x`")));
+    // 严重程度顺序：Ord 越小越坏
+    assert!(LoseKind::Irreversible < LoseKind::Repair && LoseKind::Redownload < LoseKind::Slower);
+    assert_eq!(LoseKind::ALL.iter().min(), Some(&LoseKind::Irreversible));
+    for k in LoseKind::ALL {
+        assert_eq!(LoseKind::parse(k.as_str()), Some(k));
+    }
+}
+
+#[test]
+fn explanations_carry_lose_kind() {
+    let ctx = embedded_ctx();
+    let t = tree(&[
+        (r"C:\Users\bob\.m2\repository\org\a.jar", 100),
+        (r"C:\Users\bob\AppData\Local\npm-cache\x", 10),
+        (r"C:\mystery\x", 5),
+        (r"C:\Windows\WinSxS\a", 7),
+    ]);
+    let maven = ex(&t, r"C:\Users\bob\.m2\repository", &ctx);
+    assert_eq!(maven.lose_kind, Some(LoseKind::Irreversible));
+    let json = serde_json::to_string(&maven).unwrap();
+    assert!(json.contains("\"lose_kind\":\"irreversible\""), "应序列化成 snake_case：{json}");
+    assert_eq!(ex(&t, r"C:\Users\bob\AppData\Local\npm-cache", &ctx).lose_kind, None);
+    let unk = ex(&t, r"C:\mystery", &ctx);
+    assert!(unk.is_unknown());
+    assert_eq!(unk.lose_kind, Some(LoseKind::Unsure));
+    // LLM 兜底永远是“需你确认”
+    let a = llm::parse_answer(r#"{"what":"w","owner":"","why":"y","lose":"l","confidence":0.5}"#).unwrap();
+    assert_eq!(llm::to_explanation(a, "m", 1).lose_kind, Some(LoseKind::Unsure));
+}
+
+#[test]
+fn heuristic_review_results_always_have_lose_kind() {
+    for name in [
+        "chromium-cache", "python-venv", "python-env", "node-modules", "rust-target", "dotnet-build", "model-weights", "logs-dumps",
+        "downloaded-installer", "temp-files", "media-files", "registry-install-dir", "registry-program-dir", "registry-appdata",
+        "chat-files-cache", "game-highlights", "steam-cache", "steam-workshop", "python-runtime", "conda-pkgs", "android-sdk-part",
+        "android-user-home", "android-avd", "gradle-home", "gradle-cache", "flutter-sdk", "flutter-cache", "pub-cache", "dev-sdk-container",
+        "pnpm-store", "ollama-models-dir", "visual-studio-install", "app-install-elsewhere", "driver-packages", "dominant-child", "whatever-new",
+    ] {
+        assert!(heuristic_lose_kind(name, Tier::Review).is_some(), "{name} 没有后果类型");
+    }
+    assert_eq!(heuristic_lose_kind("rust-target", Tier::Review), Some(LoseKind::Slower));
+    assert_eq!(heuristic_lose_kind("node-modules", Tier::Review), Some(LoseKind::Redownload));
+    assert_eq!(heuristic_lose_kind("model-weights", Tier::Review), Some(LoseKind::Redownload));
+    assert_eq!(heuristic_lose_kind("virtual-disk", Tier::Keep), Some(LoseKind::Unsure));
+    assert_eq!(heuristic_lose_kind("whatever-new", Tier::Review), Some(LoseKind::Unsure));
+}
+
+#[test]
+fn cleanup_candidates_group_by_rule_and_respect_guards() {
+    let ctx = embedded_ctx();
+    let t = tree(&[
+        (r"C:\Users\bob\AppData\Local\npm-cache\_cacache\a", 100),
+        (r"C:\Users\bob\AppData\Roaming\npm-cache\b", 20),
+        (r"C:\Users\bob\.m2\repository\org\a.jar", 300),
+        (r"C:\Windows.old\x", 500),
+        (r"C:\Windows\Temp\t.tmp", 40),
+        (r"C:\Windows\WinSxS\a", 1000),
+        (r"C:\Users\bob\proj\Cargo.toml", 1),
+        (r"C:\Users\bob\proj\target\debug\app.exe", 700),
+        (r"C:\Users\bob\proj\target\.rustc_info.json", 1),
+        (r"C:\Users\bob\web\package.json", 1),
+        (r"C:\Users\bob\web\node_modules\left-pad\index.js", 60),
+        (r"C:\tmp\mine.parquet", 90),
+        (r"C:\mystery\x", 5),
+    ]);
+    // 模拟保护路径：C:\Windows 下的一律拦下
+    let blocked = |p: &str| p.to_lowercase().starts_with(r"c:\windows\");
+    let g = cleanup_candidates(&t, &ctx, &blocked);
+    let by = |k: &str| g.iter().find(|x| x.key == k).unwrap_or_else(|| panic!("没有候选 {k}：{:?}", g.iter().map(|x| &x.key).collect::<Vec<_>>()));
+
+    let npm = by("npm-cache");
+    assert_eq!(npm.tier, Tier::Safe);
+    assert_eq!(npm.paths.len(), 2, "同一条规则的两个位置合成一组");
+    assert_eq!((npm.bytes, npm.deletable_bytes), (120, 120));
+    assert_eq!(npm.rule_id.as_deref(), Some("npm-cache"));
+    assert_eq!(npm.name, "npm 缓存");
+
+    let maven = by("maven-repo");
+    assert_eq!((maven.tier, maven.lose_kind, maven.deletable_bytes), (Tier::Review, Some(LoseKind::Irreversible), 300));
+
+    // Windows.old 只能用系统工具：列出来，但不能直接删
+    let old = by("windows-old");
+    assert_eq!((old.bytes, old.deletable_bytes), (500, 0));
+    assert!(old.paths.iter().all(|p| !p.deletable));
+
+    // 保护路径拦下的 safe 规则：列出来但不能删
+    let wt = by("windows-temp");
+    assert_eq!((wt.bytes, wt.deletable_bytes), (40, 0));
+
+    // keep 规则（WinSxS）不出现
+    assert!(g.iter().all(|x| x.tier != Tier::Keep));
+
+    // 启发式：Rust 编译产物 / node_modules（review，可删）
+    let rt = by("h:rust-target");
+    assert_eq!((rt.tier, rt.lose_kind, rt.bytes), (Tier::Review, Some(LoseKind::Slower), 701));
+    assert_eq!(rt.paths[0].path, r"C:\Users\bob\proj\target");
+    assert_eq!(rt.name, "Rust 编译产物");
+    let nm = by("h:node-modules");
+    assert_eq!((nm.lose_kind, nm.deletable_bytes), (Some(LoseKind::Redownload), 60));
+
+    // C:\tmp：需你确认，只能手动
+    let tmp = by("root-tmp-dir");
+    assert_eq!((tmp.lose_kind, tmp.deletable_bytes), (Some(LoseKind::Unsure), 0));
+
+    // 未知的东西不出现
+    assert!(g.iter().all(|x| !x.paths.iter().any(|p| p.path.contains("mystery"))));
+    // 候选路径两两不重叠（不会重复计数）
+    let all: Vec<String> = g.iter().flat_map(|x| x.paths.iter().map(|p| p.path.to_lowercase())).collect();
+    for a in &all {
+        for b in &all {
+            assert!(a == b || !a.starts_with(&format!("{b}\\")), "{a} 在 {b} 里面，重复计数");
+        }
+    }
+}
+
+#[test]
+fn cleanup_candidate_with_stricter_rule_inside_is_not_deleted_whole() {
+    // 外层 safe 可删的规则里面套着一条 keep 规则：外层不能整个删，只记它自己那部分；里面的 keep 不出现
+    const RULES: &str = r#"
+[[rule]]
+id = "outer"
+owner = "o"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\outer']
+what = "w"
+why = "y"
+lose = "l"
+how = "delete"
+how_detail = ""
+refs = []
+verified_on = "2026-09-30"
+
+[[rule]]
+id = "inner-keep"
+owner = "o"
+category = "userdata"
+tier = "keep"
+match = ['%LOCALAPPDATA%\outer\keepme']
+what = "w"
+why = "y"
+lose = "l"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-09-30"
+
+[[rule]]
+id = "inner-safe"
+owner = "o"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\outer2\cache']
+what = "w"
+why = "y"
+lose = "l"
+how = "delete"
+how_detail = ""
+refs = []
+verified_on = "2026-09-30"
+
+[[rule]]
+id = "outer2"
+owner = "o"
+category = "cache"
+tier = "safe"
+match = ['%LOCALAPPDATA%\outer2']
+what = "w"
+why = "y"
+lose = "l"
+how = "delete"
+how_detail = ""
+refs = []
+verified_on = "2026-09-30"
+"#;
+    let env = fake_env();
+    let (rules, errs) = RuleSet::from_sources(&[("t", RULES)], &env);
+    assert!(errs.is_empty(), "{errs:?}");
+    let ctx = ctx_with(env, rules, Vec::new());
+    let t = tree(&[
+        (r"C:\Users\bob\AppData\Local\outer\junk.tmp", 50),
+        (r"C:\Users\bob\AppData\Local\outer\keepme\x", 30),
+        (r"C:\Users\bob\AppData\Local\outer2\a", 10),
+        (r"C:\Users\bob\AppData\Local\outer2\cache\b", 5),
+    ]);
+    let g = cleanup_candidates(&t, &ctx, &|_| false);
+    let outer = g.iter().find(|x| x.key == "outer").expect("应有 outer 候选");
+    assert_eq!((outer.bytes, outer.deletable_bytes), (50, 0), "里面有 keep 的东西，不能整个删，只记自己那部分");
+    assert!(g.iter().all(|x| x.key != "inner-keep"));
+    // 外层 safe 里面套着同样可删的 safe：整个外层就是一个候选，里面的字节算进来，不再单独列（不会重复计数）
+    let o2 = g.iter().find(|x| x.key == "outer2").unwrap();
+    assert_eq!((o2.bytes, o2.deletable_bytes, o2.paths.len()), (15, 15, 1));
+    assert!(g.iter().all(|x| x.key != "inner-safe"));
+
+    // 云端占位 / 读不到的东西不影响“能不能勾”：预检时会逐个文件跳过
+    let ctx = embedded_ctx();
+    let mut t2 = tree(&[(r"C:\Users\bob\AppData\Local\Temp\junk.tmp", 50), (r"C:\Users\bob\AppData\Local\Temp\sub\x", 30)]);
+    fn find_mut<'a>(n: &'a mut Node, path: &str) -> Option<&'a mut Node> {
+        if n.path.eq_ignore_ascii_case(path) {
+            return Some(n);
+        }
+        n.children.iter_mut().find_map(|c| find_mut(c, path))
+    }
+    find_mut(&mut t2, r"C:\Users\bob\AppData\Local\Temp\sub").unwrap().cloud_placeholder = true;
+    let g2 = cleanup_candidates(&t2, &ctx, &|_| false);
+    let temp2 = g2.iter().find(|x| x.key == "user-temp").unwrap();
+    assert_eq!((temp2.bytes, temp2.deletable_bytes, temp2.paths.len()), (80, 80, 1));
+    assert_eq!(short_name("Google Chrome（谷歌浏览器）", Category::Cache), "Google Chrome 缓存");
+    assert_eq!(short_name("微信", Category::Log), "微信日志");
+    assert_eq!(short_name("回收站", Category::Trash), "回收站");
+}

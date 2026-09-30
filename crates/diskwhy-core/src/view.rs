@@ -218,6 +218,12 @@ pub struct TreemapNode {
     pub tier: String,
     pub what: String,
     pub owner: Option<String>,
+    /// 删了最坏会怎样（阶段 F：方块图悬停卡片上的后果标签）。
+    #[serde(default)]
+    pub lose_kind: Option<explain::LoseKind>,
+    /// 分类（阶段 F：列表里的灰色类别）。
+    #[serde(default = "unknown_category")]
+    pub category: explain::Category,
     pub inaccessible: bool,
     pub reparse_skipped: bool,
     pub system_reserved: bool,
@@ -230,6 +236,10 @@ pub struct TreemapNode {
     /// 因为太小 / 太多没有发过来的子项合计（前端画成“其他”）。
     pub hidden_bytes: u64,
     pub hidden_count: usize,
+}
+
+fn unknown_category() -> explain::Category {
+    explain::Category::Unknown
 }
 
 /// 每层最多发多少个子项、占根的最小比例。
@@ -255,7 +265,7 @@ fn tm_node(
     ctx: Option<&ExplainCtx>,
 ) -> TreemapNode {
     let _ = result;
-    let (tier, what, owner) = match ctx {
+    let (tier, what, owner, lose_kind, category) = match ctx {
         Some(ctx) => {
             let t = Target { node: n, path, parent: ancestors.last().copied(), ancestors };
             let e = match inherited {
@@ -272,9 +282,9 @@ fn tm_node(
                     explain::Tier::Keep => "keep",
                 }
             };
-            (tier.to_string(), e.what, e.owner)
+            (tier.to_string(), e.what, e.owner, e.lose_kind, e.category)
         }
-        None => ("unknown".to_string(), String::new(), None),
+        None => ("unknown".to_string(), String::new(), None, None, explain::Category::Unknown),
     };
     TreemapNode {
         name: n.name.clone(),
@@ -284,6 +294,8 @@ fn tm_node(
         tier,
         what,
         owner,
+        lose_kind,
+        category,
         inaccessible: n.inaccessible,
         reparse_skipped: n.reparse_skipped,
         system_reserved: n.system_reserved,

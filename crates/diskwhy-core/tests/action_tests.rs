@@ -123,6 +123,7 @@ id = "t-review"
 owner = "测试"
 category = "model"
 tier = "review"
+lose_kind = "redownload"
 match = ['%TEMP%\review']
 what = "测试用模型"
 why = "测试"
@@ -876,6 +877,7 @@ fn guidance_gives_commands_but_never_runs_them() {
         what: String::new(),
         why: String::new(),
         lose: String::new(),
+        lose_kind: None,
         how,
         how_detail: "说明".into(),
         gain_bytes: 0,

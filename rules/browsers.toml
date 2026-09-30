@@ -52,6 +52,7 @@ id = "chrome-on-device-model"
 owner = "Google Chrome"
 category = "model"
 tier = "review"
+lose_kind = "feature"
 match = ['%LOCALAPPDATA%\Google\Chrome\User Data\OptGuideOnDeviceModel']
 what = "Chrome 下载到本机的 AI 模型（给浏览器内置的 AI 功能用）"
 why = "Chrome 的一些 AI 功能（比如帮你写字、总结网页）在本机运行，需要先下载一个几 GB 的模型"

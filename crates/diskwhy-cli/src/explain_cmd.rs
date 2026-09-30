@@ -1,6 +1,8 @@
 //! `diskwhy-cli explain <root> --top 50`：扫描后对前 N 大目录逐个解释，并统计覆盖率。
 
 use super::Args;
+use diskwhy_core::action::protect::Protector;
+use diskwhy_core::explain::candidates::{cleanup_candidates, CandidateGroup};
 use diskwhy_core::explain::{tier_summary, ExplainCtx, Explanation, Source, Tier, TierSummary};
 use diskwhy_core::view::{explain_path, human_bytes, top_dirs};
 use diskwhy_core::ScanResult;
@@ -36,6 +38,9 @@ struct Report {
     counts: Counts,
     rows: Vec<Row>,
     tiers: TierSummary,
+    /// 清理页的候选（阶段 F）。
+    candidates_ms: u64,
+    candidates: Vec<CandidateGroup>,
 }
 
 #[derive(Serialize, Default)]
@@ -132,6 +137,10 @@ pub fn run(r: &ScanResult, args: &Args) {
     let covered = c.rule_exact + c.rule_inherited + c.heuristic;
     c.coverage_pct = if c.total > 0 { covered as f64 * 100.0 / c.total as f64 } else { 0.0 };
     let tiers = tier_summary(&r.tree, &ctx);
+    let t2 = Instant::now();
+    let protector = Protector::from_system();
+    let candidates = cleanup_candidates(&r.tree, &ctx, &|p: &str| protector.check(p).is_some());
+    let candidates_ms = t2.elapsed().as_millis() as u64;
 
     // ── 终端输出 ──
     println!("DiskWhy 解释：{}", r.root);
@@ -183,6 +192,30 @@ pub fn run(r: &ScanResult, args: &Args) {
         tiers.rules_hit,
         tiers.rules_total
     );
+    let sum = |t: Tier, del: bool| -> u64 {
+        candidates.iter().filter(|g| g.tier == t).map(|g| if del { g.deletable_bytes } else { g.bytes }).sum()
+    };
+    println!(
+        "清理候选（{} ms）：{} 组 | 可放心清理 {}（能直接删 {}）| 需你判断 {}（能直接删 {}）",
+        candidates_ms,
+        candidates.len(),
+        human_bytes(sum(Tier::Safe, false)),
+        human_bytes(sum(Tier::Safe, true)),
+        human_bytes(sum(Tier::Review, false)),
+        human_bytes(sum(Tier::Review, true)),
+    );
+    for g in candidates.iter().take(args.top) {
+        println!(
+            "  {:<6} {:>10} {:>10}  {:<12} {:<24} {} 个位置  {}",
+            if g.tier == Tier::Safe { "可清理" } else { "需判断" },
+            human_bytes(g.bytes),
+            human_bytes(g.deletable_bytes),
+            g.lose_kind.map(|k| k.as_str()).unwrap_or("-"),
+            clip(&g.name, 24),
+            g.paths.len(),
+            g.paths.first().map(|p| p.path.as_str()).unwrap_or("")
+        );
+    }
     let unknowns: Vec<&Row> = rows.iter().filter(|r| r.source_kind == "unknown").collect();
     if !unknowns.is_empty() {
         println!();
@@ -207,6 +240,8 @@ pub fn run(r: &ScanResult, args: &Args) {
         counts: c,
         rows,
         tiers,
+        candidates_ms,
+        candidates,
     };
 
     if let Some(p) = &args.json {

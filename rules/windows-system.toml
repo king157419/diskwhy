@@ -318,6 +318,7 @@ id = "windows-old"
 owner = "Windows"
 category = "installer"
 tier = "review"
+lose_kind = "repair"
 match = ['%SystemDrive%\Windows.old']
 what = "升级前的旧 Windows"
 why = "大版本升级后保留旧系统，方便你退回去"
@@ -332,6 +333,7 @@ id = "hiberfil"
 owner = "Windows"
 category = "system"
 tier = "review"
+lose_kind = "feature"
 kind = "file"
 match = ['%SystemDrive%\hiberfil.sys']
 what = "休眠文件：电脑休眠时把内存内容存到这里"
@@ -377,6 +379,7 @@ id = "recycle-bin"
 owner = "Windows"
 category = "trash"
 tier = "review"
+lose_kind = "irreversible"
 match = ['%SystemDrive%\$Recycle.Bin']
 what = "回收站：你删掉的文件其实还在这里"
 why = "删除文件默认先进回收站，给你反悔的机会；每个账户一个子文件夹"
@@ -493,6 +496,7 @@ id = "windows-logs"
 owner = "Windows"
 category = "log"
 tier = "review"
+lose_kind = "repair"
 match = ['%SystemRoot%\Logs']
 what = "Windows 自己的日志（更新、组件、安装等）"
 why = "系统记录更新和组件安装过程，出问题时用来排查"
@@ -535,6 +539,7 @@ id = "package-cache"
 owner = "各类安装程序（Visual Studio、.NET、VC++ 运行库等）"
 category = "installer"
 tier = "review"
+lose_kind = "repair"
 match = ['%ProgramData%\Package Cache']
 what = "安装程序保存的安装包副本"
 why = "WiX / Burn 类安装程序（VC++ 运行库、.NET SDK、Visual Studio 组件等）把安装包留一份，卸载、修复、升级时要用"
@@ -564,6 +569,7 @@ id = "msix-localcache"
 owner = "Windows（商店应用 AppData 重定向）"
 category = "userdata"
 tier = "review"
+lose_kind = "unsure"
 scope = "self"
 owner_from_path = true
 match = [
@@ -585,6 +591,7 @@ id = "store-app-package"
 owner = "Microsoft Store 应用"
 category = "userdata"
 tier = "review"
+lose_kind = "irreversible"
 owner_from_path = true
 match = ['%LOCALAPPDATA%\Packages\*']
 what = "某个商店应用自己的数据（设置、缓存和它下载的内容）"
@@ -838,3 +845,56 @@ how = "builtin_tool"
 how_detail = "“设置 > 隐私和安全性 > 诊断和反馈 > 删除诊断数据”。"
 refs = []
 verified_on = "2026-09-23"
+
+# ───────── C 盘根目录下常见的“没人认领”文件夹（2026-09-30 补） ─────────
+
+[[rule]]
+id = "root-tmp-dir"
+owner = "某些程序或你自己"
+category = "cache"
+tier = "review"
+lose_kind = "unsure"
+kind = "dir"
+match = ['%SystemDrive%\tmp']
+what = "C 盘根目录下的通用临时文件夹 C:\\tmp"
+why = "Windows 自己的临时文件夹不在这里（系统用 C:\\Windows\\Temp，每个用户用 AppData\\Local\\Temp）；C:\\tmp 通常是某些程序、脚本或安装包自己建的，也常有人把手头的临时文件随手放进来"
+lose = "谁放的都有可能：程序留下的临时文件删了一般没事，但里面也可能有你（或别人）手动放进来的文件，删了就没了。先打开看一眼再决定。"
+how = "manual"
+how_detail = "打开文件夹逐个看：认得出是程序留下的临时文件就删，自己放的东西挪到别的盘或文档里。"
+refs = ["https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw"]
+verified_on = "2026-09-30"
+
+[[rule]]
+id = "root-temp-dir"
+owner = "某些程序或你自己"
+category = "cache"
+tier = "review"
+lose_kind = "unsure"
+kind = "dir"
+match = ['%SystemDrive%\Temp']
+what = "C 盘根目录下的通用临时文件夹 C:\\Temp"
+why = "Windows 自己的临时文件夹不在这里（系统用 C:\\Windows\\Temp，每个用户用 AppData\\Local\\Temp）；C:\\Temp 通常是某些程序、脚本或安装包自己建的，也常有人把手头的临时文件随手放进来"
+lose = "谁放的都有可能：程序留下的临时文件删了一般没事，但里面也可能有你（或别人）手动放进来的文件，删了就没了。先打开看一眼再决定。"
+how = "manual"
+how_detail = "打开文件夹逐个看：认得出是程序留下的临时文件就删，自己放的东西挪到别的盘或文档里。"
+refs = ["https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw"]
+verified_on = "2026-09-30"
+
+[[rule]]
+id = "amd-installer-files"
+owner = "AMD 驱动安装程序"
+category = "installer"
+tier = "review"
+lose_kind = "repair"
+kind = "dir"
+match = ['%SystemDrive%\AMD']
+what = "AMD 驱动安装程序解压出来的文件（本机是芯片组驱动 Chipset_Software）"
+why = "AMD 的芯片组 / 显卡驱动安装程序运行时先把驱动文件解压到 C:\\AMD，再装进系统，装完不会自动删。本机这里是 Chipset_Software：Binaries 和 Packages 是各个驱动（PSP、I2C、GPIO 等）的安装文件，Logs 是安装日志"
+lose = "装好的驱动不受影响（系统用的是另存在 System32\\DriverStore 里的那一份）；以后想重装、修复或回滚这一版驱动时要重新去 AMD 官网下载，安装日志也会一起没掉。"
+how = "delete"
+how_detail = "确认驱动已经装好、电脑工作正常后再删；以后需要时去 AMD 官网按主板芯片组或显卡型号重新下载安装包。"
+refs = [
+  "https://www.amd.com/en/support/download/drivers.html",
+  "https://learn.microsoft.com/en-us/windows-hardware/drivers/install/driver-store",
+]
+verified_on = "2026-09-30"

@@ -15,6 +15,10 @@
 //! - `get_settings` / `save_settings(settings)` -> LLM 设置（%LOCALAPPDATA%\DiskWhy\settings.json）
 //! - `test_llm(settings)` -> 连接测试结果文本
 //! - `ask_ai(path)`       -> Explanation（source = Llm，tier = review），只在用户点“问 AI”时调用
+//! - `get_ui_prefs` / `set_ui_prefs(prefs)` -> 界面偏好（主题 A / B / C），存在 %LOCALAPPDATA%\DiskWhy\ui.json
+//!
+//! 阶段 F：`ScanSummary.candidates` = 清理页的候选（按规则 / 启发式分组，见 `diskwhy_core::explain::candidates`），
+//! 扫描、打开快照、清理 / 还原后的刷新都会重新算。
 //!
 //! 阶段 D（带护栏的动作，逻辑全在 `diskwhy_core::action`）：
 //! - `action_env`         -> 盘符 + 隔离区批次（超过 7 天的个数）+ 日志位置
@@ -35,6 +39,7 @@ use diskwhy_core::action::quarantine::{self, BatchInfo, PurgeReport, RestoreRepo
 use diskwhy_core::action::refresh::RefreshReport;
 use diskwhy_core::action::{self, ExecOptions, ExecProgress, ExecReport, Plan, PlanRequest, PreflightOptions, PreflightReport, Strategy};
 use diskwhy_core::explain::llm::{self, LlmSettings};
+use diskwhy_core::explain::candidates::{cleanup_candidates, CandidateGroup};
 use diskwhy_core::explain::{tier_summary, ExplainCtx, Explanation, Target, TierSummary};
 use diskwhy_core::scan::scan;
 use diskwhy_core::snapshot::{self, SnapshotMeta};
@@ -141,9 +146,19 @@ struct ScanSummary {
     mapped_dirs: Vec<MappedDir>,
     /// 结果来自快照时不为空。
     snapshot: Option<SnapshotInfo>,
+    /// 清理页的候选（阶段 F）。
+    candidates: Vec<CandidateGroup>,
 }
 
-fn summarize(r: &ScanResult, tiers: TierSummary, snapshot: Option<SnapshotInfo>) -> ScanSummary {
+/// 各档合计 + 清理候选（扫描 / 打开快照 / 动作后的刷新共用）。
+fn analyze(tree: &diskwhy_core::Node, ctx: &ExplainCtx) -> (TierSummary, Vec<CandidateGroup>) {
+    let tiers = tier_summary(tree, ctx);
+    let p = protector();
+    let candidates = cleanup_candidates(tree, ctx, &|path: &str| p.check(path).is_some());
+    (tiers, candidates)
+}
+
+fn summarize(r: &ScanResult, (tiers, candidates): (TierSummary, Vec<CandidateGroup>), snapshot: Option<SnapshotInfo>) -> ScanSummary {
     ScanSummary {
         root: r.root.clone(),
         total_bytes: r.total_bytes,
@@ -162,6 +177,7 @@ fn summarize(r: &ScanResult, tiers: TierSummary, snapshot: Option<SnapshotInfo>)
         tiers,
         mapped_dirs: r.mapped_dirs.clone(),
         snapshot,
+        candidates,
     }
 }
 
@@ -203,7 +219,7 @@ async fn start_scan(
         let r = scan(&root, &ScanOptions::default(), &cancel, |p| {
             let _ = on_progress.send(p.clone());
         })?;
-        let tiers = tier_summary(&r.tree, &ctx);
+        let tiers = analyze(&r.tree, &ctx);
         Ok::<_, diskwhy_core::ScanError>((r, tiers))
     })
     .await;
@@ -323,7 +339,7 @@ async fn open_snapshot(path: Option<String>, app: AppHandle, state: State<'_, Ap
         let p2 = p.clone();
         let (r, meta) = snapshot::with_big_stack(move || snapshot::load(&p2))?;
         let load_ms = t.elapsed().as_millis() as u64;
-        let tiers = tier_summary(&r.tree, &ctx);
+        let tiers = analyze(&r.tree, &ctx);
         let info = SnapshotInfo { path: p.display().to_string(), meta, load_ms };
         Ok::<_, String>(Some((r, tiers, info)))
     })
@@ -392,6 +408,44 @@ async fn ask_ai(path: String, state: State<'_, AppState>) -> Result<Explanation,
     })
     .await
     .map_err(|e| format!("AI 线程异常：{e}"))?
+}
+
+// ───────────────────────── 阶段 F：界面偏好 ─────────────────────────
+
+/// 界面偏好。`theme`：A 浅色 / B 深色 / C 趣味；None = 还没选过（前端按系统深浅色给默认值再存）。
+#[derive(Serialize, serde::Deserialize, Default, Clone)]
+struct UiPrefs {
+    #[serde(default)]
+    theme: Option<String>,
+}
+
+fn ui_prefs_path() -> Option<PathBuf> {
+    llm::app_data_dir().map(|d| d.join("ui.json"))
+}
+
+#[tauri::command]
+fn get_ui_prefs() -> UiPrefs {
+    let Some(p) = ui_prefs_path() else { return UiPrefs::default() };
+    let mut prefs: UiPrefs = std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    if !matches!(prefs.theme.as_deref(), Some("A" | "B" | "C")) {
+        prefs.theme = None;
+    }
+    prefs
+}
+
+#[tauri::command]
+fn set_ui_prefs(prefs: UiPrefs) -> Result<(), String> {
+    if let Some(t) = prefs.theme.as_deref() {
+        if !matches!(t, "A" | "B" | "C") {
+            return Err(format!("不认识的主题：{t}"));
+        }
+    }
+    let p = ui_prefs_path().ok_or("找不到 %LOCALAPPDATA%")?;
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(&prefs).map_err(|e| e.to_string())?;
+    std::fs::write(&p, text).map_err(|e| format!("写 {} 失败：{e}", p.display()))
 }
 
 // ───────────────────────── 阶段 D：带护栏的动作 ─────────────────────────
@@ -473,7 +527,7 @@ fn refresh_after(state: &AppState, ctx: &ExplainCtx, dirs: &[String]) -> (Refres
         let r = Arc::make_mut(&mut arc);
         action::refresh::refresh_dirs(r, dirs)
     };
-    let tiers = tier_summary(&arc.tree, ctx);
+    let tiers = analyze(&arc.tree, ctx);
     let snap = state.snapshot.lock().unwrap().clone();
     let summary = summarize(&arc, tiers, snap);
     *state.result.lock().unwrap() = Some(arc);
@@ -684,7 +738,9 @@ pub fn run() {
             open_system_settings,
             pick_scan_folder,
             pick_folder,
-            startup_scan_dir
+            startup_scan_dir,
+            get_ui_prefs,
+            set_ui_prefs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

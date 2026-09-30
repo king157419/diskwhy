@@ -14,7 +14,7 @@
 
 use super::pattern::split_lower;
 use super::registry::{normalize_name, InstalledApp};
-use super::{gain, Category, ExplainCtx, Explanation, How, Source, Target, Tier};
+use super::{gain, Category, ExplainCtx, Explanation, How, LoseKind, Source, Target, Tier};
 use crate::model::{Node, NodeKind};
 use crate::view::human_bytes;
 use std::collections::{HashMap, HashSet};
@@ -271,11 +271,35 @@ pub(super) struct Hint {
     pub(super) confidence: f32,
     pub(super) owner: Option<String>,
     pub(super) clues: Vec<String>,
+    /// 删了最坏会怎样。构造时一般留 None，[`finish`] 按 [`heuristic_lose_kind`] 补上。
+    pub(super) lose_kind: Option<LoseKind>,
+}
+
+/// 启发式结果的后果类型：按启发式的名字逐个指定（不按文案关键词猜）。
+/// review 档一定返回 Some；认不出的名字按“需你确认”算。keep 档只在有明确说法时返回。
+pub fn heuristic_lose_kind(name: &str, tier: Tier) -> Option<LoseKind> {
+    use LoseKind::*;
+    let k = match name {
+        "rust-target" | "dotnet-build" | "steam-cache" => Slower,
+        "node-modules" | "model-weights" | "downloaded-installer" | "ollama-models-dir" | "gradle-cache" | "gradle-home"
+        | "flutter-cache" | "pub-cache" | "steam-workshop" | "conda-pkgs" | "pnpm-store" => Redownload,
+        "python-venv" | "python-env" | "python-runtime" | "flutter-sdk" | "visual-studio-install" | "app-install-elsewhere"
+        | "android-sdk-part" | "android-sdk" | "conda-env" | "conda-base" => Reinstall,
+        "driver-packages" => Repair,
+        "game-highlights" | "media-files" | "android-avd" | "android-user-home" | "chat-files-cache" | "chat-files"
+        | "chat-files-container" | "user-projects" | "conda-envs" | "conda-root" => Irreversible,
+        // 虚拟机 / 虚拟磁盘、日志、临时文件、Chromium 缓存、注册表归属、容器类：说不准，交给你确认。
+        _ if tier == Tier::Review => Unsure,
+        "virtual-disk" | "vm-hyperv" | "vm-vmware" | "vm-virtualbox" => Unsure,
+        _ => return None,
+    };
+    Some(k)
 }
 
 /// 统一收尾：档位兜底（绝不 safe）、能腾多少、年龄提示。
 fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explanation {
     let tier = if h.tier == Tier::Safe { Tier::Review } else { h.tier };
+    let lose_kind = h.lose_kind.or_else(|| heuristic_lose_kind(h.name, tier));
     let (gain_bytes, gain_note) = gain(tier, &h.how, t.node.allocated);
     let mut notes = vec!["这是 DiskWhy 根据文件夹的名字和内容推测的，不是规则库里核实过的说法，所以绝不会标成“可放心清理”。".to_string()];
     let newest = if stats.newest_mtime > 0 { stats.newest_mtime } else { t.node.mtime };
@@ -290,6 +314,7 @@ fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explan
         what: h.what,
         why: h.why,
         lose: h.lose,
+        lose_kind,
         how: h.how,
         how_detail: h.how_detail,
         gain_bytes,
@@ -352,6 +377,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
                 confidence: 0.7,
                 owner: None,
                 clues: vec![if new_fmt { "里面有 Cache_Data\\index（Chromium 新版缓存格式）".into() } else { "里面有 index 和 data_0/data_1（Chromium 老版缓存格式）".into() }],
+                lose_kind: None,
             });
         }
     }
@@ -378,6 +404,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
                 confidence: 0.75,
                 owner: None,
                 clues: vec![if has_cfg { "里面有 pyvenv.cfg".into() } else { format!("文件夹名是 {}，里面有 site-packages", n.name) }],
+                lose_kind: None,
             });
         }
         if site || conda {
@@ -393,6 +420,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
                 confidence: 0.6,
                 owner: None,
                 clues: vec![if conda { "里面有 conda-meta（conda 环境的标志）".into() } else { "里面有 site-packages（Python 装库的地方）".into() }],
+                lose_kind: None,
             });
         }
     }
@@ -411,6 +439,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.75,
             owner: None,
             clues: vec!["文件夹叫 node_modules，旁边有 package.json".into()],
+            lose_kind: None,
         });
     }
 
@@ -428,6 +457,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.8,
             owner: None,
             clues: vec!["文件夹叫 target，旁边有 Cargo.toml".into()],
+            lose_kind: None,
         });
     }
 
@@ -448,6 +478,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
                     confidence: 0.75,
                     owner: None,
                     clues: vec![format!("bin 和 obj 同时存在，旁边有 {proj}")],
+                    lose_kind: None,
                 });
             }
         }
@@ -469,6 +500,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.6,
             owner: None,
             clues: vec![format!("模型类文件（.safetensors/.gguf/.onnx/.pt/.bin 等）占 {}，最大的单个 {}", pct(model_share), human_bytes(model_big))],
+            lose_kind: None,
         });
     }
 
@@ -487,6 +519,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.7,
             owner: None,
             clues: vec![format!("虚拟磁盘文件（.vhdx/.vhd/.vmdk/.qcow2）占 {}", pct(vd_share))],
+            lose_kind: None,
         });
     }
 
@@ -505,6 +538,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.6,
             owner: None,
             clues: vec![format!(".log/.etl/.dmp 占 {}", pct(log_share))],
+            lose_kind: None,
         });
     }
 
@@ -528,6 +562,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
                     confidence: 0.6,
                     owner: None,
                     clues: vec![format!("在“下载”文件夹里，.iso/.msi/.exe 占 {}", pct(inst_share))],
+                    lose_kind: None,
                 });
             }
         }
@@ -552,6 +587,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.55,
             owner: None,
             clues: vec![format!(".tmp 文件占 {}", pct(tmp_share))],
+            lose_kind: None,
         });
     }
 
@@ -571,6 +607,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.5,
             owner: None,
             clues: vec![format!("媒体文件占 {}（主要是 {}）", pct(media_share), top.join("、"))],
+            lose_kind: None,
         });
     }
     None
@@ -728,6 +765,7 @@ fn registry_owner(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.7,
             owner: Some(label),
             clues: vec!["路径落在注册表里登记的安装目录之下".into()],
+            lose_kind: None,
         });
     }
     // 在 Program Files / AppData\Local\Programs 下：这是程序文件夹，不是“数据”。
@@ -749,6 +787,7 @@ fn registry_owner(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.5,
             owner: Some(label),
             clues: vec![format!("在程序安装目录下，文件夹名和注册表里已安装软件的{}对得上", if g.via.starts_with("发布者") { "发布者" } else { "名字" })],
+            lose_kind: None,
         });
     }
     if g.via == "发布者（多个）" {
@@ -769,6 +808,7 @@ fn registry_owner(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
             confidence: 0.4,
             owner: Some(g.name.clone()),
             clues: vec![format!("文件夹名和注册表里的发布者「{publisher}」对得上；这家装了：{}", names.iter().take(6).copied().collect::<Vec<_>>().join("、"))],
+            lose_kind: None,
         });
     }
     Some(Hint {
@@ -783,6 +823,7 @@ fn registry_owner(t: &Target, ctx: &ExplainCtx) -> Option<Hint> {
         confidence: 0.5,
         owner: Some(label),
         clues: vec![format!("文件夹名和注册表里已安装软件的{}对得上", if g.via == "发布者" { "发布者" } else { "名字" })],
+        lose_kind: None,
     })
 }
 
@@ -829,6 +870,7 @@ pub fn unknown(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Explanation {
         what: "我也不确定这是什么".into(),
         why: "规则库里没有它，内容上也没看出明显特征。".into(),
         lose: "不知道。在弄清楚之前请不要删——可以根据下面的线索搜一下文件夹名，或者点“问 AI”让 AI 猜一猜。".into(),
+        lose_kind: Some(LoseKind::Unsure),
         how,
         how_detail: "先弄清楚是哪个软件的：搜索文件夹名、看看里面的文件，或者问 AI。".into(),
         gain_bytes: 0,

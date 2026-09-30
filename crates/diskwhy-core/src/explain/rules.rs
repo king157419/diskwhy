@@ -7,6 +7,7 @@
 //! owner = "npm"
 //! category = "cache"      # cache | log | installer | build | model | userdata | system | vm | trash | app
 //! tier = "safe"           # safe | review | keep
+//! lose_kind = "slower"    # review 档必填：删了最坏会怎样（见下）
 //! match = ["%LOCALAPPDATA%\\npm-cache"]   # %ENV%、* 和 ** 通配；大小写不敏感
 //! what = "..."  why = "..."  lose = "..."
 //! how = "delete"          # 或数组：delete | builtin_tool | migrate | manual | none
@@ -20,13 +21,19 @@
 //! owner_from_path = false # true 时用注册表 / 文件夹名推断具体是哪个软件
 //! ```
 //!
+//! `lose_kind`（界面上的后果标签，一项只挂一个，按最坏的选）：
+//! irreversible（找不回来）> repair（影响修复）> unsure（需你确认）> reinstall（要重装）>
+//! relogin（要重登录）> feature（功能变少）> redownload（要重下载）> slower（删了变慢）。
+//! `review` 档必须写；`safe` / `keep` 可以不写。写了不认识的值就是错误。
+//!
 //! 校验（[`validate`]）：字段齐全、枚举合法、id 唯一、模式以白名单环境变量开头、
 //! `safe` 不许落在桌面/文档/图片/视频/音乐/下载/OneDrive 之下、`keep` 不许 `how = delete`、
-//! `builtin_tool`/`migrate` 必须写 `how_detail`、`verified_on` 是 YYYY-MM-DD。
+//! `builtin_tool`/`migrate` 必须写 `how_detail`、`verified_on` 是 YYYY-MM-DD、
+//! `review` 必须写合法的 `lose_kind`。
 
 use super::env::{self, EnvMap};
 use super::pattern::{split_lower, Pattern};
-use super::{Category, How, Tier};
+use super::{Category, How, LoseKind, Tier};
 use crate::model::{Node, NodeKind};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -80,6 +87,9 @@ pub struct RuleDef {
     pub what: String,
     pub why: String,
     pub lose: String,
+    /// 删了最坏会怎样（字符串，校验时转成 [`LoseKind`]，不认识的值报错）。
+    #[serde(default)]
+    pub lose_kind: Option<String>,
     how: OneOrMany,
     pub how_detail: String,
     pub refs: Vec<String>,
@@ -121,6 +131,7 @@ pub struct Rule {
     pub what: String,
     pub why: String,
     pub lose: String,
+    pub lose_kind: Option<LoseKind>,
     pub how: Vec<How>,
     pub how_detail: String,
     pub refs: Vec<String>,
@@ -193,6 +204,14 @@ pub fn validate(def: &RuleDef, seen_ids: &mut HashSet<String>) -> Vec<String> {
         if v.trim().is_empty() {
             e.push(format!("{name} 为空"));
         }
+    }
+    match def.lose_kind.as_deref() {
+        Some(k) if LoseKind::parse(k).is_none() => {
+            let all: Vec<&str> = LoseKind::ALL.iter().map(|x| x.as_str()).collect();
+            e.push(format!("lose_kind `{k}` 不认识（只能是 {}）", all.join(" / ")));
+        }
+        None if def.tier == Tier::Review => e.push("review 档必须写 lose_kind（删了最坏会怎样）".into()),
+        _ => {}
     }
     if def.category == Category::Unknown {
         e.push("category 不能是 unknown".into());
@@ -293,6 +312,7 @@ impl RuleSet {
             what: def.what,
             why: def.why,
             lose: def.lose,
+            lose_kind: def.lose_kind.as_deref().and_then(LoseKind::parse),
             how,
             how_detail: def.how_detail,
             refs: def.refs,

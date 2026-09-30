@@ -8,6 +8,7 @@
 //! 4. LLM 兜底（[`llm`]）只在用户点“问 AI”时调用，不在这里自动跑。
 
 pub mod big_items;
+pub mod candidates;
 pub mod env;
 pub mod heuristics;
 pub mod llm;
@@ -53,6 +54,62 @@ pub enum Category {
     Unknown,
 }
 
+/// 删了最坏会怎样（界面上的“后果标签”）。一项只挂一个，取最坏的那个。
+///
+/// 声明顺序就是严重程度（从最坏到最轻），所以 `Ord` 比较时越小越坏：
+/// 找不回来 > 影响修复 > 需你确认 > 要重装 > 要重登录 > 功能变少 > 要重下载 > 删了变慢。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoseKind {
+    /// 删了就没了 / 可能丢本机独有的内容。
+    Irreversible,
+    /// 以后卸载 / 修复 / 回滚会失败或要重新下安装包。
+    Repair,
+    /// 规则自己也说不准，或者里面混着能删和不能删的。
+    Unsure,
+    /// 删了这个工具 / 扩展就用不了，要重新装。
+    Reinstall,
+    /// 要重新登录、丢本地设置（数据在云端）。
+    Relogin,
+    /// 某个功能会关掉或暂时不能用。
+    Feature,
+    /// 能下回来，但很大、很慢。
+    Redownload,
+    /// 会自动重建，只是下次要等。
+    Slower,
+}
+
+impl LoseKind {
+    pub const ALL: [LoseKind; 8] = [
+        LoseKind::Irreversible,
+        LoseKind::Repair,
+        LoseKind::Unsure,
+        LoseKind::Reinstall,
+        LoseKind::Relogin,
+        LoseKind::Feature,
+        LoseKind::Redownload,
+        LoseKind::Slower,
+    ];
+
+    /// TOML / JSON 里的写法（snake_case）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoseKind::Irreversible => "irreversible",
+            LoseKind::Repair => "repair",
+            LoseKind::Unsure => "unsure",
+            LoseKind::Reinstall => "reinstall",
+            LoseKind::Relogin => "relogin",
+            LoseKind::Feature => "feature",
+            LoseKind::Redownload => "redownload",
+            LoseKind::Slower => "slower",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LoseKind> {
+        LoseKind::ALL.into_iter().find(|k| k.as_str() == s.trim())
+    }
+}
+
 /// 该怎么腾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +149,9 @@ pub struct Explanation {
     pub what: String,
     pub why: String,
     pub lose: String,
+    /// 删了最坏会怎样（review 档一定有；safe 可能没有；keep 可以没有）。
+    #[serde(default)]
+    pub lose_kind: Option<LoseKind>,
     pub how: Vec<How>,
     pub how_detail: String,
     /// 能腾出的字节（safe/review 且可删时 = 实际占用；keep 为 0）。
@@ -376,6 +436,11 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
     };
     let how = rule.how.clone();
     let (gain_bytes, gain_note) = gain(tier, &how, t.node.allocated);
+    // safe 规则因为落在个人文件夹下被降成 review 时，规则本身没写后果类型：按“需你确认”算。
+    let lose_kind = match (tier, rule.lose_kind) {
+        (Tier::Review, None) => Some(LoseKind::Unsure),
+        (_, k) => k,
+    };
     Explanation {
         tier,
         owner,
@@ -383,6 +448,7 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         what: rule.what.clone(),
         why: rule.why.clone(),
         lose: rule.lose.clone(),
+        lose_kind,
         how,
         how_detail: rule.how_detail.clone(),
         gain_bytes,

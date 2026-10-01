@@ -151,3 +151,84 @@ describe("collapseChain（外壳文件夹合并）", () => {
     expect(collapseChain(e).node).toBe(e);
   });
 });
+
+import { tileBox, type TileTokens } from "./treemap";
+
+describe("tileBox（阶段 I：圆角 / 描边 / 投影按块大小收敛）", () => {
+  const C: TileTokens = { gap: 4, r: 6, bw: 2, shadow: 4, flatPx: 16, shadowMinPx: 48, patternMinPx: 24 };
+
+  it("圆角 = min(主题上限, w/4, h/4)，大块封顶在主题上限", () => {
+    expect(tileBox({ x: 0, y: 0, w: 204, h: 104 }, C, false).r).toBe(6);
+    const b = tileBox({ x: 0, y: 0, w: 24, h: 60 }, C, false); // 块面 20×56
+    expect(b.w).toBe(20);
+    expect(b.r).toBe(5);
+    expect(tileBox({ x: 0, y: 0, w: 22, h: 22 }, C, false).r).toBe(4); // 18 / 4 → 4
+  });
+
+  it("最短边 < 16px 画平块：没有描边 / 圆角 / 投影 / 条纹", () => {
+    const b = tileBox({ x: 10, y: 10, w: 19, h: 80 }, C);
+    expect(b).toMatchObject({ w: 15, flat: true, r: 0, bw: 0, shadow: 0, pattern: false });
+  });
+
+  it("投影只给 ≥ 48px 的块，而且画在格子里面：块面 + 投影 + 间隙 = 格子，不会压到邻块", () => {
+    const small = tileBox({ x: 0, y: 0, w: 50, h: 40 }, C);
+    expect(small.shadow).toBe(0);
+    const cell = { x: 100.4, y: 50.6, w: 200.3, h: 120.2 };
+    const b = tileBox(cell, C);
+    expect(b.shadow).toBe(4);
+    expect(b.x + b.w + b.shadow + C.gap).toBe(Math.round(cell.x + cell.w));
+    expect(b.y + b.h + b.shadow + C.gap).toBe(Math.round(cell.y + cell.h));
+  });
+
+  it("像素对齐后相邻格子之间的空隙处处一样宽", () => {
+    const xs = [0, 33.3, 66.7, 101.2];
+    for (let i = 0; i + 1 < xs.length; i++) {
+      const a = tileBox({ x: xs[i], y: 0, w: xs[i + 1] - xs[i], h: 30 }, { ...C, shadow: 0 });
+      const n = tileBox({ x: xs[i + 1], y: 0, w: 40, h: 30 }, { ...C, shadow: 0 });
+      expect(n.x - (a.x + a.w)).toBe(C.gap);
+    }
+  });
+
+  it("斜条纹只在块面 ≥ 24px 时出现", () => {
+    expect(tileBox({ x: 0, y: 0, w: 30, h: 30 }, C, false).pattern).toBe(true); // 26
+    expect(tileBox({ x: 0, y: 0, w: 26, h: 30 }, C, false).pattern).toBe(false); // 22
+  });
+});
+
+describe("尾巴合并（阶段 I）", () => {
+  // 一个文件夹：几个大子项 + 一长串越来越小的尾巴（像 Windows / Program Files 那样）
+  const kids: TmInput[] = [
+    { key: "a", name: "a", value: 5000 },
+    { key: "b", name: "b", value: 2500 },
+    { key: "c", name: "c", value: 1200 },
+    ...Array.from({ length: 60 }, (_, i) => ({ key: `t${i}`, name: `t${i}`, value: 300 / (i + 1) })),
+  ];
+  const total = kids.reduce((s, k) => s + k.value, 0);
+  const tree: TmInput = { key: "r", name: "r", value: total, children: kids };
+  const rect = { x: 0, y: 0, w: 300, h: 200 };
+
+  it("太小的尾巴整段并成唯一一个“其他 N 项”，剩下的块都 ≥ minPx，且“其他”之外的块都比被并掉的大", () => {
+    const items = layoutTreemap(tree, rect, { ...DEFAULT_LAYOUT, minPx: 8 });
+    const others = items.filter((i) => i.kind === "other");
+    expect(others).toHaveLength(1);
+    const o = others[0];
+    expect(o.name).toBe(`其他 ${o.mergedCount} 项`);
+    expect(o.mergedCount).toBeGreaterThan(10);
+    const nodes = items.filter((i) => i.kind === "node");
+    expect(nodes.length + o.mergedCount).toBe(kids.length);
+    for (const it of items) expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(8 - EPS);
+    // 是“尾巴”：留下来的块的最小值 > 被合并的块的最大值
+    const kept = new Set(nodes.map((n) => n.key));
+    const minKept = Math.min(...kids.filter((k) => kept.has(k.key)).map((k) => k.value));
+    const maxMerged = Math.max(...kids.filter((k) => !kept.has(k.key)).map((k) => k.value));
+    expect(minKept).toBeGreaterThan(maxMerged);
+    expect(o.value).toBeCloseTo(kids.filter((k) => !kept.has(k.key)).reduce((s, k) => s + k.value, 0), 6);
+  });
+
+  it("“其他”自己也太小时不画，也不留空洞：兄弟块铺满整个格子", () => {
+    const t2: TmInput = { key: "r", name: "r", value: 1000.01, children: [{ key: "a", name: "a", value: 600 }, { key: "b", name: "b", value: 400 }, { key: "z", name: "z", value: 0.01 }] };
+    const items = layoutTreemap(t2, rect);
+    expect(items.some((i) => i.kind === "other" || i.key === "z")).toBe(false);
+    expect(items.reduce((s, i) => s + area(i.rect), 0)).toBeCloseTo(area(rect), 6);
+  });
+});

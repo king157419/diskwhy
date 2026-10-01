@@ -1,11 +1,13 @@
 <script setup lang="ts">
 // 方块图（阶段 F 改成 DOM 绘制，好让三套主题的描边 / 圆角 / 斜条纹全部由 CSS token 决定）。
+// 阶段 I：每块的圆角 / 描边 / 投影按块大小收敛（treemap.ts 的 tileBox），间隙等数值来自 tokens.css 的 --tm-*。
 // 布局仍是 src/treemap.ts 的 squarified + 嵌套：两层（当前文件夹的子项 → 它们的子项），颜色 = 三档，
 // 认不出来 / 合并的“其他”画成混合色。单击选中一个顶层块（右边列表跟着变），双击进入。
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { tmKey, type ScanSummary, type TreemapNode } from "../api";
 import { isHardTag, loseTag } from "../labels";
-import { collapseChain, layoutTreemap, type TmInput, type TmItem } from "../treemap";
+import { collapseChain, layoutTreemap, tileBox, type TileBox, type TileTokens, type TmInput, type TmItem } from "../treemap";
+import { theme } from "../theme";
 import { sizeParts } from "../capacity";
 
 const props = defineProps<{
@@ -23,10 +25,36 @@ onMounted(() => {
   if (!wrap.value) return;
   const upd = () => (size.value = { w: wrap.value!.clientWidth, h: wrap.value!.clientHeight });
   upd();
+  readTokens();
   ro = new ResizeObserver(upd);
   ro.observe(wrap.value);
 });
 onBeforeUnmount(() => ro?.disconnect());
+
+// ── 设计令牌（tokens.css 的 --tm-*）：间隙、圆角上限、描边、投影都由主题决定，切主题时重读 ──
+const tk = ref({ gap: 3, r: 3, bw: 0, shadow: 0, gR: 4, gBw: 1, head: 26 });
+function readTokens() {
+  if (!wrap.value) return;
+  const cs = getComputedStyle(wrap.value);
+  const px = (name: string, d: number) => {
+    const v = parseFloat(cs.getPropertyValue(name));
+    return Number.isFinite(v) ? v : d;
+  };
+  tk.value = {
+    gap: px("--tm-gap", 3),
+    r: px("--tm-r", 3),
+    bw: px("--tm-bw", 0),
+    shadow: px("--tm-shadow", 0),
+    gR: px("--tm-g-r", 4),
+    gBw: px("--tm-g-bw", 1),
+    head: px("--tm-head", 26),
+  };
+}
+watch(theme, () => nextTick(readTokens));
+/** 小于 16px 画平块；小于 48px 不画投影；小于 24px 斜条纹改纯色 */
+const FLAT_PX = 16;
+const SHADOW_MIN_PX = 48;
+const PATTERN_MIN_PX = 24;
 
 const PSEUDO: Record<string, string> = { inacc: "无权限", sysest: "系统保留", unattr: "未归属", cloud: "云端占位" };
 
@@ -64,13 +92,44 @@ const root = computed<TmInput | null>(() => {
   return r;
 });
 
-const G = 3;
 const items = computed<TmItem[]>(() => {
   const r = root.value;
   const { w, h } = size.value;
+  const t = tk.value;
+  const G = t.gap;
   if (!r || w < 20 || h < 20) return [];
-  return layoutTreemap(r, { x: 0, y: 0, w: w + G, h: h + G }, { minPx: 8, maxDepth: 2, headerPx: 26, pad: 4, minContainerPx: 90 });
+  // 整张图多铺一个间隙，最右 / 最下的块扣掉间隙后正好贴边。
+  // 容器内边距：左 = 描边 + 间隙；右 / 下 = 间隙 + 投影 + 描边（容器的块面已经扣掉了间隙和投影），子块四周的空隙都 = 间隙。
+  return layoutTreemap(r, { x: 0, y: 0, w: w + G, h: h + G }, {
+    minPx: 8,
+    maxDepth: 2,
+    headerPx: t.head,
+    pad: t.gBw + G,
+    padEnd: G + t.shadow + t.gBw,
+    minContainerPx: 90,
+  });
 });
+
+const tiles = computed<{ it: TmItem; b: TileBox }[]>(() => {
+  const t = tk.value;
+  const leaf: TileTokens = { gap: t.gap, r: t.r, bw: t.bw, shadow: t.shadow, flatPx: FLAT_PX, shadowMinPx: SHADOW_MIN_PX, patternMinPx: PATTERN_MIN_PX };
+  const group: TileTokens = { ...leaf, r: t.gR, bw: t.gBw, flatPx: 0 };
+  // 投影只给顶层块（容器 / 顶层大块），里面的小块只有描边
+  return items.value.map((it) => ({ it, b: tileBox(it.rect, it.container ? group : leaf, it.depth === 1) }));
+});
+
+function boxStyle(b: TileBox, group: boolean) {
+  const s: Record<string, string> = {
+    left: b.x + "px",
+    top: b.y + "px",
+    width: b.w + "px",
+    height: b.h + "px",
+    borderRadius: b.r + "px",
+    boxShadow: b.shadow ? `${b.shadow}px ${b.shadow}px 0 var(--stroke, var(--ink))` : "none",
+  };
+  if (!group) s.borderWidth = b.bw + "px";
+  return s;
+}
 
 function nodeOf(it: TmItem): TreemapNode | null {
   const x = it.ref as TreemapNode | { pseudo: string } | undefined;
@@ -128,11 +187,12 @@ const tip = computed(() => {
   };
 });
 
-function label(it: TmItem): "full" | "size" | "none" {
-  const w = it.rect.w - G;
-  const h = it.rect.h - G;
+function label(b: TileBox): "full" | "size" | "none" {
+  if (b.flat) return "none";
+  const { w, h } = b;
   if (w > 62 && h > 40) return "full";
-  if (w > 40 && h > 22) return "size";
+  // 内边距 7 + 描边 2 + 一行字约 16px：低于 30px 的块写数字会被截掉半行，干脆不写
+  if (w > 40 && h >= 30) return "size";
   return "none";
 }
 function gb(v: number) {
@@ -142,12 +202,12 @@ function gb(v: number) {
 
 <template>
   <div ref="wrap" class="map" @mouseleave="hover = null">
-    <template v-for="it in items" :key="it.key">
+    <template v-for="{ it, b } in tiles" :key="it.key">
       <div
         v-if="it.container"
         class="g"
         :class="{ sel: nodeOf(it)?.path === focusPath }"
-        :style="{ left: it.rect.x + 'px', top: it.rect.y + 'px', width: it.rect.w - G + 'px', height: it.rect.h - G + 'px' }"
+        :style="boxStyle(b, true)"
         role="button"
         tabindex="0"
         :aria-label="'方块 ' + it.name"
@@ -161,8 +221,18 @@ function gb(v: number) {
       <div
         v-else
         class="lf"
-        :class="[tone(it), { big: it.rect.w > 150 && it.rect.h > 70, hov: hover?.key === it.key, sel: it.depth === 1 && nodeOf(it)?.path === focusPath }]"
-        :style="{ left: it.rect.x + 'px', top: it.rect.y + 'px', width: it.rect.w - G + 'px', height: it.rect.h - G + 'px' }"
+        :class="[
+          tone(it),
+          {
+            big: b.w > 150 && b.h > 70,
+            flat: b.flat,
+            bare: label(b) === 'none',
+            solid: !b.pattern,
+            hov: hover?.key === it.key,
+            sel: it.depth === 1 && nodeOf(it)?.path === focusPath,
+          },
+        ]"
+        :style="boxStyle(b, false)"
         role="button"
         tabindex="-1"
         :aria-label="'方块 ' + it.name"
@@ -170,10 +240,10 @@ function gb(v: number) {
         @dblclick="onDbl(it)"
         @mousemove="onMove($event, it)"
       >
-        <template v-if="label(it) === 'full'">
+        <template v-if="label(b) === 'full'">
           <span class="a">{{ it.name }}</span><span class="b num">{{ gb(it.value) }} GB</span>
         </template>
-        <span v-else-if="label(it) === 'size'" class="b num">{{ gb(it.value) }}</span>
+        <span v-else-if="label(b) === 'size'" class="b num">{{ gb(it.value) }}</span>
       </div>
     </template>
     <div v-if="tip" class="tip" :style="{ left: tipPos.x + 'px', top: tipPos.y + 'px' }">
@@ -193,7 +263,7 @@ function gb(v: number) {
 .g {
   position: absolute;
   background: var(--surface);
-  border: 1px solid var(--line);
+  border: var(--tm-g-bw) solid var(--line);
   cursor: pointer;
   transition: border-color var(--dur-1) var(--ease);
 }
@@ -222,25 +292,21 @@ function gb(v: number) {
   border: 2px solid var(--ink);
   z-index: 2;
 }
-[data-theme="A"] .g {
-  border-radius: 4px;
-}
 [data-theme="B"] .g {
   background: #1a1612;
   border-color: #2a241e;
-  border-radius: 6px;
 }
 [data-theme="B"] .g.sel {
   border-color: var(--accent);
 }
 [data-theme="C"] .g {
-  border: 2px solid #141412;
-  border-radius: 10px;
+  border-color: #141412;
   background: #fff;
 }
+/* 卡通：顶层块本来就带硬投影（画在格子里面），选中 = 加粗描边 + 标题栏涂亮色 */
 [data-theme="C"] .g.sel {
   border-width: 3px;
-  box-shadow: 5px 5px 0 #141412;
+  background: linear-gradient(var(--accent) 0 calc(var(--tm-head) - 3px), #fff 0);
 }
 [data-theme="C"] .g .gh {
   font-family: var(--heading);
@@ -268,6 +334,14 @@ function gb(v: number) {
   display: block;
   opacity: 0.8;
 }
+/* 没有文字的块不留内边距；平块（最短边 < 16px）连描边也没有。
+   不然 border-box 下 padding + 描边会把小块撑成至少 20×18，配上圆角就成了圆 / 药丸，还压到邻块 */
+.lf.bare {
+  padding: 0;
+}
+.lf.flat {
+  border-width: 0 !important;
+}
 .lf.big .a {
   font-size: 15px;
 }
@@ -290,12 +364,6 @@ function gb(v: number) {
   background: var(--keep2);
   color: var(--ink2);
 }
-[data-theme="A"] .lf {
-  border-radius: 3px;
-}
-[data-theme="B"] .lf {
-  border-radius: 4px;
-}
 [data-theme="B"] .lf.safe {
   background: #e4bc70;
   color: #241a0d;
@@ -313,11 +381,12 @@ function gb(v: number) {
   color: var(--ink3);
 }
 [data-theme="C"] .lf {
-  border: 2px solid #141412;
-  border-radius: 8px;
+  border-style: solid;
+  border-color: #141412;
   color: #141412;
 }
-[data-theme="C"] .lf.mix {
+/* 斜条纹只给 ≥ 24px 的块，小块用纯浅色，免得一片噪点 */
+[data-theme="C"] .lf.mix:not(.solid) {
   background: repeating-linear-gradient(135deg, #f4f0e6 0 5px, #e6e1d5 5px 10px);
 }
 .lf.hov {

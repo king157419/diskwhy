@@ -129,8 +129,10 @@ export interface LayoutOptions {
   maxDepth: number;
   /** 容器标题栏高度 */
   headerPx: number;
-  /** 容器内边距 */
+  /** 容器内边距（左 / 上方标题栏之外的左边）：= 容器描边 + 间隙 */
   pad: number;
+  /** 容器右 / 下内边距（默认 = pad）：= 间隙 + 容器描边 + 容器硬投影，让子块的外描边不被裁、投影不压子块 */
+  padEnd?: number;
   /** 容器至少多大才展开子块 */
   minContainerPx: number;
 }
@@ -167,19 +169,32 @@ function place(parent: TmInput, rect: Rect, depth: number, parentKey: string | n
 
   let keep = kids.slice();
   let placed: Placed<Slot>[] = [];
-  // 反复：铺 → 把太小的并进“其他” → 再铺，直到稳定（通常 1~2 轮）
-  for (let round = 0; round < 6; round++) {
+  let dropOther = false;
+  // 反复：铺 → 有块太小就把“尾巴”（值 ≤ 最大的那个太小块的全部子项）整段并进一个“其他” → 再铺，直到稳定。
+  // “其他”自己也太小时不留空洞：把它从布局里拿掉重铺（它的面积不到 minPx²，兄弟块吃掉这点空间）。
+  for (let round = 0; round < 12; round++) {
     const items: Weighted<Slot>[] = keep.map((c) => ({ value: c.value, data: { node: c, merged: 0 } }));
-    if (otherValue > 0) items.push({ value: otherValue, data: { node: null, merged: otherCount } });
+    if (otherValue > 0 && !dropOther) items.push({ value: otherValue, data: { node: null, merged: otherCount } });
     placed = squarify(items, rect);
     const small = placed.filter((p) => p.data.node && tooSmall(p.rect, opt.minPx));
-    if (!small.length) break;
-    const smallSet = new Set(small.map((p) => p.data.node));
-    keep = keep.filter((c) => !smallSet.has(c));
-    for (const s of small) {
-      otherValue += s.value;
-      otherCount += 1;
+    if (small.length) {
+      const cut = Math.max(...small.map((p) => p.value));
+      for (const c of keep) {
+        if (c.value <= cut) {
+          otherValue += c.value;
+          otherCount += 1;
+        }
+      }
+      keep = keep.filter((c) => c.value > cut);
+      dropOther = false;
+      continue;
     }
+    const other = placed.find((p) => !p.data.node);
+    if (other && tooSmall(other.rect, opt.minPx) && keep.length) {
+      dropOther = true;
+      continue;
+    }
+    break;
   }
 
   for (const p of placed) {
@@ -222,13 +237,74 @@ function place(parent: TmInput, rect: Rect, depth: number, parentKey: string | n
       const inner: Rect = {
         x: r.x + opt.pad,
         y: r.y + opt.headerPx,
-        w: r.w - opt.pad * 2,
-        h: r.h - opt.headerPx - opt.pad,
+        w: r.w - opt.pad - (opt.padEnd ?? opt.pad),
+        h: r.h - opt.headerPx - (opt.padEnd ?? opt.pad),
       };
       if (inner.w > opt.minPx && inner.h > opt.minPx) place(n, inner, depth + 1, n.key, opt, out);
       else item.container = false;
     }
   }
+}
+
+// ───── 单块的绘制尺寸（阶段 I）：圆角 / 描边 / 投影按块大小收敛 ─────
+
+/** 方块图的设计令牌（来自 tokens.css 的 --tm-*，三主题各一套）。单位 px。 */
+export interface TileTokens {
+  /** 块与块之间的固定间隙 */
+  gap: number;
+  /** 圆角上限（方块图专用，比卡片圆角小） */
+  r: number;
+  /** 描边宽度 */
+  bw: number;
+  /** 硬投影偏移（0 = 不画） */
+  shadow: number;
+  /** 最短边小于这个就画成平块：只填色，没有描边 / 圆角 / 投影 */
+  flatPx: number;
+  /** 最短边小于这个就不画投影 */
+  shadowMinPx: number;
+  /** 最短边小于这个，斜条纹块改成纯浅色 */
+  patternMinPx: number;
+}
+
+export interface TileBox {
+  /** 像素对齐后的左上角 */
+  x: number;
+  y: number;
+  /** 块面（不含投影）的宽高；块面 + 投影 + 间隙 恰好 = 分到的格子 */
+  w: number;
+  h: number;
+  r: number;
+  bw: number;
+  shadow: number;
+  flat: boolean;
+  pattern: boolean;
+}
+
+/**
+ * 把布局给的格子换成实际绘制的块：先像素对齐（间隙处处一样宽），右 / 下扣掉固定间隙；
+ * 够大才有描边、圆角（不超过 min(r, w/4, h/4)）和投影，投影画在格子里面（块面相应缩小），绝不压到邻块。
+ */
+export function tileBox(rect: Rect, t: TileTokens, withShadow = true): TileBox {
+  const x = Math.round(rect.x);
+  const y = Math.round(rect.y);
+  const w = Math.max(0, Math.round(rect.x + rect.w) - x - t.gap);
+  const h = Math.max(0, Math.round(rect.y + rect.h) - y - t.gap);
+  const m = Math.min(w, h);
+  if (m < t.flatPx) return { x, y, w, h, r: 0, bw: 0, shadow: 0, flat: true, pattern: false };
+  const shadow = withShadow && t.shadow > 0 && m >= t.shadowMinPx ? t.shadow : 0;
+  const fw = w - shadow;
+  const fh = h - shadow;
+  return {
+    x,
+    y,
+    w: fw,
+    h: fh,
+    r: Math.max(0, Math.floor(Math.min(t.r, fw / 4, fh / 4))),
+    bw: t.bw,
+    shadow,
+    flat: false,
+    pattern: Math.min(fw, fh) >= t.patternMinPx,
+  };
 }
 
 /** 命中测试：返回最深的包含该点的块（列表是先父后子的绘制顺序）。 */

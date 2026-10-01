@@ -73,6 +73,14 @@
   --r-lg: 10px;
   --r-pill: 6px;
   --bw: 1px;
+  /* 方块图（阶段 I）：间隙 / 块圆角上限 / 块描边 / 顶层硬投影 / 容器圆角 / 容器描边 / 容器标题栏高 */
+  --tm-gap: 3px;
+  --tm-r: 3px;
+  --tm-bw: 0px;
+  --tm-shadow: 0px;
+  --tm-g-r: 4px;
+  --tm-g-bw: 1px;
+  --tm-head: 26px;
   --stroke: var(--line);
   --shadow: none;
   --shadow-hard: none;
@@ -124,6 +132,13 @@
   --r-lg: 12px;
   --r-pill: 8px;
   --bw: 1px;
+  --tm-gap: 3px;
+  --tm-r: 4px;
+  --tm-bw: 0px;
+  --tm-shadow: 0px;
+  --tm-g-r: 6px;
+  --tm-g-bw: 1px;
+  --tm-head: 26px;
   --stroke: var(--line);
   --shadow: none;
   --shadow-hard: none;
@@ -175,6 +190,14 @@
   --r-lg: 18px;
   --r-pill: 999px;
   --bw: 2px;
+  /* 方块图的圆角比卡片小（--r 12px 用在小块上会变成圆 / 药丸）；投影只给顶层块，画在格子里面 */
+  --tm-gap: 4px;
+  --tm-r: 6px;
+  --tm-bw: 2px;
+  --tm-shadow: 4px;
+  --tm-g-r: 10px;
+  --tm-g-bw: 2px;
+  --tm-head: 26px;
   --stroke: #141412;
   --shadow: 4px 4px 0 #141412;
   --shadow-hard: 6px 6px 0 #141412;

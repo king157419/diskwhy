@@ -23,3 +23,9 @@ serde_json = { workspace = true }
 diskwhy-core = { path = "../crates/diskwhy-core" }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+
+# 阶段 J 闪退取证：WebView2 浏览器 / 渲染进程挂了要活下来并记录（CoreWebView2.add_ProcessFailed）。
+# 版本和 Tauri（wry / tauri-runtime-wry）用的一致：webview2-com 0.38.2、windows-core 0.61.2 都已在 Cargo.lock 里。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows-core = "0.61"

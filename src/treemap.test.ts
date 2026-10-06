@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_LAYOUT, hitTest, layoutTreemap, squarify, type Rect, type TmInput } from "./treemap";
+import { crumbTarget, DEFAULT_LAYOUT, hitTest, layoutTreemap, samePath, squarify, type Rect, type TmInput } from "./treemap";
 
 const area = (r: Rect) => r.w * r.h;
 const EPS = 1e-6;
@@ -230,5 +230,22 @@ describe("尾巴合并（阶段 I）", () => {
     const items = layoutTreemap(t2, rect);
     expect(items.some((i) => i.kind === "other" || i.key === "z")).toBe(false);
     expect(items.reduce((s, i) => s + area(i.rect), 0)).toBeCloseTo(area(rect), 6);
+  });
+});
+
+describe("空间分析导航（阶段 J）", () => {
+  it("samePath：大小写、末尾反斜杠不敏感", () => {
+    expect(samePath("C:\\", "c:")).toBe(true);
+    expect(samePath("C:\\Users\\", "c:\\users")).toBe(true);
+    expect(samePath("C:\\Users", "C:\\Users\\king")).toBe(false);
+    expect(samePath(null, "C:\\")).toBe(false);
+  });
+  it("crumbTarget：第 0 级打开并选中盘根，其余级打开上一级、选中自己", () => {
+    const bc = [{ path: "C:\\" }, { path: "C:\\Users" }, { path: "C:\\Users\\king" }];
+    expect(crumbTarget(bc, 0)).toEqual({ open: "C:\\", focus: "C:\\" });
+    expect(crumbTarget(bc, 1)).toEqual({ open: "C:\\", focus: "C:\\Users" });
+    expect(crumbTarget(bc, 2)).toEqual({ open: "C:\\Users", focus: "C:\\Users\\king" });
+    expect(crumbTarget(bc, 3)).toBeNull();
+    expect(crumbTarget([], 0)).toBeNull();
   });
 });

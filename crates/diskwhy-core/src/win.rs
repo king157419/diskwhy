@@ -357,3 +357,30 @@ pub fn relaunch_as_admin(exe: &str, params: &str) -> Result<(), RelaunchError> {
         }
     }
 }
+
+/// 当前进程的父进程号（CreateToolhelp32Snapshot + Process32FirstW/NextW 找自己那一项的 th32ParentProcessID）。
+/// 闪退取证用：执行开始的 `start` 日志记一下是谁启动的 DiskWhy。读不到返回 None。
+pub fn parent_pid() -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    let me = std::process::id();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return None;
+        }
+        let mut pe: PROCESSENTRY32W = zeroed();
+        pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        let mut ok = Process32FirstW(snap, &mut pe) != 0;
+        while ok {
+            if pe.th32ProcessID == me {
+                found = Some(pe.th32ParentProcessID);
+                break;
+            }
+            ok = Process32NextW(snap, &mut pe) != 0;
+        }
+        CloseHandle(snap);
+        found
+    }
+}

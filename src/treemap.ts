@@ -342,3 +342,22 @@ export function collapseChain<T extends ChainNode>(n: T, share = 0.95, maxHops =
   }
   return { node, name };
 }
+
+// ───── 空间分析的导航（阶段 J §3.9：任何一层都能选中） ─────
+
+/** 路径比较：大小写不敏感，忽略末尾的反斜杠（“C:\” 和 “c:” 视为同一个） */
+export function samePath(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (a == null || b == null) return false;
+  const n = (s: string) => s.replace(/[\\/]+$/, "").toLowerCase();
+  return n(a) === n(b);
+}
+
+/**
+ * 点面包屑第 i 级：第 0 级（盘根）→ 方块图和右边列表都是盘根；
+ * 第 i 级 → 方块图是它的上一级、右边列表是它自己（方块图里它被框出来）。越界返回 null。
+ */
+export function crumbTarget(bc: { path: string }[], i: number): { open: string; focus: string } | null {
+  if (i < 0 || i >= bc.length) return null;
+  if (i === 0) return { open: bc[0].path, focus: bc[0].path };
+  return { open: bc[i - 1].path, focus: bc[i].path };
+}

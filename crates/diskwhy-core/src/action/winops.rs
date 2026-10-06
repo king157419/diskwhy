@@ -410,37 +410,189 @@ pub fn personal_known_folders() -> Vec<(String, &'static str)> {
 /// - FOF_ALLOWUNDO (0x40)：保留撤销信息；
 /// - FOF_NOCONFIRMATION (0x10)：不弹“确定要删除吗”（用户已在 DiskWhy 的预览里确认过）；
 /// - FOF_SILENT (0x4)：不显示进度框；
-/// - FOF_NOERRORUI (0x400)：出错不弹框，跳过该项继续（结果由我们逐个检查）；
-/// - FOF_WANTNUKEWARNING (0x4000)：如果某项会被**永久删除而不是进回收站**，仍然弹警告
-///   （文档：部分覆盖 FOF_NOCONFIRMATION）——防止“回收站放不下 → 静默永久删除”；
+/// - FOF_NOERRORUI (0x400)：出错不弹框，跳过该项继续（结果由进度回调 + 事后检查逐个确定）；
 /// - FOFX_RECYCLEONDELETE (0x80000，Win8+)：删除时送进回收站；
 /// - FOFX_ADDUNDORECORD (0x20000000，Win8+)：用户发起的操作，放进撤销栈。
-pub const RECYCLE_FLAGS: u32 = 0x40 | 0x10 | 0x4 | 0x400 | 0x4000 | 0x0008_0000 | 0x2000_0000;
+///
+/// 阶段 J **去掉了 FOF_WANTNUKEWARNING (0x4000)**：它让“这个会被永久删除”的确认框绕过 FOF_NOCONFIRMATION
+/// 弹出来，而工作线程是没有窗口、没有消息循环的 STA 线程——框看不见，线程永远卡住（PHASE_J_CRASH.md 隐患 2）。
+/// 现在“回收站放不下”的情况在送进去之前就分流掉（[`RecycleBinInfo::refuse`]：比回收站上限还大的文件、
+/// 这个盘的回收站设成了“直接删除”），万一还有漏网的，进度回调 `PostDeleteItem` 的 `psiNewlyCreated == NULL`
+/// 会告诉我们它是被直接删掉的，如实记账（[`RecycleOutcome::Deleted`]），不会当成“进了回收站”。
+pub const RECYCLE_FLAGS: u32 = 0x40 | 0x10 | 0x4 | 0x400 | 0x0008_0000 | 0x2000_0000;
 
-/// 把一组文件送进回收站。必须在已经 `CoInitializeEx(COINIT_APARTMENTTHREADED)` 的线程上调用
-/// （文档：IFileOperation 只能在 STA 里用）。返回每个路径的结果：之后路径不存在 = 成功。
-pub fn recycle(paths: &[String]) -> Vec<Result<(), String>> {
+/// 一项回收的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecycleOutcome {
+    /// 进了回收站（原路径已经不在，回调给出了回收站里的新项）。
+    Recycled,
+    /// 原路径已经不在，但不是进了回收站，而是被直接删掉了（回调里 `psiNewlyCreated == NULL`）。
+    Deleted,
+    /// 没成功：原路径还在（或打不开）。`hr` 是回调给出的这一项的 HRESULT（没收到回调为 0），`msg` 是说明。
+    Failed { hr: i32, msg: String },
+}
+
+#[windows::core::implement(windows::Win32::UI::Shell::IFileOperationProgressSink)]
+struct RecycleSink {
+    /// (小写路径, hrDelete, 是否在回收站里生成了新项)
+    seen: std::cell::RefCell<Vec<(String, i32, bool)>>,
+}
+
+#[allow(non_snake_case)]
+impl windows::Win32::UI::Shell::IFileOperationProgressSink_Impl for RecycleSink_Impl {
+    fn StartOperations(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn FinishOperations(&self, _hr: windows::core::HRESULT) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreRenameItem(&self, _f: u32, _i: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>, _n: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostRenameItem(
+        &self,
+        _f: u32,
+        _i: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _n: &windows::core::PCWSTR,
+        _hr: windows::core::HRESULT,
+        _c: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreMoveItem(
+        &self,
+        _f: u32,
+        _i: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _d: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _n: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostMoveItem(
+        &self,
+        _f: u32,
+        _i: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _d: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _n: &windows::core::PCWSTR,
+        _hr: windows::core::HRESULT,
+        _c: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreCopyItem(
+        &self,
+        _f: u32,
+        _i: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _d: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _n: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostCopyItem(
+        &self,
+        _f: u32,
+        _i: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _d: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _n: &windows::core::PCWSTR,
+        _hr: windows::core::HRESULT,
+        _c: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreDeleteItem(&self, _f: u32, _i: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>) -> windows::core::Result<()> {
+        Ok(())
+    }
+    /// 文档：`hrDelete` 是这一项真正删除的结果（不是 DeleteItem 的排队结果）；`psiNewlyCreated` 是进了回收站的新项，
+    /// “If the item was fully deleted, this value is NULL”。
+    fn PostDeleteItem(
+        &self,
+        _f: u32,
+        item: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        hr: windows::core::HRESULT,
+        created: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        use windows::Win32::UI::Shell::SIGDN_FILESYSPATH;
+        if let Some(it) = item.as_ref() {
+            if let Ok(p) = unsafe { it.GetDisplayName(SIGDN_FILESYSPATH) } {
+                let s = unsafe { p.to_string() }.unwrap_or_default();
+                unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const c_void)) };
+                if let Ok(mut v) = self.seen.try_borrow_mut() {
+                    v.push((strip_verbatim(&s).to_lowercase(), hr.0, created.as_ref().is_some()));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn PreNewItem(&self, _f: u32, _d: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>, _n: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostNewItem(
+        &self,
+        _f: u32,
+        _d: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+        _n: &windows::core::PCWSTR,
+        _t: &windows::core::PCWSTR,
+        _a: u32,
+        _hr: windows::core::HRESULT,
+        _c: windows::core::Ref<'_, windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn UpdateProgress(&self, _t: u32, _s: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResetTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PauseTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResumeTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+/// HRESULT 的说明（系统消息 + 十六进制码）。
+pub fn hresult_text(hr: i32) -> String {
+    let e = windows::core::Error::from_hresult(windows::core::HRESULT(hr));
+    let m = e.message();
+    let m = m.trim();
+    if m.is_empty() {
+        format!("0x{:08X}", hr as u32)
+    } else {
+        format!("{m}（0x{:08X}）", hr as u32)
+    }
+}
+
+/// 把一组文件 / 文件夹送进回收站。必须在已经 `CoInitializeEx(COINIT_APARTMENTTHREADED)` 的线程上调用
+/// （文档：IFileOperation 只能在 STA 里用）。每一项的结果由进度回调（`IFileOperationProgressSink::PostDeleteItem`，
+/// 用 `Advise` 挂在整个操作上）加事后“原路径还在不在”共同决定：
+/// - 原路径不在了 + 回调说回收站里有新项（或没收到回调）→ [`RecycleOutcome::Recycled`]；
+/// - 原路径不在了 + 回调说没有新项 → [`RecycleOutcome::Deleted`]（被直接删了，如实报告）；
+/// - 原路径还在 → [`RecycleOutcome::Failed`]，带回调里的 HRESULT（例如被占用 0x80270027 / 0x80070020）。
+///
+/// 不会弹任何界面（见 [`RECYCLE_FLAGS`]），所以工作线程不需要属主窗口 / 消息循环。
+pub fn recycle_items(paths: &[String]) -> Vec<RecycleOutcome> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
     use windows::Win32::UI::Shell::{
-        FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
-        FILEOPERATION_FLAGS,
+        FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName, FILEOPERATION_FLAGS,
     };
-    let mut results: Vec<Result<(), String>> = vec![Err("没有执行".into()); paths.len()];
+    let fail_all = |msg: String| paths.iter().map(|_| RecycleOutcome::Failed { hr: 0, msg: msg.clone() }).collect::<Vec<_>>();
     if paths.is_empty() {
-        return results;
+        return Vec::new();
     }
     let op: IFileOperation = match unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) } {
         Ok(o) => o,
-        Err(e) => {
-            let msg = format!("创建 IFileOperation 失败：{e}");
-            return results.into_iter().map(|_| Err(msg.clone())).collect();
-        }
+        Err(e) => return fail_all(format!("创建 IFileOperation 失败：{e}")),
     };
     if let Err(e) = unsafe { op.SetOperationFlags(FILEOPERATION_FLAGS(RECYCLE_FLAGS)) } {
-        let msg = format!("SetOperationFlags 失败：{e}");
-        return results.into_iter().map(|_| Err(msg.clone())).collect();
+        return fail_all(format!("SetOperationFlags 失败：{e}"));
     }
+    let sink_obj = windows::core::ComObject::new(RecycleSink { seen: std::cell::RefCell::new(Vec::with_capacity(paths.len())) });
+    let sink: IFileOperationProgressSink = sink_obj.to_interface();
+    let cookie = unsafe { op.Advise(&sink) }.ok();
+    let mut results: Vec<RecycleOutcome> = vec![RecycleOutcome::Failed { hr: 0, msg: "没有执行".into() }; paths.len()];
     let mut queued = vec![false; paths.len()];
     for (i, p) in paths.iter().enumerate() {
         let h = HSTRING::from(p.as_str());
@@ -448,29 +600,98 @@ pub fn recycle(paths: &[String]) -> Vec<Result<(), String>> {
         match item {
             Ok(it) => match unsafe { op.DeleteItem(&it, None::<&IFileOperationProgressSink>) } {
                 Ok(()) => queued[i] = true,
-                Err(e) => results[i] = Err(format!("DeleteItem 失败：{e}")),
+                Err(e) => results[i] = RecycleOutcome::Failed { hr: e.code().0, msg: format!("DeleteItem 失败：{e}") },
             },
-            Err(e) => results[i] = Err(format!("Shell 打不开这个路径：{e}")),
+            Err(e) => results[i] = RecycleOutcome::Failed { hr: e.code().0, msg: format!("Shell 打不开这个路径：{e}") },
         }
     }
-    let perform = unsafe { op.PerformOperations() };
-    let aborted = unsafe { op.GetAnyOperationsAborted() }.map(|b| b.as_bool()).unwrap_or(false);
+    let perform = if queued.iter().any(|&q| q) { unsafe { op.PerformOperations() } } else { Ok(()) };
+    if let Some(c) = cookie {
+        let _ = unsafe { op.Unadvise(c) };
+    }
+    // 回调记录：按小写路径找（同一路径多条时取最后一条）
+    let seen: std::collections::HashMap<String, (i32, bool)> = {
+        // PerformOperations 已经返回（同一线程、同步），回调不会再来
+        let v = sink_obj.seen.borrow();
+        v.iter().map(|(p, hr, c)| (p.clone(), (*hr, *c))).collect()
+    };
     for (i, p) in paths.iter().enumerate() {
         if !queued[i] {
             continue;
         }
+        let rec = seen.get(&strip_verbatim(p).to_lowercase()).copied();
         let still_there = std::fs::symlink_metadata(long_path(p)).is_ok();
-        results[i] = if !still_there {
-            Ok(())
-        } else if let Err(e) = &perform {
-            Err(format!("回收站操作失败：{e}"))
-        } else if aborted {
-            Err("回收站操作被中止（可能被占用、没有权限，或你在“永久删除”警告里点了否）".into())
-        } else {
-            Err("操作结束后文件仍在原处".into())
+        results[i] = match (still_there, rec) {
+            (false, Some((_, false))) => RecycleOutcome::Deleted,
+            (false, _) => RecycleOutcome::Recycled,
+            (true, Some((hr, _))) if hr < 0 => RecycleOutcome::Failed { hr, msg: format!("回收站操作失败：{}", hresult_text(hr)) },
+            (true, Some((hr, _))) => RecycleOutcome::Failed { hr, msg: format!("回收站跳过了这个文件（0x{:08X}）", hr as u32) },
+            (true, None) => match &perform {
+                Err(e) => RecycleOutcome::Failed { hr: e.code().0, msg: format!("回收站操作失败：{e}") },
+                Ok(()) => RecycleOutcome::Failed { hr: 0, msg: "操作结束后文件仍在原处".into() },
+            },
         };
     }
     results
+}
+
+/// 旧接口：成功（进了回收站 / 被直接删）= Ok。
+pub fn recycle(paths: &[String]) -> Vec<Result<(), String>> {
+    recycle_items(paths)
+        .into_iter()
+        .map(|r| match r {
+            RecycleOutcome::Recycled | RecycleOutcome::Deleted => Ok(()),
+            RecycleOutcome::Failed { msg, .. } => Err(msg),
+        })
+        .collect()
+}
+
+/// 某个盘的回收站设置（执行前读一次），用来在送进回收站**之前**分流“回收站放不下 / 关掉了”的条目——
+/// 否则 Windows 会直接永久删除（我们不再要 FOF_WANTNUKEWARNING 的确认框，见 [`RECYCLE_FLAGS`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecycleBinInfo {
+    /// 回收站上限（字节）。注册表 `BitBucket\Volume\<GUID>\MaxCapacity`（MB）；读不到时按卷大小的 5% 估
+    /// （Windows 默认值的量级），再读不到就是 None（不按大小分流）。
+    pub max_bytes: Option<u64>,
+    /// 这个盘的回收站设成了“不移到回收站，直接删除”（`NukeOnDelete = 1`），或策略 `NoRecycleFiles = 1`。
+    pub nuke: bool,
+}
+
+impl RecycleBinInfo {
+    pub fn read(root: &str) -> Self {
+        let max_bytes = recycle_bin_max_capacity(root).or_else(|| crate::win::volume_space(root).ok().map(|s| s.total_bytes / 20));
+        let nuke = volume_guid(root)
+            .and_then(|g| reg_dword(false, &format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{g}"), "NukeOnDelete"))
+            .is_some_and(|v| v != 0)
+            || [false, true]
+                .iter()
+                .any(|&m| reg_dword(m, r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer", "NoRecycleFiles").is_some_and(|v| v != 0));
+        RecycleBinInfo { max_bytes, nuke }
+    }
+
+    /// 这么大的东西送进这个盘的回收站会不会被 Windows 直接删掉：会 → Some(原因)。
+    pub fn refuse(&self, size: u64) -> Option<String> {
+        if self.nuke {
+            return Some("这个盘的回收站设成了“直接删除”，进不了回收站，没动它".into());
+        }
+        match self.max_bytes {
+            Some(0) => Some("这个盘的回收站上限是 0，进不了回收站，没动它".into()),
+            Some(m) if size > m => Some(format!("比回收站上限（{} MB）还大，进不了回收站，没动它", m >> 20)),
+            _ => None,
+        }
+    }
+}
+
+/// 读一个 REG_DWORD（`machine` = HKLM，否则 HKCU）。
+fn reg_dword(machine: bool, key: &str, val: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    let root = if machine { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER };
+    let k = wide(key);
+    let v = wide(val);
+    let mut data: u32 = 0;
+    let mut cb = size_of::<u32>() as u32;
+    let e = unsafe { RegGetValueW(root, k.as_ptr(), v.as_ptr(), RRF_RT_REG_DWORD, null_mut(), &mut data as *mut u32 as *mut c_void, &mut cb) };
+    (e == 0).then_some(data)
 }
 
 /// 当前线程进入 STA（IFileOperation 需要）；返回的守卫在析构时 CoUninitialize。
@@ -495,4 +716,267 @@ impl Drop for ComSta {
 /// FILETIME（100ns，自 1601）→ Unix 秒。
 pub fn ft_to_unix(ft: u64) -> i64 {
     crate::fs::filetime_to_unix(ft)
+}
+
+// ───────────────────────── 阶段 J：直接删除（同一个句柄上重新校验后删） ─────────────────────────
+
+/// 为删除打开的句柄：`DELETE | FILE_READ_ATTRIBUTES`、全共享、`FILE_FLAG_OPEN_REPARSE_POINT`（不跟随链接）。
+/// 先用 [`DeleteHandle::fingerprint`] 在**同一个句柄**上重新校验，再 [`DeleteHandle::delete`]：
+/// 校验和删除之间文件不可能被换成别的（换了名字的话这个句柄指的还是原来那个文件）。析构时关闭句柄。
+pub struct DeleteHandle(HANDLE);
+
+impl DeleteHandle {
+    pub fn open(path: &str, is_dir: bool) -> Result<Self, u32> {
+        let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
+        if is_dir {
+            flags |= FILE_FLAG_BACKUP_SEMANTICS;
+        }
+        open(path, DELETE | FILE_READ_ATTRIBUTES, flags).map(DeleteHandle)
+    }
+
+    pub fn fingerprint(&self) -> Result<Fingerprint, u32> {
+        unsafe { fingerprint_of(self.0, false) }
+    }
+
+    /// 设删除标记（learn.microsoft.com：SetFileInformationByHandle + FILE_DISPOSITION_INFO_EX；
+    /// `FILE_DISPOSITION_FLAG_DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE`：名字在关句柄时立刻消失，
+    /// 只读文件也能删）。不支持 Ex 的文件系统（FAT 等，返回 ERROR_INVALID_PARAMETER / NOT_SUPPORTED）
+    /// 退回 FILE_DISPOSITION_INFO（DeleteFile = TRUE，和 DeleteFileW 等价）。删除在句柄关闭（析构）时生效。
+    pub fn delete(self) -> Result<(), u32> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle, FILE_DISPOSITION_FLAG_DELETE,
+            FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+            FILE_DISPOSITION_INFO_EX,
+        };
+        unsafe {
+            let ex = FILE_DISPOSITION_INFO_EX {
+                Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+            };
+            if SetFileInformationByHandle(self.0, FileDispositionInfoEx, &ex as *const _ as *const c_void, size_of::<FILE_DISPOSITION_INFO_EX>() as u32) != 0 {
+                return Ok(());
+            }
+            let e = GetLastError();
+            // 87 ERROR_INVALID_PARAMETER / 50 ERROR_NOT_SUPPORTED / 1 ERROR_INVALID_FUNCTION：文件系统不支持 Ex
+            if !matches!(e, 87 | 50 | 1) {
+                return Err(e);
+            }
+            let fdi = FILE_DISPOSITION_INFO { DeleteFile: true.into() };
+            if SetFileInformationByHandle(self.0, FileDispositionInfo, &fdi as *const _ as *const c_void, size_of::<FILE_DISPOSITION_INFO>() as u32) != 0 {
+                Ok(())
+            } else {
+                Err(GetLastError())
+            }
+        }
+    }
+}
+
+impl Drop for DeleteHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+// ───────────────────────── 阶段 J：可中断的跨盘复制 ─────────────────────────
+
+/// `CopyFileExW(src, dst, NULL, NULL, pbCancel, COPY_FILE_FAIL_IF_EXISTS)`。`cancel` 指向的值变成非 0
+/// 时复制中途停下（文档：“If this flag is set to TRUE during the copy operation, the operation is
+/// canceled”），返回 Err，**半截的目标文件由这里删掉**（文档没保证 pbCancel 时会删，所以自己删）。
+/// 复制保留属性、修改时间、备用数据流（CopyFileEx 文档 Remarks）。
+pub fn copy_file_cancellable(src: &str, dst: &str, cancel: Option<&std::sync::atomic::AtomicI32>) -> Result<(), u32> {
+    use windows_sys::Win32::Storage::FileSystem::{CopyFileExW, COPY_FILE_FAIL_IF_EXISTS};
+    let s = wide(&long_path(src));
+    let d = wide(&long_path(dst));
+    let pc: *mut i32 = match cancel {
+        Some(c) => c.as_ptr(),
+        None => null_mut(),
+    };
+    let ok = unsafe { CopyFileExW(s.as_ptr(), d.as_ptr(), None, null(), pc, COPY_FILE_FAIL_IF_EXISTS) };
+    if ok != 0 {
+        return Ok(());
+    }
+    let e = unsafe { GetLastError() };
+    // 80 = ERROR_FILE_EXISTS：目标本来就有，不是我们建的，不能删
+    if e != 80 {
+        let _ = std::fs::remove_file(long_path(dst));
+    }
+    Err(e)
+}
+
+/// ERROR_REQUEST_ABORTED（1235）：复制被取消。
+pub const ERROR_REQUEST_ABORTED: u32 = 1235;
+
+// ───────────────────────── 阶段 J：回收站用量 / 上限 ─────────────────────────
+
+/// 当前用户在某个盘上的回收站现在占多少：(字节, 项数)。
+///
+/// 不用 SHQueryRecycleBinW：本机回收站 26 万项时它要 23 秒（实测）。这里只列一遍
+/// `X:\$Recycle.Bin\<当前用户 SID>`（一次 FindFirstFileExW 遍历）：`$R*` 文件按目录项里的大小算；
+/// `$R*` 是文件夹时读对应 `$I*` 记录里的原始大小（第 8–16 字节，little-endian i64）。项数 = `$I*` 的个数。
+/// 列不出（没有这个文件夹 / 没权限）返回 None。
+pub fn recycle_bin_usage(root: &str) -> Option<(u64, u64)> {
+    let sid = current_user_sid()?;
+    let dir = crate::fs::join(&crate::fs::join(root, "$Recycle.Bin"), &sid);
+    let list = list_dir(&dir).ok()?;
+    let mut bytes = 0u64;
+    let mut items = 0u64;
+    for r in &list {
+        if r.name.starts_with("$I") {
+            items += 1;
+        } else if r.name.starts_with("$R") {
+            if r.attrs & crate::fs::attrs::DIRECTORY != 0 {
+                let ipath = crate::fs::join(&dir, &format!("$I{}", &r.name[2..]));
+                if let Ok(b) = std::fs::read(long_path(&ipath)) {
+                    if b.len() >= 16 {
+                        bytes += i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8])).max(0) as u64;
+                    }
+                }
+            } else {
+                bytes += r.size;
+            }
+        }
+    }
+    Some((bytes, items))
+}
+
+/// 同 [`recycle_bin_usage`]，但用 SHQueryRecycleBinW（所有用户、权威但可能很慢）。
+pub fn recycle_bin_usage_shell(root: &str) -> Option<(u64, u64)> {
+    use windows_sys::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
+    let w = wide(root);
+    let mut info = SHQUERYRBINFO { cbSize: size_of::<SHQUERYRBINFO>() as u32, i64Size: 0, i64NumItems: 0 };
+    let hr = unsafe { SHQueryRecycleBinW(w.as_ptr(), &mut info) };
+    if hr < 0 {
+        return None;
+    }
+    Some((info.i64Size.max(0) as u64, info.i64NumItems.max(0) as u64))
+}
+
+/// 卷 GUID（`{...}`），由 GetVolumeNameForVolumeMountPointW（`\\?\Volume{GUID}\`）取出。
+pub fn volume_guid(root: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+    let mut r = root.to_string();
+    if !r.ends_with('\\') {
+        r.push('\\');
+    }
+    let w = wide(&r);
+    let mut buf = [0u16; 64];
+    if unsafe { GetVolumeNameForVolumeMountPointW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } == 0 {
+        return None;
+    }
+    let s = from_wide_nul(&buf);
+    let a = s.find('{')?;
+    let b = s.find('}')?;
+    (b > a).then(|| s[a..=b].to_string())
+}
+
+/// 回收站上限（字节）：`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\<GUID>\MaxCapacity`
+/// （REG_DWORD，单位 MB）。读不到返回 None。
+pub fn recycle_bin_max_capacity(root: &str) -> Option<u64> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let guid = volume_guid(root)?;
+    let key = wide(&format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{guid}"));
+    let val = wide("MaxCapacity");
+    let mut data: u32 = 0;
+    let mut cb = size_of::<u32>() as u32;
+    let e = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), val.as_ptr(), RRF_RT_REG_DWORD, null_mut(), &mut data as *mut u32 as *mut c_void, &mut cb)
+    };
+    (e == 0).then_some(data as u64 * 1024 * 1024)
+}
+
+// ───────────────────────── 阶段 J：提权建暂存区 ─────────────────────────
+
+/// 当前进程令牌的用户 SID（`S-1-5-21-…`）。
+pub fn current_user_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut need = 0u32;
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut need);
+        if need == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u64; (need as usize).div_ceil(8)];
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as *mut c_void, need, &mut need);
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut s: *mut u16 = null_mut();
+        if ConvertSidToStringSidW(tu.User.Sid, &mut s) == 0 || s.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        while *s.add(len) != 0 {
+            len += 1;
+        }
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, len));
+        LocalFree(s as _);
+        Some(out)
+    }
+}
+
+/// 令牌的提权类型（GetTokenInformation(TokenElevationType)）：1 = Default（普通用户，或关了 UAC），
+/// 2 = Full（已提权），3 = Limited（管理员账户的受限令牌，能通过 UAC 提权）。读不到返回 0。
+pub fn elevation_type() -> i32 {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevationType, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return 0;
+        }
+        let mut t: i32 = 0;
+        let mut n = 0u32;
+        let ok = GetTokenInformation(token, TokenElevationType, &mut t as *mut i32 as *mut c_void, size_of::<i32>() as u32, &mut n);
+        CloseHandle(token);
+        if ok == 0 {
+            0
+        } else {
+            t
+        }
+    }
+}
+
+/// 以管理员身份运行 `exe params` 并等它退出（ShellExecuteExW "runas" + SEE_MASK_NOCLOSEPROCESS +
+/// WaitForSingleObject + GetExitCodeProcess）。返回子进程退出码；用户在 UAC 里点“否”（ERROR_CANCELLED 1223）
+/// → Err(None)，其他失败 → Err(Some(说明))。
+pub fn run_elevated_wait(exe: &str, params: &str) -> Result<u32, Option<String>> {
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    let verb = wide("runas");
+    let file = wide(exe);
+    let par = wide(params);
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = zeroed();
+        info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = par.as_ptr();
+        info.nShow = 0; // SW_HIDE
+        if ShellExecuteExW(&mut info) == 0 {
+            let e = GetLastError();
+            return if e == 1223 { Err(None) } else { Err(Some(format!("ShellExecuteExW 失败，错误 {e}"))) };
+        }
+        if info.hProcess.is_null() {
+            return Err(Some("没拿到提权进程的句柄".into()));
+        }
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(info.hProcess, &mut code) != 0;
+        CloseHandle(info.hProcess);
+        if ok {
+            Ok(code)
+        } else {
+            Err(Some("读不到提权进程的退出码".into()))
+        }
+    }
 }

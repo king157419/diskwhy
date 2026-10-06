@@ -35,6 +35,13 @@
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
+/* 窄窗口 / 竖屏（阶段 J §3.7，断点与 src/layout.ts 一致）：两侧留白收窄 */
+@media (max-width: 1099px), (max-aspect-ratio: 1/1) {
+  :root {
+    --gutter: clamp(16px, 3.4vw, 40px);
+  }
+}
+
 /* ───────── A 浅色 · 纸本 ───────── */
 :root,
 [data-theme="A"] {

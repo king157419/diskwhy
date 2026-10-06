@@ -9,12 +9,13 @@
 //! | 5 | 云占位 / 云文件：跳过并说明（不打开） | [`preflight`] | 跳过该条 |
 //! | 6 | reparse point：不跟随，只删链接自身，预览里标出 | [`preflight`] | `RemoveLink` |
 //! | 7 | 占用检测：DELETE 权限探测 + Restart Manager 报告进程名和 PID，只报告不关进程 | [`preflight`] | 跳过该条（用户可选“跳过被占用的”继续，或取消） |
-//! | 8 | 空间提示：回收站策略且所在卷可用空间 < 10% | [`preflight`] | 警告 + 可切换到隔离区 |
+//! | 8 | 空间提示：有东西要进回收站且所在卷可用空间 < 10%（阶段 J：另查回收站上限 MaxCapacity） | [`preflight`] | 警告 + 可切换到隔离区 |
 //! | 9 | 重新校验：执行前每条再取一次文件 ID / 大小 / 修改时间 | [`super::execute`] | 对不上的跳过 |
 
 use super::protect::{ParentCache, Protector};
 use super::winops::{self, Fingerprint, LockingProcess};
-use super::{Decision, EntryKind, EntryView, Plan, Progress, SkipReason, Strategy, HOT_WINDOW_SECS, LOW_SPACE_RATIO, PREVIEW_LIMIT};
+use super::perf::{PerfModel, Workload};
+use super::{ByDest, CountBytes, Decision, Dest, EntryKind, EntryView, Plan, Progress, SkipReason, Strategy, HOT_WINDOW_SECS, LOW_SPACE_RATIO, PREVIEW_LIMIT};
 use crate::explain::{ExplainCtx, Explanation, How, Source, Tier};
 use crate::explain::pattern::split_lower;
 use crate::explain::rules::Scope;
@@ -138,11 +139,13 @@ pub struct PreflightOptions {
     pub rm_sessions: usize,
     /// 最多把多少个被占用的文件交给 Restart Manager；超过的只标“被占用”、不查进程（防止极端情况下查几分钟）。
     pub rm_max_files: usize,
+    /// 阶段 J：估计用时用的耗时模型（None = 读 `%LOCALAPPDATA%\DiskWhy\perf.json`，没有就用默认值）。
+    pub perf: Option<PerfModel>,
 }
 
 impl Default for PreflightOptions {
     fn default() -> Self {
-        PreflightOptions { now: crate::explain::now_unix(), hot_window_secs: HOT_WINDOW_SECS, rm_chunk: 16, rm_sessions: 6, rm_max_files: 2048 }
+        PreflightOptions { now: crate::explain::now_unix(), hot_window_secs: HOT_WINDOW_SECS, rm_chunk: 16, rm_sessions: 6, rm_max_files: 2048, perf: None }
     }
 }
 
@@ -205,6 +208,10 @@ pub struct DriveChoice {
     pub label: String,
     pub free_bytes: u64,
     pub total_bytes: u64,
+    /// 阶段 J：这个盘上已经能用的暂存区位置（`Strategy::Quarantine { dest_root }` 直接用它）；
+    /// None = 盘根不让建文件夹，要先调 `prepare_quarantine` / `elevate_quarantine` 或让用户选文件夹。
+    #[serde(default)]
+    pub dest_root: Option<String>,
 }
 
 /// 预检报告。
@@ -235,6 +242,23 @@ pub struct PreflightReport {
     /// 各阶段用时（毫秒），排查慢在哪里用。
     #[serde(default)]
     pub timing_ms: BTreeMap<String, u64>,
+    /// 阶段 J：safe 档是否直接删除（见 `Plan::safe_direct`）。
+    #[serde(default)]
+    pub safe_direct: bool,
+    /// 阶段 J：预计用时（秒，按 perf.json 的耗时模型；`pending` 时为 0 = 还不知道）。
+    #[serde(default)]
+    pub est_secs: f64,
+    /// 阶段 J：计划按去向分别多少个 / 多少字节（`pending` 时个数为 0、字节按扫描时的大小）。
+    #[serde(default)]
+    pub by_dest: ByDest,
+    /// 阶段 J：跳过的总字节，和按原因（hot / cloud / locked / hardlink / …）分的个数 + 字节。
+    #[serde(default)]
+    pub skipped_bytes: u64,
+    #[serde(default)]
+    pub skipped_by_reason: BTreeMap<String, CountBytes>,
+    /// 阶段 J：扫描时的估算总量（= 弹层先显示的 quote 的 `total_bytes`），界面用它解释“数字为什么变小了”。
+    #[serde(default)]
+    pub scan_total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,7 +277,7 @@ pub fn preflight(plan: &mut Plan, protector: &Protector, opts: &PreflightOptions
 /// 确认弹层先用的估算（阶段 G）：只用快速计划（[`super::plan::build_plan_quick`]）的结果，每项按扫描时的大小算，
 /// 被拦下的项照常列出、空间提示 / 隔离区检查照常给出；`pending = true`、`can_execute = false`。
 pub fn quote(plan: &Plan) -> PreflightReport {
-    report_impl(plan, Vec::new(), true)
+    report_impl(plan, Vec::new(), true, &PerfModel::load_default())
 }
 
 enum RmMsg {
@@ -361,8 +385,9 @@ pub fn preflight_with(plan: &mut Plan, protector: &Protector, opts: &PreflightOp
     timing.insert("check_parallel".into(), check_ms);
     timing.insert("rm_after_check".into(), (t0.elapsed().as_millis() as u64).saturating_sub(check_ms));
     timing.insert("parent_dirs_resolved".into(), cache.len() as u64);
+    let perf = opts.perf.clone().unwrap_or_else(PerfModel::load_default);
     if prog.cancelled() {
-        return report_impl(plan, Vec::new(), true);
+        return report_impl(plan, Vec::new(), true, &perf);
     }
     for (&(ii, ei), (d, fp, bytes)) in work.iter().zip(decided) {
         let item = &mut plan.items[ii];
@@ -381,14 +406,163 @@ pub fn preflight_with(plan: &mut Plan, protector: &Protector, opts: &PreflightOp
             plan.items[ii].decisions[ei] = Decision::Skip { reason: SkipReason::Locked { processes: procs.clone() } };
         }
     }
+    // 阶段 J（PHASE_J_CRASH.md 隐患 5）：正在运行的 Chromium / Electron 程序的磁盘缓存——它们常用 FILE_SHARE_DELETE
+    // 打开缓存文件，探测不出“被占用”，删了会弄坏正在运行的程序（上次 444 条“回收站操作被中止”就是这些）。
+    let tl = std::time::Instant::now();
+    let live = skip_live_chromium_caches(plan, opts);
+    timing.insert("live_cache_check".into(), tl.elapsed().as_millis() as u64);
+    all_procs.extend(live);
     all_procs.sort_by_key(|p| p.pid);
     all_procs.dedup_by_key(|p| p.pid);
+    skip_cross_volume_hardlinks(plan);
+    skip_unrecyclable(plan);
     plan.preflight_done = true;
     prog.set_phase(4);
-    let mut rep = report_impl(plan, all_procs, false);
+    let mut rep = report_impl(plan, all_procs, false, &perf);
     timing.insert("total".into(), t0.elapsed().as_millis() as u64);
     rep.timing_ms = timing;
     rep
+}
+
+/// 阶段 J（§3.10 硬链接陷阱）：跨盘暂存时链接数 > 1 的文件跳过——整份拷到别的盘既占那个盘的空间，
+/// 这个盘又腾不出空间（别的名字还指着同一份数据）。只看要进暂存区、而且跨盘的条目。
+pub fn skip_cross_volume_hardlinks(plan: &mut Plan) {
+    for ii in 0..plan.items.len() {
+        if plan.items[ii].blocked.is_some() || plan.dest_for(&plan.items[ii]) != Dest::Quarantine {
+            continue;
+        }
+        let hits: Vec<(usize, u32)> = plan.items[ii]
+            .entries
+            .iter()
+            .zip(&plan.items[ii].decisions)
+            .enumerate()
+            .filter(|(_, (e, d))| matches!(d, Decision::Delete) && e.kind == EntryKind::File && plan.crosses_volume(&e.path))
+            .filter_map(|(i, (e, _))| e.fp.filter(|f| f.links > 1).map(|f| (i, f.links)))
+            .collect();
+        for (i, links) in hits {
+            plan.items[ii].decisions[i] = Decision::Skip { reason: SkipReason::Hardlink { links } };
+        }
+    }
+}
+
+/// 阶段 J（PHASE_J_CRASH.md 隐患 2）：要进回收站、但回收站收不下的条目（比该盘回收站上限还大，或该盘回收站设成了
+/// “直接删除”）预先标成跳过——送进去 Windows 会直接永久删除。执行时还会按同样的规则再查一次。
+pub fn skip_unrecyclable(plan: &mut Plan) {
+    let mut bins: Vec<(String, winops::RecycleBinInfo)> = Vec::new();
+    for ii in 0..plan.items.len() {
+        if plan.items[ii].blocked.is_some() {
+            continue;
+        }
+        let hits: Vec<(usize, String)> = plan.items[ii]
+            .entries
+            .iter()
+            .zip(&plan.items[ii].decisions)
+            .enumerate()
+            .filter(|(_, (e, d))| matches!(d, Decision::Delete) && plan.entry_dest(&plan.items[ii], e) == Dest::Recycle)
+            .filter_map(|(i, (e, _))| {
+                let v = crate::scan::volume_root_of(&e.path)?.to_lowercase();
+                let info = match bins.iter().find(|(r, _)| *r == v) {
+                    Some((_, b)) => b.clone(),
+                    None => {
+                        let b = winops::RecycleBinInfo::read(&v);
+                        bins.push((v, b.clone()));
+                        b
+                    }
+                };
+                let size = e.fp.map(|f| f.size).unwrap_or(e.size);
+                info.refuse(size).map(|why| (i, why))
+            })
+            .collect();
+        for (i, why) in hits {
+            plan.items[ii].decisions[i] = Decision::Skip { reason: SkipReason::RecycleUnavailable { why } };
+        }
+    }
+}
+
+/// 一个 Chromium 磁盘缓存文件夹里拿去问 Restart Manager 的文件：`index`、`data_0..3`（blockfile 格式：GPUCache、
+/// 老的 Cache）、`index-dir\the-real-index`（simple cache：Cache_Data、Code Cache\js）。
+/// 返回 缓存文件夹（小写）→ 要问的文件。只认清单里真有 `index` 的文件夹。
+pub fn chromium_cache_dirs(plan: &Plan) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for item in plan.items.iter().filter(|i| i.blocked.is_none()) {
+        let set: std::collections::HashSet<String> = item.entries.iter().map(|e| e.path.to_lowercase()).collect();
+        for e in &item.entries {
+            if e.kind != EntryKind::File {
+                continue;
+            }
+            let Some((dir, name)) = e.path.rsplit_once('\\') else { continue };
+            if !name.eq_ignore_ascii_case("index") {
+                continue;
+            }
+            let ld = dir.to_lowercase();
+            let blockfile = set.contains(&format!("{ld}\\data_0"));
+            let real_index = format!("{dir}\\index-dir\\the-real-index");
+            let simple = set.contains(&real_index.to_lowercase()) || ld.ends_with("\\cache_data");
+            if !(blockfile || simple) {
+                continue;
+            }
+            let mut files = vec![e.path.clone()];
+            for k in 0..4 {
+                let f = format!("{dir}\\data_{k}");
+                if set.contains(&f.to_lowercase()) {
+                    files.push(f);
+                }
+            }
+            if set.contains(&real_index.to_lowercase()) {
+                files.push(real_index);
+            }
+            out.entry(ld).or_default().extend(files);
+        }
+    }
+    out
+}
+
+/// 正在被某个进程打开的 Chromium 缓存文件夹：整个文件夹里要删的都改成“跳过·被占用（进程名）”。返回查到的进程。
+/// 先把所有缓存文件放进**一个** Restart Manager 会话问一次（通常没有程序在跑，一次就完）；有进程在用时再按文件夹
+/// 分别问（最多 `rm_sessions` 个会话并发、最多 400 个文件夹），找出是哪些文件夹。只报告，不关进程。
+pub fn skip_live_chromium_caches(plan: &mut Plan, opts: &PreflightOptions) -> Vec<LockingProcess> {
+    let dirs = chromium_cache_dirs(plan);
+    if dirs.is_empty() {
+        return Vec::new();
+    }
+    let all: Vec<String> = dirs.values().flatten().cloned().collect();
+    // RmRegisterResources 一次注册几千个文件没问题；太多时只看 index（每个文件夹一个）
+    let first: Vec<String> = if all.len() <= 4000 { all } else { dirs.values().filter_map(|v| v.first().cloned()).collect() };
+    match winops::rm_locking_processes(&first) {
+        Ok(p) if p.is_empty() => return Vec::new(),
+        Ok(_) => {}
+        Err(_) => return Vec::new(),
+    }
+    let list: Vec<(&String, &Vec<String>)> = dirs.iter().take(400).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let found: std::sync::Mutex<Vec<(String, Vec<LockingProcess>)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..opts.rm_sessions.clamp(1, 8) {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((d, files)) = list.get(k) else { break };
+                if let Ok(p) = winops::rm_locking_processes(files) {
+                    if !p.is_empty() {
+                        found.lock().unwrap().push(((*d).clone(), p));
+                    }
+                }
+            });
+        }
+    });
+    let found = found.into_inner().unwrap_or_default();
+    let mut procs = Vec::new();
+    for (d, p) in &found {
+        let pre = format!("{d}\\");
+        for item in plan.items.iter_mut().filter(|i| i.blocked.is_none()) {
+            for (e, dec) in item.entries.iter().zip(item.decisions.iter_mut()) {
+                if matches!(dec, Decision::Delete) && e.path.to_lowercase().starts_with(&pre) {
+                    *dec = Decision::Skip { reason: SkipReason::Locked { processes: p.clone() } };
+                }
+            }
+        }
+        procs.extend(p.iter().cloned());
+    }
+    procs
 }
 
 /// 收被占用的文件、按清单项分组交给 Restart Manager（最多 `rm_sessions` 个会话并发），和探测同时进行。
@@ -537,23 +711,62 @@ fn is_cloud_attrs(a: u32, tag: u32) -> bool {
     a & attrs::CLOUD_PLACEHOLDER_MASK != 0 || (a & attrs::REPARSE_POINT != 0 && reparse::is_cloud(tag))
 }
 
+/// 计划要做的工作量（估计用时 / 进度权重用），只算预检后标记为删 / 只删链接的条目。
+pub fn workload(plan: &Plan) -> Workload {
+    let mut w = Workload::default();
+    for it in plan.items.iter().filter(|i| i.blocked.is_none()) {
+        let mut any = false;
+        for (e, _) in it.will_delete() {
+            any = true;
+            if e.kind == EntryKind::Link {
+                match plan.entry_dest(it, e) {
+                    Dest::Quarantine => w.rename += 1,
+                    _ => w.links += 1,
+                }
+                continue;
+            }
+            match plan.entry_dest(it, e) {
+                Dest::Permanent => w.permanent += 1,
+                Dest::Recycle => w.recycle += 1,
+                Dest::Quarantine if plan.crosses_volume(&e.path) => {
+                    w.xvol += 1;
+                    w.xvol_bytes += e.size;
+                }
+                Dest::Quarantine => w.rename += 1,
+            }
+        }
+        if any {
+            w.dirs += it.dirs.len();
+        }
+    }
+    w
+}
+
 /// 汇总报告。`pending = true`（弹层先用的估算）时每项按扫描时的大小算、不能执行。
-fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool) -> PreflightReport {
+fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool, perf: &PerfModel) -> PreflightReport {
     let mut items = Vec::new();
     let (mut total_entries, mut total_bytes, mut total_skipped) = (0usize, 0u64, 0usize);
     let (mut locked_count, mut hot_count, mut cloud_count, mut link_count) = (0, 0, 0, 0);
     let mut review_items = Vec::new();
+    let mut by_dest = ByDest::default();
+    let mut skipped_bytes_all = 0u64;
+    let mut skipped_by_reason_all: BTreeMap<String, CountBytes> = BTreeMap::new();
+    let mut scan_total_bytes = 0u64;
+    // 跨盘暂存要在目的盘上占的空间（逻辑大小之和；硬链接已经跳过）
+    let mut xvol_need = 0u64;
     for it in &plan.items {
         let mut skipped = Vec::new();
         let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
         let (mut sk_count, mut sk_bytes, mut links) = (0usize, 0u64, 0usize);
         if it.blocked.is_none() {
+            scan_total_bytes += it.scan_allocated;
             for (e, d) in it.entries.iter().zip(&it.decisions) {
                 match d {
                     Decision::Skip { reason } => {
                         sk_count += 1;
                         sk_bytes += e.bytes;
                         *by_reason.entry(reason.code().to_string()).or_default() += 1;
+                        skipped_by_reason_all.entry(reason.code().to_string()).or_default().add(e.bytes);
                         match reason {
                             SkipReason::Locked { .. } => locked_count += 1,
                             SkipReason::Hot { .. } => hot_count += 1,
@@ -576,7 +789,23 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
                     _ => {}
                 }
             }
+            if !pending {
+                for (e, _) in it.will_delete() {
+                    let d = plan.entry_dest(it, e);
+                    by_dest.get_mut(d).add(e.bytes);
+                    if d == Dest::Quarantine && e.kind == EntryKind::File && plan.crosses_volume(&e.path) {
+                        xvol_need += e.size;
+                    }
+                }
+            } else {
+                let d = plan.dest_for(it);
+                by_dest.get_mut(d).bytes += it.scan_allocated;
+                if d == Dest::Quarantine && plan.crosses_volume(&it.path) {
+                    xvol_need += it.scan_allocated;
+                }
+            }
         }
+        skipped_bytes_all += sk_bytes;
         let wd_count = if it.blocked.is_none() && !pending { it.entry_count() } else { 0 };
         let wd_bytes = match (&it.blocked, pending) {
             (Some(_), _) => 0,
@@ -629,49 +858,85 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
     src_vols.sort();
     src_vols.dedup();
     let drives = crate::win::list_fixed_drives();
-    // 护栏 8：空间提示
-    match &plan.strategy {
-        Strategy::RecycleBin => {
-            for v in &src_vols {
-                if let Ok(sp) = crate::win::volume_space(v) {
-                    if sp.total_bytes > 0 && (sp.free_bytes as f64) < sp.total_bytes as f64 * LOW_SPACE_RATIO {
-                        warnings.push(Warning {
-                            code: "recycle_low_space".into(),
-                            message: format!(
-                                "{v} 只剩 {}（不到 10%）。回收站就在同一个盘上：删除后空间不会立刻腾出来，要等你清空回收站才行。想马上腾出空间，可以改成“隔离到其他盘”。",
-                                crate::view::human_bytes(sp.free_bytes)
-                            ),
-                            blocking: false,
-                        });
-                    }
+    // 哪些卷有东西要进回收站、各多少字节（护栏 8 只在这时提示）
+    let mut recycle_vols: BTreeMap<String, u64> = BTreeMap::new();
+    for it in plan.items.iter().filter(|i| i.blocked.is_none()) {
+        let (goes, b) = if pending {
+            (plan.dest_for(it) == Dest::Recycle && it.scan_allocated > 0, it.scan_allocated)
+        } else {
+            let mut n = 0usize;
+            let mut b = 0u64;
+            for (e, _) in it.will_delete() {
+                if plan.entry_dest(it, e) == Dest::Recycle {
+                    n += 1;
+                    b += e.bytes;
                 }
             }
-        }
-        Strategy::Quarantine { dest_root } => {
-            if let Some(why) = quarantine_dest_problem(dest_root, plan) {
-                warnings.push(Warning { code: "quarantine_bad_dest".into(), message: why, blocking: true });
+            (n > 0, b)
+        };
+        if goes {
+            if let Some(v) = crate::scan::volume_root_of(&it.path) {
+                *recycle_vols.entry(v).or_default() += b;
             }
-            let dest_vol = crate::scan::volume_root_of(dest_root).unwrap_or_default();
-            if src_vols.iter().any(|v| v.eq_ignore_ascii_case(&dest_vol)) {
+        }
+    }
+    // 护栏 8：空间提示（只在有东西进回收站时）
+    for (v, planned) in &recycle_vols {
+        if let Ok(sp) = crate::win::volume_space(v) {
+            if sp.total_bytes > 0 && (sp.free_bytes as f64) < sp.total_bytes as f64 * LOW_SPACE_RATIO {
                 warnings.push(Warning {
-                    code: "quarantine_same_volume".into(),
-                    message: format!("隔离区在 {dest_vol}，和要清理的东西在同一个盘上：只是挪了位置，这个盘不会腾出空间。"),
+                    code: "recycle_low_space".into(),
+                    message: format!(
+                        "{v} 只剩 {}（不到 10%）。回收站就在同一个盘上：删除后空间不会立刻腾出来，要等你清空回收站才行。想马上腾出空间，可以改成“隔离到其他盘”。",
+                        crate::view::human_bytes(sp.free_bytes)
+                    ),
                     blocking: false,
                 });
             }
-            match crate::win::volume_space(&dest_vol) {
-                Ok(sp) if sp.free_bytes < total_bytes.saturating_add(64 * 1024 * 1024) => warnings.push(Warning {
-                    code: "quarantine_no_space".into(),
+        }
+        // 回收站上限（MaxCapacity）：超了 Windows 会静默删掉最早放进回收站的东西
+        // （只在逐个检查做完后查：要列一遍回收站文件夹，本机 26 万项约 1 秒，弹层的估算不等它）
+        let cap = if pending { None } else { winops::recycle_bin_max_capacity(v).zip(winops::recycle_bin_usage(v)) };
+        if let Some((max, (used, _))) = cap {
+            if used.saturating_add(*planned) > max {
+                warnings.push(Warning {
+                    code: "recycle_over_capacity".into(),
                     message: format!(
-                        "隔离区所在的 {dest_vol} 只剩 {}，放不下这次要隔离的 {}（另留 64 MB 余量）。请换一个盘或改用回收站。",
-                        crate::view::human_bytes(sp.free_bytes),
-                        crate::view::human_bytes(total_bytes)
+                        "{v} 的回收站上限 {}，现在已经有 {}，再放 {} 就超了：Windows 会把回收站里最早的东西直接删掉。",
+                        crate::view::human_bytes(max),
+                        crate::view::human_bytes(used),
+                        crate::view::human_bytes(*planned)
                     ),
-                    blocking: true,
-                }),
-                Err(e) => warnings.push(Warning { code: "quarantine_bad_dest".into(), message: format!("隔离区位置不可用：{e}"), blocking: true }),
-                _ => {}
+                    blocking: false,
+                });
             }
+        }
+    }
+    let needs_quarantine = by_dest.quarantine.bytes > 0 || by_dest.quarantine.count > 0;
+    if let (Strategy::Quarantine { dest_root }, true) = (&plan.strategy, needs_quarantine) {
+        if let Some(why) = quarantine_dest_problem(dest_root, plan) {
+            warnings.push(Warning { code: "quarantine_bad_dest".into(), message: why, blocking: true });
+        }
+        let dest_vol = crate::scan::volume_root_of(dest_root).unwrap_or_default();
+        if src_vols.iter().any(|v| v.eq_ignore_ascii_case(&dest_vol)) {
+            warnings.push(Warning {
+                code: "quarantine_same_volume".into(),
+                message: format!("隔离区在 {dest_vol}，和要清理的东西在同一个盘上：只是挪了位置，这个盘不会腾出空间。"),
+                blocking: false,
+            });
+        }
+        match crate::win::volume_space(&dest_vol) {
+            Ok(sp) if xvol_need > 0 && sp.free_bytes < xvol_need.saturating_add(64 * 1024 * 1024) => warnings.push(Warning {
+                code: "quarantine_no_space".into(),
+                message: format!(
+                    "隔离区所在的 {dest_vol} 只剩 {}，放不下这次要隔离的 {}（另留 64 MB 余量）。请换一个盘或改用回收站。",
+                    crate::view::human_bytes(sp.free_bytes),
+                    crate::view::human_bytes(xvol_need)
+                ),
+                blocking: true,
+            }),
+            Err(e) => warnings.push(Warning { code: "quarantine_bad_dest".into(), message: format!("隔离区位置不可用：{e}"), blocking: true }),
+            _ => {}
         }
     }
     if locked_count > 0 {
@@ -697,9 +962,20 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
     let quarantine_choices = drives
         .iter()
         .filter(|d| !src_vols.iter().any(|v| v.eq_ignore_ascii_case(&d.root)))
-        .map(|d| DriveChoice { root: d.root.clone(), label: d.label.clone(), free_bytes: d.free_bytes, total_bytes: d.total_bytes })
+        .map(|d| DriveChoice {
+            root: d.root.clone(),
+            label: d.label.clone(),
+            free_bytes: d.free_bytes,
+            total_bytes: d.total_bytes,
+            dest_root: match super::quarantine::prepare_dest(&d.root, false) {
+                super::quarantine::DestStatus::Ok { dest_root } => Some(dest_root),
+                _ => None,
+            },
+        })
         .collect();
     let can_execute = !pending && plan.preflight_done && total_entries > 0 && !warnings.iter().any(|w| w.blocking);
+    let active_items = plan.items.iter().filter(|i| i.blocked.is_none() && i.entry_count() > 0).count();
+    let est_secs = if pending { 0.0 } else { perf.estimate_secs(&workload(plan), super::default_workers(), active_items) };
     PreflightReport {
         plan_id: plan.id.clone(),
         strategy: plan.strategy.clone(),
@@ -718,5 +994,11 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
         quarantine_choices,
         pending,
         timing_ms: BTreeMap::new(),
+        safe_direct: plan.safe_direct,
+        est_secs,
+        by_dest,
+        skipped_bytes: skipped_bytes_all,
+        skipped_by_reason: skipped_by_reason_all,
+        scan_total_bytes,
     }
 }

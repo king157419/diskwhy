@@ -3,10 +3,12 @@
 // 阶段 I：每块的圆角 / 描边 / 投影按块大小收敛（treemap.ts 的 tileBox），间隙等数值来自 tokens.css 的 --tm-*。
 // 布局仍是 src/treemap.ts 的 squarified + 嵌套：两层（当前文件夹的子项 → 它们的子项），颜色 = 三档，
 // 认不出来 / 合并的“其他”画成混合色。单击选中一个顶层块（右边列表跟着变），双击进入。
+// 阶段 J：块的配色类（.tm-tone.safe / review / keep / mix / na）不加 scoped，分析页的「图例」色块直接复用；
+// 扫不到的伪块（无权限 / 系统保留 / 未归属）单独一种 na；“外壳”合并块（Users \ king）单击选中的是外层 Users。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { tmKey, type ScanSummary, type TreemapNode } from "../api";
 import { isHardTag, loseTag } from "../labels";
-import { collapseChain, layoutTreemap, tileBox, type TileBox, type TileTokens, type TmInput, type TmItem } from "../treemap";
+import { collapseChain, layoutTreemap, samePath, tileBox, type TileBox, type TileTokens, type TmInput, type TmItem } from "../treemap";
 import { theme } from "../theme";
 import { sizeParts } from "../capacity";
 
@@ -57,10 +59,19 @@ const SHADOW_MIN_PX = 48;
 const PATTERN_MIN_PX = 24;
 
 const PSEUDO: Record<string, string> = { inacc: "无权限", sysest: "系统保留", unattr: "未归属", cloud: "云端占位" };
+const PSEUDO_TIP: Record<string, string> = {
+  inacc: "没有权限读，以管理员身份重启能看到",
+  sysest: "Windows 自己占着的，扫不到",
+  unattr: "盘上用了、但扫不到在哪",
+};
+
+/** 合并块的 key → 外层文件夹的路径（单击选中外层，比如 Users，而不是里面的 king） */
+let outerOf = new Map<string, string>();
 
 function toInput(n: TreemapNode): TmInput {
   // 几乎只装着一个文件夹的“外壳”（Users → king）合成一块，名字写成 “Users \ king”，里面直接铺内层的子项
   const { node, name } = collapseChain(n);
+  if (node !== n) outerOf.set(tmKey(node), n.path);
   return {
     key: tmKey(node),
     name,
@@ -75,6 +86,7 @@ function toInput(n: TreemapNode): TmInput {
 const root = computed<TmInput | null>(() => {
   const d = props.data;
   if (!d) return null;
+  outerOf = new Map();
   const r = toInput(d);
   if (props.isScanRoot) {
     const b = props.summary.buckets;
@@ -138,19 +150,32 @@ function nodeOf(it: TmItem): TreemapNode | null {
 function tone(it: TmItem): string {
   if (it.kind === "other") return "mix";
   const n = nodeOf(it);
-  if (!n) return "keep";
+  if (!n) return "na";
   if (n.kind === "Rest") return "mix";
   return n.tier === "unknown" ? "mix" : n.tier;
 }
+function topItem(it: TmItem): TmItem | null {
+  if (it.depth === 1) return it;
+  return items.value.find((x) => x.key === it.parentKey) ?? null;
+}
 function topNode(it: TmItem): TreemapNode | null {
-  if (it.depth === 1) return nodeOf(it);
-  const p = items.value.find((x) => x.key === it.parentKey);
-  return p ? nodeOf(p) : null;
+  const t = topItem(it);
+  return t ? nodeOf(t) : null;
+}
+/** 单击一个顶层块时选中的路径：合并块选外层（Users），其余就是它自己 */
+function selPath(it: TmItem): string | null {
+  const n = nodeOf(it);
+  if (!n) return null;
+  return outerOf.get(it.key) ?? n.path;
+}
+function isSel(it: TmItem): boolean {
+  return it.depth === 1 && samePath(selPath(it), props.focusPath);
 }
 
 function onClick(it: TmItem) {
-  const n = topNode(it);
-  if (n && n.kind === "Dir") emit("select", n.path);
+  const t = topItem(it);
+  const n = t ? nodeOf(t) : null;
+  if (t && n && n.kind === "Dir") emit("select", selPath(t)!);
 }
 function onDbl(it: TmItem) {
   const n = nodeOf(it);
@@ -177,11 +202,17 @@ const tip = computed(() => {
   const it = hover.value;
   if (!it || it.container) return null;
   const n = nodeOf(it);
+  const tn = tone(it);
+  const pseudo = (it.ref as { pseudo?: string } | undefined)?.pseudo;
+  let what = n?.what ?? (it.kind === "other" ? `${it.mergedCount} 个小项合计` : "");
+  if (!what && pseudo) what = PSEUDO_TIP[pseudo] ?? "";
+  // 认不出来的块没有说明时的兜底（阶段 J §3.9）
+  if (!what && tn === "mix") what = "认不出来，点开看线索";
   return {
     name: it.name,
     size: sizeParts(it.value).join(" "),
-    tone: tone(it),
-    what: n?.what ?? (it.kind === "other" ? `${it.mergedCount} 个小项合计` : ""),
+    tone: tn,
+    what,
     lose: n && n.tier === "review" ? n.lose_kind : null,
     loseText: n && n.tier === "review" ? loseTag(n) : null,
   };
@@ -206,7 +237,7 @@ function gb(v: number) {
       <div
         v-if="it.container"
         class="g"
-        :class="{ sel: nodeOf(it)?.path === focusPath }"
+        :class="{ sel: isSel(it) }"
         :style="boxStyle(b, true)"
         role="button"
         tabindex="0"
@@ -220,7 +251,7 @@ function gb(v: number) {
       </div>
       <div
         v-else
-        class="lf"
+        class="lf tm-tone"
         :class="[
           tone(it),
           {
@@ -229,7 +260,7 @@ function gb(v: number) {
             bare: label(b) === 'none',
             solid: !b.pattern,
             hov: hover?.key === it.key,
-            sel: it.depth === 1 && nodeOf(it)?.path === focusPath,
+            sel: isSel(it),
           },
         ]"
         :style="boxStyle(b, false)"
@@ -348,46 +379,10 @@ function gb(v: number) {
 .lf.big .b {
   font-size: 13px;
 }
-.lf.safe {
-  background: var(--safe);
-  color: #fff;
-}
-.lf.review {
-  background: var(--review);
-  color: #fff;
-}
-.lf.keep {
-  background: var(--keep);
-  color: var(--ink);
-}
-.lf.mix {
-  background: var(--keep2);
-  color: var(--ink2);
-}
-[data-theme="B"] .lf.safe {
-  background: #e4bc70;
-  color: #241a0d;
-}
-[data-theme="B"] .lf.review {
-  background: #d97d62;
-  color: #21120c;
-}
-[data-theme="B"] .lf.keep {
-  background: #40372f;
-  color: var(--ink2);
-}
-[data-theme="B"] .lf.mix {
-  background: #2e2823;
-  color: var(--ink3);
-}
 [data-theme="C"] .lf {
   border-style: solid;
   border-color: #141412;
   color: #141412;
-}
-/* 斜条纹只给 ≥ 24px 的块，小块用纯浅色，免得一片噪点 */
-[data-theme="C"] .lf.mix:not(.solid) {
-  background: repeating-linear-gradient(135deg, #f4f0e6 0 5px, #e6e1d5 5px 10px);
 }
 .lf.hov {
   outline: 2px solid var(--ink);
@@ -448,5 +443,71 @@ function gb(v: number) {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+</style>
+
+<!-- 方块的配色（不加 scoped：分析页「图例」的色块直接用同一组类，C 主题的斜条纹就是真斜条纹） -->
+<style>
+.tm-tone.safe {
+  background: var(--safe);
+  color: #fff;
+}
+.tm-tone.review {
+  background: var(--review);
+  color: #fff;
+}
+.tm-tone.keep {
+  background: var(--keep);
+  color: var(--ink);
+}
+.tm-tone.mix {
+  background: var(--keep2);
+  color: var(--ink2);
+}
+/* 扫不到（无权限 / 系统保留 / 未归属）：细网格 */
+.tm-tone.na {
+  color: var(--ink2);
+  background:
+    repeating-linear-gradient(45deg, transparent 0 5px, rgba(0, 0, 0, 0.07) 5px 6px),
+    repeating-linear-gradient(-45deg, transparent 0 5px, rgba(0, 0, 0, 0.07) 5px 6px),
+    var(--keep2);
+}
+[data-theme="B"] .tm-tone.safe {
+  background: #e4bc70;
+  color: #241a0d;
+}
+[data-theme="B"] .tm-tone.review {
+  background: #d97d62;
+  color: #21120c;
+}
+[data-theme="B"] .tm-tone.keep {
+  background: #40372f;
+  color: var(--ink2);
+}
+[data-theme="B"] .tm-tone.mix {
+  background: #2e2823;
+  color: var(--ink3);
+}
+[data-theme="B"] .tm-tone.na {
+  color: var(--ink3);
+  background:
+    repeating-linear-gradient(45deg, transparent 0 5px, rgba(255, 255, 255, 0.06) 5px 6px),
+    repeating-linear-gradient(-45deg, transparent 0 5px, rgba(255, 255, 255, 0.06) 5px 6px),
+    #221d18;
+}
+[data-theme="C"] .tm-tone {
+  color: #141412;
+}
+/* 斜条纹只给 ≥ 24px 的块，小块用纯浅色，免得一片噪点 */
+[data-theme="C"] .tm-tone.mix:not(.solid) {
+  background: repeating-linear-gradient(135deg, #f4f0e6 0 5px, #e6e1d5 5px 10px);
+}
+[data-theme="C"] .tm-tone.na:not(.solid) {
+  background:
+    radial-gradient(#141412 1px, transparent 1.3px) 0 0 / 8px 8px,
+    #fff;
+}
+[data-theme="C"] .tm-tone.na.solid {
+  background: #fff;
 }
 </style>

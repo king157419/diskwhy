@@ -77,6 +77,7 @@ pub fn build_plan_quick(result: &ScanResult, ctx: &ExplainCtx, protector: &Prote
         items,
         warnings,
         preflight_done: false,
+        safe_direct: true,
     }
 }
 

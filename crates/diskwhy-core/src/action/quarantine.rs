@@ -1,4 +1,5 @@
-//! 隔离区：`<dest_root>\DiskWhy-Quarantine\<时间戳>\<原路径映射>` + `manifest.json`。
+//! 隔离区（界面上叫“暂存区”）：`<dest_root>\DiskWhy暂存区\<时间戳>\<原路径映射>` + `manifest.json`
+//! （阶段 J 之前的批次在 `<dest_root>\DiskWhy-Quarantine\…`，[`list_batches`] / [`restore`] / [`purge`] 照样认）。
 //!
 //! - 原路径映射：`C:\Users\me\AppData\Local\Temp\x.bin` → `<批次>\C\Users\me\AppData\Local\Temp\x.bin`；
 //! - 移入：先 `MoveFileExW` 同卷改名；跨卷（ERROR_NOT_SAME_DEVICE）则复制（`CopyFileExW`，保留时间和属性）
@@ -15,7 +16,15 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const DIR_NAME: &str = "DiskWhy-Quarantine";
+/// 新批次用的文件夹名（阶段 J 起）。
+pub const DIR_NAME: &str = "DiskWhy暂存区";
+/// 以前用过的文件夹名（列批次 / 清空时同样认）。
+pub const OLD_DIR_NAMES: &[&str] = &["DiskWhy-Quarantine"];
+
+/// 新旧所有文件夹名。
+pub fn all_dir_names() -> impl Iterator<Item = &'static str> {
+    std::iter::once(DIR_NAME).chain(OLD_DIR_NAMES.iter().copied())
+}
 pub const MANIFEST: &str = "manifest.json";
 pub const FORMAT: &str = "diskwhy-quarantine";
 pub const KEEP_DAYS: i64 = 7;
@@ -77,7 +86,8 @@ impl Manifest {
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let tmp = path.with_extension("json.tmp");
-        let s = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        // 阶段 J：紧凑格式（20 万条时带缩进的要 80 MB 左右，执行中每 10 秒存一次）
+        let s = serde_json::to_vec(self).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, s).map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("写 {} 失败：{e}", path.display()))
     }
@@ -157,17 +167,39 @@ fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
 /// 移动一个文件：同卷改名；跨卷复制 → 校验 → 删除原文件。返回用的方法。
 /// `dst` 已存在时失败（不覆盖任何东西）。
 pub fn move_file(src: &str, dst: &str) -> Result<&'static str, String> {
-    ensure_parent(dst)?;
-    if std::fs::symlink_metadata(winops_long(dst)).is_ok() {
-        return Err(format!("目标位置已经有东西了：{dst}（不覆盖）"));
+    move_file_cancellable(src, dst, None)
+}
+
+/// 同 [`move_file`]；跨卷复制用 `CopyFileExW`，`cancel` 变成非 0 时大文件也能中途停下（半截的复制品删掉，原文件不动）。
+pub fn move_file_cancellable(src: &str, dst: &str, cancel: Option<&std::sync::atomic::AtomicI32>) -> Result<&'static str, String> {
+    move_file_with(src, dst, cancel, false)
+}
+
+/// 同 [`move_file_cancellable`]。`parent_ready = true`（调用方刚在同一个文件夹里放过东西）时省掉“建上层文件夹”和
+/// “目标已存在”这两次额外的文件系统调用：MoveFileExW 不带 REPLACE_EXISTING、CopyFileExW 带 FAIL_IF_EXISTS，
+/// 目标已存在时本来就会失败（183 / 80），照样不覆盖；上层文件夹不在（3）时补建再试一次。
+pub fn move_file_with(src: &str, dst: &str, cancel: Option<&std::sync::atomic::AtomicI32>, parent_ready: bool) -> Result<&'static str, String> {
+    if !parent_ready {
+        ensure_parent(dst)?;
+        if std::fs::symlink_metadata(winops_long(dst)).is_ok() {
+            return Err(format!("目标位置已经有东西了：{dst}（不覆盖）"));
+        }
     }
-    match winops::rename(src, dst) {
+    let mut first = winops::rename(src, dst);
+    if parent_ready && first == Err(3) {
+        ensure_parent(dst)?;
+        first = winops::rename(src, dst);
+    }
+    match first {
         Ok(()) => Ok("rename"),
+        Err(183) | Err(80) => Err(format!("目标位置已经有东西了：{dst}（不覆盖）")),
         Err(code) if code == winops::ERROR_NOT_SAME_DEVICE => {
-            // 跨卷：CopyFileExW（std::fs::copy 在 Windows 上就是它，保留时间和属性）
-            std::fs::copy(winops_long(src), winops_long(dst)).map_err(|e| {
-                let _ = std::fs::remove_file(winops_long(dst));
-                format!("复制到另一个盘失败：{e}")
+            winops::copy_file_cancellable(src, dst, cancel).map_err(|c| {
+                if c == winops::ERROR_REQUEST_ABORTED {
+                    "已停止：复制到一半停下了，复制品已删掉，原文件没动".to_string()
+                } else {
+                    format!("复制到另一个盘失败（Win32 错误 {c}）")
+                }
             })?;
             match same_content(src, dst) {
                 Ok(true) => {}
@@ -319,12 +351,12 @@ pub struct PurgeReport {
     pub error: Option<String>,
 }
 
-/// 彻底删除一个批次（不可恢复）。只接受 `...\DiskWhy-Quarantine\<批次>\manifest.json`。
+/// 彻底删除一个批次（不可恢复）。只接受 `...\DiskWhy暂存区\<批次>\manifest.json`（或旧名 `DiskWhy-Quarantine`）。
 pub fn purge(manifest_path: &Path, log: &ActionLog) -> Result<PurgeReport, String> {
     let m = Manifest::load(manifest_path)?;
     let dir = manifest_path.parent().ok_or("清单路径不对")?;
     let parent_name = dir.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    if !parent_name.eq_ignore_ascii_case(DIR_NAME) {
+    if !all_dir_names().any(|n| parent_name.eq_ignore_ascii_case(n)) {
         return Err(format!("{} 不在 {DIR_NAME} 文件夹里，拒绝清空", dir.display()));
     }
     let dir_s = dir.to_string_lossy().to_string();
@@ -380,13 +412,12 @@ pub struct BatchInfo {
     pub items: Vec<String>,
 }
 
-/// 列出若干根目录下（`<root>\DiskWhy-Quarantine\*\manifest.json`）的批次，新的在前。
+/// 列出若干根目录下（`<root>\DiskWhy暂存区\*\manifest.json`，以及旧名 `DiskWhy-Quarantine`）的批次，新的在前。
 pub fn list_batches(roots: &[String]) -> Vec<BatchInfo> {
     let now = crate::explain::now_unix();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for r in roots {
-        let q = crate::fs::join(r, DIR_NAME);
+    for q in roots.iter().flat_map(|r| all_dir_names().map(move |n| crate::fs::join(r, n))) {
         let Ok(rd) = std::fs::read_dir(&q) else { continue };
         for d in rd.flatten() {
             let mp = d.path().join(MANIFEST);
@@ -448,5 +479,180 @@ pub fn tier_str(t: Tier) -> &'static str {
         Tier::Safe => "safe",
         Tier::Review => "review",
         Tier::Keep => "keep",
+    }
+}
+
+// ───────────────────────── 阶段 J：暂存区落点（盘根不可写时） ─────────────────────────
+
+/// 某个盘上暂存区的落点（[`prepare_dest`] 的结果）。序列化成 `{status:"ok", dest_root}` /
+/// `{status:"needs_elevation"}` / `{status:"failed", message}`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DestStatus {
+    /// `dest_root` 可以直接当 `Strategy::Quarantine { dest_root }` 用（批次放在 `<dest_root>\DiskWhy暂存区\…`）。
+    Ok { dest_root: String },
+    /// 这个盘的根目录普通权限建不了文件夹，当前账户是管理员（受限令牌）：可以点“授权”提权建一次。
+    NeedsElevation,
+    /// 建不了，也提不了权：请用户选文件夹。
+    Failed { message: String },
+}
+
+/// `X:\` 形式的盘根（大小写不限）。
+pub fn is_drive_root(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+/// 在 `dir` 里建一个临时子文件夹再删掉，确认能写（不留下任何东西）。
+pub fn dir_writable(dir: &str) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let probe = crate::fs::join(dir, &format!(".dw-probe-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    match std::fs::create_dir(winops_long(&probe)) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(winops_long(&probe));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 是普通文件夹（不是链接 / 联接）。
+fn plain_dir(p: &str) -> bool {
+    std::fs::symlink_metadata(winops_long(p)).map(|m| m.is_dir() && !m.file_type().is_symlink()).unwrap_or(false)
+        && winops::stat_entry(p).map(|r| r.attrs & crate::fs::attrs::REPARSE_POINT == 0).unwrap_or(false)
+}
+
+/// 找某个盘上能用的暂存区位置（`docs/PHASE_J_PLAN.md` §3.2 的 ①②③，不提权）：
+/// ① `X:\DiskWhy暂存区` 已存在且可写 → 用；② 试建（`create = false` 时只试一下就删掉，不留东西）→ 能建就用；
+/// ③ `quarantine-roots.json` 里这个盘以前用过的位置仍可写 → 用；都不行 → 管理员账户（受限令牌）给
+/// `NeedsElevation`，否则 `Failed`。
+pub fn prepare_dest(drive_root: &str, create: bool) -> DestStatus {
+    prepare_dest_with(drive_root, create, &known_roots(), winops::elevation_type())
+}
+
+/// 同 [`prepare_dest`]，以前用过的位置和提权类型由调用方给（测试用）。
+pub fn prepare_dest_with(drive_root: &str, create: bool, known: &[String], elevation_type: i32) -> DestStatus {
+    if !is_drive_root(drive_root) {
+        return DestStatus::Failed { message: format!("「{drive_root}」不是盘的根目录（应形如 D:\\）") };
+    }
+    if !std::path::Path::new(drive_root).is_dir() {
+        return DestStatus::Failed { message: format!("{drive_root} 不存在") };
+    }
+    let q = crate::fs::join(drive_root, DIR_NAME);
+    // ①
+    if plain_dir(&q) && dir_writable(&q) {
+        return DestStatus::Ok { dest_root: drive_root.to_string() };
+    }
+    // ②
+    if !std::path::Path::new(&winops_long(&q)).exists() {
+        if create {
+            if std::fs::create_dir(winops_long(&q)).is_ok() {
+                return DestStatus::Ok { dest_root: drive_root.to_string() };
+            }
+        } else if std::fs::create_dir(winops_long(&q)).is_ok() {
+            let _ = std::fs::remove_dir(winops_long(&q));
+            return DestStatus::Ok { dest_root: drive_root.to_string() };
+        }
+    }
+    // ③
+    for r in known {
+        if r.eq_ignore_ascii_case(drive_root) || !crate::scan::volume_root_of(r).is_some_and(|v| v.eq_ignore_ascii_case(drive_root)) {
+            continue;
+        }
+        if !plain_dir(r) {
+            continue;
+        }
+        let rq = crate::fs::join(r, DIR_NAME);
+        if (plain_dir(&rq) && dir_writable(&rq)) || (!std::path::Path::new(&winops_long(&rq)).exists() && dir_writable(r)) {
+            return DestStatus::Ok { dest_root: r.clone() };
+        }
+    }
+    if elevation_type == 3 {
+        DestStatus::NeedsElevation
+    } else {
+        DestStatus::Failed { message: format!("{drive_root} 不让建文件夹，请选一个能写的文件夹") }
+    }
+}
+
+/// 提权子进程的命令行开关：`diskwhy.exe --mkdir-quarantine X:\ --grant-sid S-1-5-21-…`。
+pub const MKDIR_FLAG: &str = "--mkdir-quarantine";
+pub const SID_FLAG: &str = "--grant-sid";
+
+/// 提权子进程的退出码。
+pub mod mkdir_exit {
+    pub const OK: i32 = 0;
+    pub const BAD_ARGS: i32 = 2;
+    pub const MKDIR_FAILED: i32 = 3;
+    pub const NOT_PLAIN_DIR: i32 = 4;
+    pub const ICACLS_FAILED: i32 = 5;
+}
+
+/// 给提权子进程的参数（盘根带结尾 `\`，命令行里要写成 `"X:\\"` 防止 `\"` 被当成转义的引号）。
+pub fn mkdir_params(drive_root: &str, sid: &str) -> String {
+    format!("{MKDIR_FLAG} \"{drive_root}\\\" {SID_FLAG} {sid}")
+}
+
+fn valid_sid(s: &str) -> bool {
+    s.starts_with("S-1-") && s.len() < 200 && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == 'S')
+}
+
+/// 程序一启动就调用（在建任何窗口之前）：命令行是 `--mkdir-quarantine X:\ --grant-sid <SID>` 时，
+/// 建 `X:\DiskWhy暂存区`、用 icacls 给这个 SID 加“修改”权限（`(OI)(CI)M`，子文件夹 / 文件继承），返回退出码；
+/// 不是这个模式返回 None。只接受固定盘的盘根和形如 `S-1-…` 的 SID；文件夹已存在但是链接 / 联接时拒绝。
+pub fn elevated_mkdir_from_args(args: &[String]) -> Option<i32> {
+    let i = args.iter().position(|a| a == MKDIR_FLAG)?;
+    let root = args.get(i + 1).map(|s| {
+        let t = s.trim_matches('"');
+        if t.len() == 2 { format!("{t}\\") } else { t.trim_end_matches('\\').to_string() + "\\" }
+    });
+    let sid = args.iter().position(|a| a == SID_FLAG).and_then(|j| args.get(j + 1)).cloned();
+    let (Some(root), Some(sid)) = (root, sid) else { return Some(mkdir_exit::BAD_ARGS) };
+    if !is_drive_root(&root) || !valid_sid(&sid) {
+        return Some(mkdir_exit::BAD_ARGS);
+    }
+    if !crate::win::list_fixed_drives().iter().any(|d| d.root.eq_ignore_ascii_case(&root)) {
+        return Some(mkdir_exit::BAD_ARGS);
+    }
+    let q = crate::fs::join(&root, DIR_NAME);
+    if std::fs::symlink_metadata(winops_long(&q)).is_ok() {
+        if !plain_dir(&q) {
+            return Some(mkdir_exit::NOT_PLAIN_DIR);
+        }
+    } else if std::fs::create_dir(winops_long(&q)).is_err() {
+        return Some(mkdir_exit::MKDIR_FAILED);
+    }
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let icacls = format!(r"{sysroot}\System32\icacls.exe");
+    let mut cmd = std::process::Command::new(icacls);
+    cmd.arg(&q).arg("/grant").arg(format!("*{sid}:(OI)(CI)M"));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => Some(mkdir_exit::OK),
+        _ => Some(mkdir_exit::ICACLS_FAILED),
+    }
+}
+
+/// 非提权一侧：用当前用户的 SID 以管理员身份运行本程序的 `--mkdir-quarantine`，等它结束，再走一遍
+/// [`prepare_dest`]（`create = true`）。用户在 UAC 里点“否”→ `Failed { message: "你取消了授权" }`。
+pub fn elevate_and_prepare(exe: &str, drive_root: &str) -> DestStatus {
+    if !is_drive_root(drive_root) {
+        return DestStatus::Failed { message: format!("「{drive_root}」不是盘的根目录") };
+    }
+    let Some(sid) = winops::current_user_sid() else {
+        return DestStatus::Failed { message: "读不到当前用户".into() };
+    };
+    match winops::run_elevated_wait(exe, &mkdir_params(drive_root, &sid)) {
+        Ok(0) => match prepare_dest(drive_root, true) {
+            DestStatus::NeedsElevation => DestStatus::Failed { message: "授权后还是写不进去，请选其他文件夹".into() },
+            s => s,
+        },
+        Ok(code) => DestStatus::Failed { message: format!("授权建文件夹失败（代码 {code}），请选其他文件夹") },
+        Err(None) => DestStatus::Failed { message: "你取消了授权".into() },
+        Err(Some(m)) => DestStatus::Failed { message: m },
     }
 }

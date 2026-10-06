@@ -162,3 +162,11 @@ export function advice(tier: string, how: How[], howDetail?: string | null, grou
   const kind = adviceKind(tier, how, group);
   return { kind, head: ADVICE_TEXT[kind], detail: (howDetail ?? "").trim() };
 }
+
+// ───── 盘名（阶段 J：界面上不再写死“C 盘”） ─────
+
+/** 扫描根 → “C 盘” / “D 盘”；扫的是某个文件夹时取它所在的盘；认不出盘符时写“磁盘” */
+export function driveName(root: string | null | undefined): string {
+  const m = /^([A-Za-z]):/.exec((root ?? "").trim());
+  return m ? `${m[1].toUpperCase()} 盘` : "磁盘";
+}

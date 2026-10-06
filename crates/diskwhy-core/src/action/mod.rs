@@ -7,9 +7,11 @@
 //!    （文件 ID / 大小 / 修改时间）。
 //! 2. [`preflight`]：逐项、逐条检查，给出阻止 / 跳过 / 警告（见 [`preflight`] 模块说明的 9 条护栏）。
 //! 3. [`execute`]：只处理预检标记为“删”的条目；执行前每个条目再取一次指纹，对不上就跳过；
-//!    回收站走 `IFileOperation`，隔离区走 `MoveFileExW`（跨卷：复制 → 逐字节校验 → 删除）；
-//!    每条结果写进 `%LOCALAPPDATA%\DiskWhy\actions.log`（JSON lines）。最多 4 个线程并发，
-//!    失败不回滚已成功的项。
+//!    去向按条目所属清单项决定（阶段 J，[`Plan::dest_for`]）：safe 档且 `safe_direct` → 直接删除
+//!    （同一个句柄上重新校验后设删除标记）；其余按策略：回收站走 `IFileOperation`，暂存区走 `MoveFileExW`
+//!    （跨卷：`CopyFileExW` 可中断 → 逐字节校验 → 删除），`Permanent` 直接删除；
+//!    所有清单项的条目切成 256 条一块进同一个工作队列，`clamp(CPU 数, 4, 16)` 个线程；
+//!    每条结果写进 `%LOCALAPPDATA%\DiskWhy\actions.log`（JSON lines）。失败不回滚已成功的项。
 //! 4. 隔离区可以一键还原（[`quarantine::restore`]）或彻底清空（[`quarantine::purge`]）。
 //!
 //! `builtin_tool` / `migrate` 只给指引（[`guidance`]），**本阶段不自动运行任何系统命令**。
@@ -17,14 +19,17 @@
 pub mod execute;
 pub mod guidance;
 pub mod log;
+pub mod perf;
 pub mod plan;
 pub mod preflight;
 pub mod protect;
 pub mod quarantine;
 pub mod refresh;
+pub mod runstate;
 pub mod winops;
 
 pub use execute::{execute, ExecOptions, ExecProgress, ExecReport, ItemResult};
+pub use perf::PerfModel;
 pub use plan::{build_plan, build_plan_quick, enumerate_plan};
 pub use preflight::{preflight, preflight_with, quote, PreflightOptions, PreflightReport};
 
@@ -36,8 +41,15 @@ use winops::{Fingerprint, LockingProcess};
 pub const PREVIEW_LIMIT: usize = 200;
 /// 30 分钟内修改过的文件视为“正在用”，跳过。
 pub const HOT_WINDOW_SECS: i64 = 30 * 60;
-/// 执行并发上限。
-pub const MAX_WORKERS: usize = 4;
+/// 执行并发上限（阶段 J：所有条目切块进同一个队列，线程数 `clamp(CPU 数, 4, 16)`）。
+pub const MAX_WORKERS: usize = 16;
+/// 执行队列里一块的条目数。
+pub const CHUNK: usize = 256;
+
+/// 执行用几个线程：`clamp(CPU 数, 4, 16)`。
+pub fn default_workers() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, MAX_WORKERS)
+}
 /// 单个清单项最多枚举多少条（超过就整项拒绝，让用户分批）。
 pub const MAX_ENTRIES_PER_ITEM: usize = 500_000;
 /// 回收站所在卷可用空间低于这个比例时提示“删了不会立刻腾空间”。
@@ -51,14 +63,67 @@ pub enum Strategy {
     RecycleBin,
     /// 移到 `<dest_root>\DiskWhy-Quarantine\<时间戳>\<原路径映射>`，保留 7 天，可一键还原。
     Quarantine { dest_root: String },
+    /// 直接删除（阶段 J）：不进回收站、不进暂存区。
+    Permanent,
 }
 
 impl Strategy {
     pub fn label(&self) -> String {
         match self {
             Strategy::RecycleBin => "回收站".into(),
-            Strategy::Quarantine { dest_root } => format!("隔离区（{dest_root}）"),
+            Strategy::Quarantine { dest_root } => format!("暂存区（{dest_root}）"),
+            Strategy::Permanent => "直接删除".into(),
         }
+    }
+}
+
+/// 一个清单项实际去哪（阶段 J，见 [`Plan::dest_for`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dest {
+    Permanent,
+    Recycle,
+    Quarantine,
+}
+
+/// 个数 + 字节。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountBytes {
+    pub count: usize,
+    pub bytes: u64,
+}
+
+impl CountBytes {
+    pub fn add(&mut self, bytes: u64) {
+        self.count += 1;
+        self.bytes += bytes;
+    }
+    pub fn merge(&mut self, o: &CountBytes) {
+        self.count += o.count;
+        self.bytes += o.bytes;
+    }
+}
+
+/// 按去向分别统计。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByDest {
+    pub permanent: CountBytes,
+    pub recycle: CountBytes,
+    pub quarantine: CountBytes,
+}
+
+impl ByDest {
+    pub fn get_mut(&mut self, d: Dest) -> &mut CountBytes {
+        match d {
+            Dest::Permanent => &mut self.permanent,
+            Dest::Recycle => &mut self.recycle,
+            Dest::Quarantine => &mut self.quarantine,
+        }
+    }
+    pub fn merge(&mut self, o: &ByDest) {
+        self.permanent.merge(&o.permanent);
+        self.recycle.merge(&o.recycle);
+        self.quarantine.merge(&o.quarantine);
     }
 }
 
@@ -119,6 +184,10 @@ pub enum SkipReason {
     Missing,
     /// 读不到信息。
     Unreadable { code: u32 },
+    /// 跨盘暂存时链接数 > 1 的文件（阶段 J）：整份拷到别的盘既占空间又不腾空间。
+    Hardlink { links: u32 },
+    /// 回收站收不下（比回收站上限还大 / 这个盘的回收站设成了直接删除）：送进去会被 Windows 直接永久删除，所以不送（阶段 J）。
+    RecycleUnavailable { why: String },
 }
 
 impl SkipReason {
@@ -132,6 +201,8 @@ impl SkipReason {
             SkipReason::Changed { .. } => "changed",
             SkipReason::Missing => "missing",
             SkipReason::Unreadable { .. } => "unreadable",
+            SkipReason::Hardlink { .. } => "hardlink",
+            SkipReason::RecycleUnavailable { .. } => "recycle_unavailable",
         }
     }
 
@@ -149,6 +220,8 @@ impl SkipReason {
             SkipReason::Changed { what } => format!("生成清单之后被改过：{what}（防止删掉被替换的文件，跳过）"),
             SkipReason::Missing => "已经不在了".into(),
             SkipReason::Unreadable { code } => format!("读不到文件信息（Win32 错误 {code}）"),
+            SkipReason::Hardlink { .. } => "硬链接，删了不腾空间".into(),
+            SkipReason::RecycleUnavailable { why } => why.clone(),
         }
     }
 }
@@ -290,11 +363,64 @@ pub struct Plan {
     pub warnings: Vec<String>,
     /// 预检做过了没有（没做过不许执行）。
     pub preflight_done: bool,
+    /// 阶段 J：safe 档（可放心清理，会自动重建）直接删除，不管 `strategy`；false 时 safe 档也按 `strategy`
+    /// （用户明确选了“回收站”时前端传 false）。默认 true。
+    #[serde(default = "yes")]
+    pub safe_direct: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Plan {
     pub fn total_bytes(&self) -> u64 {
         self.items.iter().filter(|i| i.blocked.is_none()).map(|i| i.bytes()).sum()
+    }
+
+    /// 这一项的去向：safe 档且 `safe_direct` → 直接删除；否则按策略。9 条护栏和去向无关，都在去向之前执行。
+    pub fn dest_for(&self, item: &PlanItem) -> Dest {
+        if item.tier == Tier::Safe && self.safe_direct {
+            return Dest::Permanent;
+        }
+        match self.strategy {
+            Strategy::RecycleBin => Dest::Recycle,
+            Strategy::Quarantine { .. } => Dest::Quarantine,
+            Strategy::Permanent => Dest::Permanent,
+        }
+    }
+
+    /// 暂存区根目录（策略是暂存时）。
+    pub fn quarantine_root(&self) -> Option<&str> {
+        match &self.strategy {
+            Strategy::Quarantine { dest_root } => Some(dest_root),
+            _ => None,
+        }
+    }
+
+    /// 某个条目进暂存区是否跨盘（盘符不同）。
+    pub fn crosses_volume(&self, entry_path: &str) -> bool {
+        match self.quarantine_root() {
+            Some(d) => !same_volume(d, entry_path),
+            None => false,
+        }
+    }
+
+    /// 某一条（预检后的决定）实际去哪：链接在同盘暂存时整体改名进暂存区，其余链接直接删（算“直接删除”）。
+    pub fn entry_dest(&self, item: &PlanItem, e: &Entry) -> Dest {
+        let d = self.dest_for(item);
+        if e.kind == EntryKind::Link && !(d == Dest::Quarantine && !self.crosses_volume(&e.path)) {
+            return Dest::Permanent;
+        }
+        d
+    }
+}
+
+/// 两个路径是否在同一个盘符上（按 `X:` 比较；挂载点之类真的跨卷时 `MoveFileExW` 会报 NOT_SAME_DEVICE，照样改走复制）。
+pub fn same_volume(a: &str, b: &str) -> bool {
+    match (crate::scan::volume_root_of(a), crate::scan::volume_root_of(b)) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(&y),
+        _ => false,
     }
 }
 

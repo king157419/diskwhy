@@ -26,6 +26,23 @@
 //!   先发 quote 让弹层立刻出现，再在后台枚举实际内容并预检，期间发 progress；阶段 G）
 //! - `cancel_preview()`：取消正在进行的预检
 //! - `execute_plan(plan_id, skip_locked, onProgress)` -> ExecOutcome（执行 + 重扫受影响的子树 + 新摘要）
+//!
+//! 阶段 J：
+//! - `preview_plan(items, strategy, safeDirect?, onEvent)`：`safeDirect`（默认 true）= safe 档直接删除；
+//!   用户明确选“回收站”时前端传 false。`strategy` 多了 `{ kind: "permanent" }`；
+//! - `cancel_execute()` -> bool：停止正在进行的执行（不再取新块，当前文件做完 / 中断，返回 cancelled = true 的报告）；
+//! - `action_status()` -> bool：现在是否在执行 / 还原 / 清空（界面重载后用）；
+//! - `last_interrupted()` -> Option<Interrupted>：上次清理被打断（last-run.json 还是 running、进程已不在）；
+//!   `dismiss_interrupted()`：看过了；
+//! - `prepare_quarantine(driveRoot)` -> {status:"ok",dest_root} | {status:"needs_elevation"} | {status:"failed",message}；
+//!   `elevate_quarantine(driveRoot)`：UAC 一次，提权运行本程序的 `--mkdir-quarantine X:\ --grant-sid <SID>`，再走一遍；
+//! - 执行期间点 ✕ / Alt+F4 / 任务栏关闭：拦下（`prevent_close`），发事件 `close-blocked`（payload null）给前端；
+//!   按了停止 20 秒后还在执行就不再拦（安全阀）；
+//! - `exec_progress()` -> Option<ExecProgress>：执行中最近一次进度（界面重载 / 窗口重建后重新附着）；
+//! - `last_exec_report()` -> Option<ExecReport>：本次运行最近一次执行的报告；
+//! - `log_frontend_error(message, stack?, source?)`：前端报错记进 `%LOCALAPPDATA%\DiskWhy\crash.log`；
+//! - 闪退取证：panic hook / 未处理原生异常 minidump（`diskwhy_core::crash`）；WebView2 进程挂了记录并恢复
+//!   （浏览器主进程 → 重建主窗口；渲染进程 → 重新加载），见 `watch_webview`。
 //! - `list_quarantine` / `restore_batch(manifest_path)` / `purge_batch(manifest_path)`
 //! - `get_guidance(path, kind)` -> keep / 只能用工具 / 迁移 的指引（只展示命令，不运行）
 //! - `open_system_settings(uri)` -> 打开白名单里的 ms-settings 页
@@ -37,7 +54,9 @@
 use diskwhy_core::action::guidance::{self, Guidance};
 use diskwhy_core::action::log::ActionLog;
 use diskwhy_core::action::protect::Protector;
-use diskwhy_core::action::quarantine::{self, BatchInfo, PurgeReport, RestoreReport};
+use diskwhy_core::action::quarantine::{self, BatchInfo, DestStatus, PurgeReport, RestoreReport};
+use diskwhy_core::action::runstate::{self, Interrupted, RunState};
+use diskwhy_core::action::PerfModel;
 use diskwhy_core::action::refresh::RefreshReport;
 use diskwhy_core::action::{self, ExecOptions, ExecProgress, ExecReport, Plan, PlanRequest, PreflightOptions, PreflightReport, Progress, ProgressView, Strategy};
 use diskwhy_core::explain::llm::{self, LlmSettings};
@@ -55,7 +74,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 #[derive(Default)]
@@ -73,6 +92,38 @@ struct AppState {
     preview: Mutex<Option<Arc<Progress>>>,
     /// 正在执行 / 还原 / 清空。
     acting: AtomicBool,
+    /// 阶段 J：正在进行的执行的停止信号（`cancel_execute` 置位）。
+    exec_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// 阶段 J：什么时候按的“停止”（关窗守卫的安全阀：停止后 20 秒还没停下来，就不再拦关窗）。
+    cancel_at: Mutex<Option<std::time::Instant>>,
+    /// 阶段 J：执行中最近一次进度（界面重载后重新附着用，`exec_progress`）。
+    exec_progress: Mutex<Option<ExecProgress>>,
+    /// 阶段 J：最近一次执行的报告（界面在执行中重载过、没收到返回值时用，`last_exec_report`）。
+    last_report: Mutex<Option<ExecReport>>,
+    /// 阶段 J：WebView2 浏览器进程挂了、正在重建主窗口（这期间窗口全没了，不能让程序退出）。
+    recreating: AtomicBool,
+    /// 阶段 J：`log_frontend_error` 本次运行已经写了几条（防止刷屏）。
+    frontend_errors: std::sync::atomic::AtomicUsize,
+}
+
+/// `acting` 的守卫：开始时置位，析构时（正常返回、提前 return、panic 展开都算）一定复位——
+/// `acting` 卡在 true 会让关窗永远被拦（PHASE_J_CRASH.md 第 3 条）。
+struct Acting<'a>(&'a AppState);
+
+impl<'a> Acting<'a> {
+    fn begin(st: &'a AppState) -> Option<Self> {
+        if st.acting.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(Acting(st))
+        }
+    }
+}
+
+impl Drop for Acting<'_> {
+    fn drop(&mut self) {
+        self.0.acting.store(false, Ordering::SeqCst);
+    }
 }
 
 impl AppState {
@@ -513,6 +564,7 @@ enum PreviewEvent {
 async fn preview_plan(
     items: Vec<PlanRequest>,
     strategy: Strategy,
+    safe_direct: Option<bool>,
     on_event: Channel<PreviewEvent>,
     state: State<'_, AppState>,
 ) -> Result<PreflightReport, String> {
@@ -538,6 +590,7 @@ async fn preview_plan(
     let res = tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
         let mut plan = action::build_plan_quick(&r, &ctx, protector(), &items, strategy);
+        plan.safe_direct = safe_direct.unwrap_or(true);
         let _ = on_event.send(PreviewEvent::Quote { report: action::quote(&plan) });
         let quote_ms = t0.elapsed().as_millis() as u64;
         let done = Arc::new(AtomicBool::new(false));
@@ -637,13 +690,15 @@ async fn execute_plan(
     skip_locked: bool,
     on_progress: Channel<ExecProgress>,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<ExecOutcome, String> {
     if state.scanning.load(Ordering::SeqCst) {
         return Err("正在扫描，先等扫描结束".into());
     }
-    if state.acting.swap(true, Ordering::SeqCst) {
+    let st: &AppState = &state;
+    let Some(_acting) = Acting::begin(st) else {
         return Err("已经有一个清理动作在进行".into());
-    }
+    };
     let plan = {
         let mut g = state.plan.lock().unwrap();
         match g.as_ref() {
@@ -652,20 +707,33 @@ async fn execute_plan(
         }
     };
     let Some(plan) = plan else {
-        state.acting.store(false, Ordering::SeqCst);
         return Err("找不到这次预览的清单（可能已经执行过或被新的预览替换），请重新预览".into());
     };
+    let cancel = Arc::new(AtomicBool::new(false));
+    *state.exec_cancel.lock().unwrap() = Some(cancel.clone());
+    *state.cancel_at.lock().unwrap() = None;
+    *state.exec_progress.lock().unwrap() = None;
+    *state.last_report.lock().unwrap() = None;
+    let app2 = app.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
         let r = (|| {
             let log_path = ActionLog::default_path().ok_or("找不到 %LOCALAPPDATA%")?;
             let log = ActionLog::open(&log_path);
             let mut opts = ExecOptions::new(&log);
             opts.skip_locked = skip_locked;
+            opts.cancel = Some(&*cancel);
+            opts.perf = PerfModel::load_default();
+            opts.perf_path = PerfModel::default_path();
+            opts.run_state_path = RunState::default_path();
             let r = action::execute(&plan, protector(), &opts, |p| {
+                // 界面重载 / 窗口重建后，通道那头可能已经没人了：最新进度另存一份给 `exec_progress`
+                if let Ok(mut g) = app2.state::<AppState>().exec_progress.lock() {
+                    *g = Some(p.clone());
+                }
                 let _ = on_progress.send(p.clone());
             });
-            if r.is_ok() {
-                if let Strategy::Quarantine { dest_root } = &plan.strategy {
+            if let (Ok(rep), Strategy::Quarantine { dest_root }) = (&r, &plan.strategy) {
+                if rep.by_dest.quarantine.count > 0 {
                     quarantine::remember_root(dest_root);
                 }
             }
@@ -675,26 +743,113 @@ async fn execute_plan(
     })
     .await
     .map_err(|e| format!("执行线程异常：{e}"));
+    *state.exec_cancel.lock().unwrap() = None;
+    *state.cancel_at.lock().unwrap() = None;
     let report = match res {
         Ok((_, Ok(r))) => r,
         Ok((plan, Err(e))) => {
             // execute 只在动任何文件之前返回 Err（没预检、隔离区建不了、选了不跳过被占用的……），
             // 所以把计划放回去，用户可以改一下再试，不用重新预览。
             *state.plan.lock().unwrap() = Some(plan);
-            state.acting.store(false, Ordering::SeqCst);
             return Err(e);
         }
         Err(e) => {
-            state.acting.store(false, Ordering::SeqCst);
+            diskwhy_core::crash::note("exec", &e);
             return Err(e);
         }
     };
+    *state.last_report.lock().unwrap() = Some(report.clone());
     let ctx = state.ctx();
     let dirs = report.affected_dirs.clone();
-    let st: &AppState = &state;
     let (refresh, summary) = refresh_after(st, &ctx, &dirs);
-    state.acting.store(false, Ordering::SeqCst);
     Ok(ExecOutcome { report, refresh, summary })
+}
+
+/// 停止正在进行的执行。返回 true = 确实有一个在执行（执行会尽快返回 `cancelled = true` 的报告）。
+#[tauri::command]
+fn cancel_execute(state: State<'_, AppState>) -> bool {
+    match state.exec_cancel.lock().unwrap().as_ref() {
+        Some(c) => {
+            c.store(true, Ordering::SeqCst);
+            state.cancel_at.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+            true
+        }
+        None => false,
+    }
+}
+
+/// 执行中最近一次进度（界面重载后重新附着用；没有在执行时为 null）。
+#[tauri::command]
+fn exec_progress(state: State<'_, AppState>) -> Option<ExecProgress> {
+    if !state.acting.load(Ordering::SeqCst) {
+        return None;
+    }
+    state.exec_progress.lock().unwrap().clone()
+}
+
+/// 最近一次执行的报告（本次运行里；界面在执行中重载过、没收到 `execute_plan` 的返回值时用）。
+#[tauri::command]
+fn last_exec_report(state: State<'_, AppState>) -> Option<ExecReport> {
+    state.last_report.lock().unwrap().clone()
+}
+
+/// 前端的 `error` / `unhandledrejection` 记进 crash.log（每次运行最多 200 条，每条最多 4000 字）。
+#[tauri::command]
+fn log_frontend_error(message: String, stack: Option<String>, source: Option<String>, state: State<'_, AppState>) {
+    if state.frontend_errors.fetch_add(1, Ordering::SeqCst) >= 200 {
+        return;
+    }
+    let mut s = message;
+    if let Some(src) = source.filter(|x| !x.is_empty()) {
+        s.push_str(&format!(" @ {src}"));
+    }
+    if let Some(st) = stack.filter(|x| !x.is_empty()) {
+        s.push_str("\r\n");
+        s.push_str(&st);
+    }
+    let s: String = s.chars().take(4000).collect();
+    diskwhy_core::crash::note("frontend", &s);
+}
+
+/// 现在是否在执行 / 还原 / 清空（界面重载后用来恢复状态）。
+#[tauri::command]
+fn action_status(state: State<'_, AppState>) -> bool {
+    state.acting.load(Ordering::SeqCst)
+}
+
+/// 上次清理被打断了吗（`last-run.json` 还是 running，记录的进程已不在）。正在执行时返回 None。
+#[tauri::command]
+fn last_interrupted(state: State<'_, AppState>) -> Option<Interrupted> {
+    if state.acting.load(Ordering::SeqCst) {
+        return None;
+    }
+    runstate::interrupted(&RunState::default_path()?)
+}
+
+/// 用户看过“上次清理中断”的提示了。
+#[tauri::command]
+fn dismiss_interrupted() -> Result<(), String> {
+    match RunState::default_path() {
+        Some(p) => runstate::dismiss(&p),
+        None => Ok(()),
+    }
+}
+
+/// 某个盘（`X:\`）上能用的暂存区位置（§3.2 的 ①②③，不提权；② 会真的建 `X:\DiskWhy暂存区`）。
+#[tauri::command]
+async fn prepare_quarantine(drive_root: String) -> Result<DestStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || quarantine::prepare_dest(&drive_root, true))
+        .await
+        .map_err(|e| format!("线程异常：{e}"))
+}
+
+/// 提权建暂存区（UAC 一次）：以管理员身份运行本程序的 `--mkdir-quarantine`，等它结束再走一遍 ①②③。
+#[tauri::command]
+async fn elevate_quarantine(drive_root: String) -> Result<DestStatus, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || quarantine::elevate_and_prepare(&exe.to_string_lossy(), &drive_root))
+        .await
+        .map_err(|e| format!("线程异常：{e}"))
 }
 
 #[tauri::command]
@@ -712,9 +867,10 @@ struct RestoreOutcome {
 
 #[tauri::command]
 async fn restore_batch(manifest_path: String, state: State<'_, AppState>) -> Result<RestoreOutcome, String> {
-    if state.acting.swap(true, Ordering::SeqCst) {
+    let st: &AppState = &state;
+    let Some(_acting) = Acting::begin(st) else {
         return Err("已经有一个清理动作在进行".into());
-    }
+    };
     let res = tauri::async_runtime::spawn_blocking(move || {
         let log = ActionLog::open(&ActionLog::default_path().ok_or("找不到 %LOCALAPPDATA%")?);
         quarantine::restore(std::path::Path::new(&manifest_path), &log)
@@ -723,30 +879,25 @@ async fn restore_batch(manifest_path: String, state: State<'_, AppState>) -> Res
     .map_err(|e| format!("还原线程异常：{e}"));
     let report = match res {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) | Err(e) => {
-            state.acting.store(false, Ordering::SeqCst);
-            return Err(e);
-        }
+        Ok(Err(e)) | Err(e) => return Err(e),
     };
     let ctx = state.ctx();
-    let st: &AppState = &state;
     let summary = if st.result.lock().unwrap().is_some() { refresh_after(st, &ctx, &report.touched_dirs).1 } else { None };
-    state.acting.store(false, Ordering::SeqCst);
     Ok(RestoreOutcome { report, summary })
 }
 
 #[tauri::command]
 async fn purge_batch(manifest_path: String, state: State<'_, AppState>) -> Result<PurgeReport, String> {
-    if state.acting.swap(true, Ordering::SeqCst) {
+    let st: &AppState = &state;
+    let Some(_acting) = Acting::begin(st) else {
         return Err("已经有一个清理动作在进行".into());
-    }
+    };
     let res = tauri::async_runtime::spawn_blocking(move || {
         let log = ActionLog::open(&ActionLog::default_path().ok_or("找不到 %LOCALAPPDATA%")?);
         quarantine::purge(std::path::Path::new(&manifest_path), &log)
     })
     .await
     .map_err(|e| format!("清空线程异常：{e}"));
-    state.acting.store(false, Ordering::SeqCst);
     res?
 }
 
@@ -803,12 +954,248 @@ fn startup_scan_dir() -> Option<String> {
     args.iter().position(|a| a == "--scan").and_then(|i| args.get(i + 1)).filter(|p| std::path::Path::new(p).is_dir()).cloned()
 }
 
+/// 执行中拦关窗的安全阀：按了“停止”这么久还没停下来（例如某个系统调用卡住），就不再拦，免得窗口永远关不掉。
+const CLOSE_GUARD_GIVE_UP_SECS: u64 = 20;
+
+/// 关窗请求要不要拦：执行 / 还原 / 清空进行中 → 拦（除非已经按了停止且过了安全阀时间）。
+fn close_should_block(st: &AppState) -> bool {
+    if !st.acting.load(Ordering::SeqCst) {
+        return false;
+    }
+    match *st.cancel_at.lock().unwrap() {
+        Some(t) => t.elapsed().as_secs() < CLOSE_GUARD_GIVE_UP_SECS,
+        None => true,
+    }
+}
+
+/// 主窗口的配置（tauri.conf.json 里 label = "main" 的那个）。
+fn main_window_config(app: &AppHandle) -> Option<tauri::utils::config::WindowConfig> {
+    app.config().app.windows.iter().find(|w| w.label == "main").cloned()
+}
+
+/// WebView2 的进程挂了要活下来并记录（PHASE_J_CRASH.md 第 2 条；处理方式按 learn.microsoft.com
+/// “Handling process-related events in WebView2”）：
+/// - 浏览器主进程退出（BROWSER_PROCESS_EXITED）：“All associated WebView2 controls will be closed … need to be
+///   recreated” → 关掉旧窗口、按配置重建主窗口（执行线程照常跑，前端重新加载后用 `action_status` / `exec_progress` 附着）；
+/// - 主框架的渲染进程退出（RENDER_PROCESS_EXITED）：内容变成错误页 → `Reload()`；
+/// - 渲染进程无响应（RENDER_PROCESS_UNRESPONSIVE，约每 15 秒报一次）：连续 4 次（约 1 分钟）才 `Reload()`；
+/// - 其他（GPU / 工具进程等，会自动恢复）：只记录。
+///
+/// 每次都在 crash.log 记一行（类型、原因、退出码、进程说明）。
+#[cfg(windows)]
+fn watch_webview(w: &tauri::WebviewWindow) {
+    use std::sync::atomic::AtomicU32;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2, ICoreWebView2ProcessFailedEventArgs, ICoreWebView2ProcessFailedEventArgs2, COREWEBVIEW2_PROCESS_FAILED_KIND,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE, COREWEBVIEW2_PROCESS_FAILED_REASON,
+    };
+    use webview2_com::ProcessFailedEventHandler;
+    use windows_core::Interface;
+    let app = w.app_handle().clone();
+    let r = w.with_webview(move |pw| unsafe {
+        let core = match pw.controller().CoreWebView2() {
+            Ok(c) => c,
+            Err(e) => {
+                diskwhy_core::crash::note("webview2", &format!("取不到 CoreWebView2，没法监视进程：{e}"));
+                return;
+            }
+        };
+        let unresponsive = Arc::new(AtomicU32::new(0));
+        let handler = ProcessFailedEventHandler::create(Box::new(
+            move |sender: Option<ICoreWebView2>, args: Option<ICoreWebView2ProcessFailedEventArgs>| {
+                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                let mut detail = String::new();
+                if let Some(a) = &args {
+                    let _ = a.ProcessFailedKind(&mut kind);
+                    if let Ok(a2) = a.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+                        let mut reason = COREWEBVIEW2_PROCESS_FAILED_REASON::default();
+                        let mut code = 0i32;
+                        let _ = a2.Reason(&mut reason);
+                        let _ = a2.ExitCode(&mut code);
+                        let mut desc = windows_core::PWSTR::null();
+                        let d = if a2.ProcessDescription(&mut desc).is_ok() && !desc.is_null() {
+                            // take_pwstr 读完用 CoTaskMemFree 释放（WebView2 的字符串出参都这样）
+                            webview2_com::take_pwstr(desc)
+                        } else {
+                            String::new()
+                        };
+                        detail = format!("，原因 {}，退出码 0x{:X}{}", reason.0, code as u32, if d.is_empty() { String::new() } else { format!("，{d}") });
+                    }
+                }
+                let acting = app.state::<AppState>().acting.load(Ordering::SeqCst);
+                let what = match kind {
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => "浏览器主进程退出 → 重建窗口",
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => "渲染进程退出 → 重新加载",
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => "渲染进程无响应",
+                    _ => "其他进程退出（会自动恢复）",
+                };
+                diskwhy_core::crash::note(
+                    "webview2",
+                    &format!("WebView2 进程出错：类型 {}（{what}）{detail}；执行中 = {acting}", kind.0),
+                );
+                if kind != COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE {
+                    unresponsive.store(0, Ordering::SeqCst);
+                }
+                match kind {
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => recreate_main_window(&app),
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => {
+                        if let Some(s) = &sender {
+                            let _ = s.Reload();
+                        }
+                    }
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => {
+                        if unresponsive.fetch_add(1, Ordering::SeqCst) + 1 >= 4 {
+                            unresponsive.store(0, Ordering::SeqCst);
+                            diskwhy_core::crash::note("webview2", "渲染进程持续无响应约 1 分钟 → 重新加载");
+                            if let Some(s) = &sender {
+                                let _ = s.Reload();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+        let mut token = 0i64;
+        if let Err(e) = core.add_ProcessFailed(&handler, &mut token) {
+            diskwhy_core::crash::note("webview2", &format!("add_ProcessFailed 失败：{e}"));
+        }
+    });
+    if let Err(e) = r {
+        diskwhy_core::crash::note("webview2", &format!("with_webview 失败：{e}"));
+    }
+}
+
+#[cfg(not(windows))]
+fn watch_webview(_w: &tauri::WebviewWindow) {}
+
+/// 浏览器主进程没了：先关掉旧的主窗口（这期间不许程序退出，见 `RunEvent::ExitRequested`），旧窗口销毁后
+/// （`WindowEvent::Destroyed`）按配置重建一个，见 [`build_main_window`]。
+fn recreate_main_window(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    if st.recreating.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app2 = app.clone();
+    // 不在 WebView2 自己的事件回调里销毁它：排到主线程下一轮
+    let r = app.run_on_main_thread(move || match app2.get_webview_window("main") {
+        Some(w) => {
+            diskwhy_core::crash::note("webview2", "关掉旧的主窗口");
+            if let Err(e) = w.destroy() {
+                diskwhy_core::crash::note("webview2", &format!("关旧窗口失败：{e}"));
+                app2.state::<AppState>().recreating.store(false, Ordering::SeqCst);
+            }
+        }
+        None => {
+            diskwhy_core::crash::note("webview2", "旧的主窗口已经不在了，直接重建");
+            build_main_window(&app2)
+        }
+    });
+    if r.is_err() {
+        st.recreating.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 按 tauri.conf.json 重建主窗口。Tauri 文档：在 Windows 上同步的事件处理里建窗口会死锁（WebView2 的限制），
+/// 所以放到异步任务里建。建不起来：没在执行就退出程序；在执行就等执行结束再退出（不打断清理）。
+fn build_main_window(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let res = match main_window_config(&app) {
+            Some(cfg) => tauri::WebviewWindowBuilder::from_config(&app, &cfg).and_then(|b| b.build()).map_err(|e| e.to_string()),
+            None => Err("tauri.conf.json 里没有 main 窗口".into()),
+        };
+        match res {
+            Ok(w) => {
+                // build() 在非主线程上只是把“建窗口”排进事件循环就返回了：旧窗口的 Destroyed 可能还排在它前面，
+                // 那时窗口表是空的，会发 ExitRequested。所以 `recreating` 不在这里清，等新窗口的页面开始加载
+                // （`on_page_load`）时再清，这期间的退出请求都拦下。
+                watch_webview(&w);
+                diskwhy_core::crash::note("webview2", "主窗口重建中（已排进事件循环）");
+            }
+            Err(e) => {
+                app.state::<AppState>().recreating.store(false, Ordering::SeqCst);
+                diskwhy_core::crash::note("webview2", &format!("主窗口重建失败：{e}；清理结束后退出"));
+                let app2 = app.clone();
+                std::thread::spawn(move || {
+                    while app2.state::<AppState>().acting.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    app2.exit(1);
+                });
+            }
+        }
+    });
+}
+
+/// 测试用（只在 debug 构建里）：环境变量 `DISKWHY_TEST_HOLD_ACTING=1` 时启动后一直处于“执行中”，
+/// 用来在没有真实清理的情况下验证关窗守卫（发 WM_CLOSE / WM_SYSCOMMAND SC_CLOSE 给窗口）。
+#[cfg(debug_assertions)]
+fn test_hold_acting(st: &AppState) {
+    if std::env::var("DISKWHY_TEST_HOLD_ACTING").is_ok_and(|v| v == "1") {
+        st.acting.store(true, Ordering::SeqCst);
+        diskwhy_core::crash::note("test", "DISKWHY_TEST_HOLD_ACTING：一直处于执行中");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_hold_acting(_st: &AppState) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // 提权子进程（`elevate_quarantine` 拉起的）：建暂存区文件夹、授权，然后直接退出，不建任何窗口。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = quarantine::elevated_mkdir_from_args(&args) {
+        std::process::exit(code);
+    }
+    // 闪退取证：panic → crash.log（带 backtrace）；未处理的原生异常 → crash\*.dmp + crash.log 一行。
+    diskwhy_core::crash::install();
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            test_hold_acting(&app.state::<AppState>());
+            if let Some(w) = app.get_webview_window("main") {
+                watch_webview(&w);
+            }
+            Ok(())
+        })
+        .on_page_load(|webview, _payload| {
+            // 重建的主窗口开始加载页面了 = 它已经在窗口表里，退出请求不用再拦
+            if webview.label() == "main" && webview.state::<AppState>().recreating.swap(false, Ordering::SeqCst) {
+                diskwhy_core::crash::note("webview2", "主窗口已重建，页面在加载");
+            }
+        })
+        .on_window_event(|window, event| {
+            let st = window.state::<AppState>();
+            match event {
+                // 执行中不许关窗：✕（前端 getCurrentWindow().close()）、Alt+F4、任务栏“关闭窗口”都先到这里
+                // （WM_CLOSE → tao CloseRequested；JS close() → WindowMessage::Close → 同一个 on_close_requested）。
+                // 拦下并通知前端闪一下“停止”。按了停止 20 秒还没停下来就不再拦（安全阀）。
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if close_should_block(&st) {
+                        api.prevent_close();
+                        diskwhy_core::crash::note("close-blocked", "执行中，拦下了关窗");
+                        let _ = window.emit("close-blocked", ());
+                    } else if st.acting.load(Ordering::SeqCst) {
+                        diskwhy_core::crash::note("close-forced", "按了停止 20 秒后仍在执行，放行关窗");
+                    }
+                }
+                tauri::WindowEvent::Destroyed => {
+                    let rec = st.recreating.load(Ordering::SeqCst);
+                    if rec || st.acting.load(Ordering::SeqCst) {
+                        diskwhy_core::crash::note("window", &format!("窗口 {} 已销毁（重建中 = {rec}）", window.label()));
+                    }
+                    if window.label() == "main" && rec {
+                        build_main_window(window.app_handle());
+                    }
+                }
+                _ => {}
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_env,
             list_drives,
@@ -829,6 +1216,15 @@ pub fn run() {
             preview_plan,
             cancel_preview,
             execute_plan,
+            cancel_execute,
+            action_status,
+            exec_progress,
+            last_exec_report,
+            last_interrupted,
+            dismiss_interrupted,
+            log_frontend_error,
+            prepare_quarantine,
+            elevate_quarantine,
             list_quarantine,
             restore_batch,
             purge_batch,
@@ -840,6 +1236,49 @@ pub fn run() {
             get_ui_prefs,
             set_ui_prefs
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            let st = app.state::<AppState>();
+            if st.recreating.load(Ordering::SeqCst) {
+                // 重建主窗口的空档：窗口全没了，但程序不能退
+                api.prevent_exit();
+                diskwhy_core::crash::note("exit", &format!("重建主窗口中，拦下退出请求（code = {code:?}）"));
+            } else if st.acting.load(Ordering::SeqCst) {
+                diskwhy_core::crash::note("exit", &format!("执行中收到退出请求（code = {code:?}）"));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 关窗守卫：没在执行 → 放行；执行中 → 拦；按了停止不到 20 秒 → 还拦；超过 20 秒还没停 → 放行（安全阀）。
+    /// `Acting` 守卫析构时一定复位（包括 panic 展开）。
+    #[test]
+    fn close_guard_and_acting_reset() {
+        let st = AppState::default();
+        assert!(!close_should_block(&st));
+        {
+            let g = Acting::begin(&st).expect("第一次能开始");
+            assert!(Acting::begin(&st).is_none(), "同时只能有一个");
+            assert!(close_should_block(&st));
+            *st.cancel_at.lock().unwrap() = Some(Instant::now());
+            assert!(close_should_block(&st), "刚按停止：还拦");
+            *st.cancel_at.lock().unwrap() = Instant::now().checked_sub(Duration::from_secs(CLOSE_GUARD_GIVE_UP_SECS + 1));
+            assert!(!close_should_block(&st), "停止 20 秒后还没停下：放行");
+            drop(g);
+        }
+        assert!(!st.acting.load(Ordering::SeqCst));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = Acting::begin(&st).unwrap();
+            panic!("执行线程里出事");
+        }));
+        assert!(r.is_err());
+        assert!(!st.acting.load(Ordering::SeqCst), "panic 之后 acting 也复位了");
+    }
 }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 隔离区：选“隔离到其他盘”清理的文件按批次放在别的盘，可以整批还原；彻底删除要再确认一次。
-// DiskWhy 不会自动删隔离区，超过保留天数只提醒。
+// 暂存区（界面文案，阶段 J；后端标识仍叫 quarantine）：暂存到其他盘的文件按批次放着，可以整批还原；彻底删除要再确认一次。
+// DiskWhy 不会自动删暂存区，超过保留天数只提醒。窄窗口时每批的“位置 / 大小 / 操作”换行排。
 import { computed, onMounted, ref } from "vue";
 import { listQuarantine, purgeBatch, restoreBatch, type BatchInfo } from "../api";
 import { gbNum, sizeParts } from "../capacity";
@@ -80,7 +80,7 @@ function day(unix: number) {
 <template>
   <div class="q">
     <div class="top">
-      <div class="k">隔离区</div>
+      <div class="k">暂存区</div>
       <div class="big"><span class="v num">{{ gbNum(totalBytes) }}</span><span class="u">GB</span></div>
       <div class="meta">
         <span><b class="num">{{ batches.length }}</b> 批</span><span>保留 <b class="num">{{ keepDays }}</b> 天</span>
@@ -270,5 +270,55 @@ function day(unix: number) {
   padding: 48px 0;
   color: var(--ink3);
   font-size: var(--fs-body);
+}
+
+/* ───────── 窄窗口 / 竖屏（阶段 J §3.7） ───────── */
+@media (max-width: 1099px), (max-aspect-ratio: 1/1) {
+  .top {
+    top: 72px;
+  }
+  .big .v {
+    font-size: 96px;
+  }
+  .list {
+    top: 268px;
+    bottom: 20px;
+  }
+  .row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "when sz"
+      "what what"
+      "acts acts";
+    row-gap: 8px;
+    padding: 14px 0;
+  }
+  .when {
+    grid-area: when;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .what {
+    grid-area: what;
+  }
+  .sz {
+    grid-area: sz;
+  }
+  .acts {
+    grid-area: acts;
+    justify-content: flex-start;
+  }
+}
+@media (max-width: 1099px) and (max-height: 759px), (max-aspect-ratio: 1/1) and (max-height: 759px) {
+  .big .v {
+    font-size: 72px;
+  }
+  .meta {
+    margin-top: 14px;
+  }
+  .list {
+    top: 222px;
+  }
 }
 </style>

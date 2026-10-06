@@ -464,6 +464,7 @@ fn hot_and_cloud_skipped_and_junction_removed_without_touching_target() {
     let r = scan_dir(&root);
     let prot = Protector::from_system();
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     assert!(plan.items[0].blocked.is_none(), "{:?}", plan.items[0].blocked);
     let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
     let item = &plan.items[0];
@@ -517,6 +518,7 @@ fn reverify_skips_files_replaced_or_modified_after_plan() {
     let prot = Protector::from_system();
     let q = TempTree::new("reverify-q");
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     action::preflight(&mut plan, &prot, &PreflightOptions::default());
     assert_eq!(plan.items[0].entry_count(), 4);
     let a_mtime = fs::metadata(t.p(r"cache\a.bin")).unwrap().modified().unwrap();
@@ -568,6 +570,7 @@ fn quarantine_round_trip(dest_base: &Path, expect_method: &str) {
     let prot = Protector::from_system();
     let q = TempTree::in_dir(dest_base, "qdest");
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
     assert!(rep.can_execute, "{:?}", rep.warnings);
     assert_eq!(rep.total_entries, 4);
@@ -645,8 +648,11 @@ fn quarantine_round_trip_cross_volume() {
 
 // ───────────────────────── 回收站 ─────────────────────────
 
-/// 在 `X:\$Recycle.Bin\<SID>\$I*` 里找原路径以 `name` 结尾的记录；返回 ($I, $R, 记录的原路径)。
-fn find_in_recycle_bin(vol: &str, name: &str) -> Option<(PathBuf, PathBuf, String)> {
+/// 在 `X:\$Recycle.Bin\<SID>\$I*` 里找原路径**等于** `original` 的记录；返回 ($I, $R, 记录的原路径)。
+/// 先按 $I 文件大小筛（第 2 版 $I = 28 字节头 + 原路径 UTF-16 含结尾 0）：本机回收站有几十万项，逐个读太慢。
+pub fn find_in_recycle_bin(vol: &str, original: &str) -> Option<(PathBuf, PathBuf, String)> {
+    let want_v2 = 28 + 2 * (original.encode_utf16().count() as u64 + 1);
+    let name = original;
     let rb = Path::new(vol).join("$Recycle.Bin");
     for sid in fs::read_dir(&rb).ok()?.flatten() {
         let Ok(rd) = fs::read_dir(sid.path()) else { continue };
@@ -654,6 +660,10 @@ fn find_in_recycle_bin(vol: &str, name: &str) -> Option<(PathBuf, PathBuf, Strin
             let fname = f.file_name().to_string_lossy().to_string();
             if !fname.starts_with("$I") {
                 continue;
+            }
+            match f.metadata() {
+                Ok(m) if m.len() == want_v2 || m.len() == 544 => {}
+                _ => continue,
             }
             let Ok(b) = fs::read(f.path()) else { continue };
             if b.len() < 28 {
@@ -668,7 +678,7 @@ fn find_in_recycle_bin(vol: &str, name: &str) -> Option<(PathBuf, PathBuf, Strin
             let end = (start + chars * 2).min(b.len());
             let u: Vec<u16> = b[start..end].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
             let orig = String::from_utf16_lossy(&u);
-            if orig.to_lowercase().ends_with(&name.to_lowercase()) {
+            if orig.eq_ignore_ascii_case(name) || orig.to_lowercase() == name.to_lowercase() {
                 let r = sid.path().join(format!("$R{}", &fname[2..]));
                 return Some((f.path(), r, orig));
             }
@@ -690,6 +700,7 @@ fn recycle_bin_really_receives_file_then_restore_only_ours() {
     let r = scan_dir(&root);
     let prot = Protector::from_system();
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
     assert_eq!(rep.total_entries, 1);
     let log = ActionLog::open(&t.p("actions.log"));
@@ -697,7 +708,7 @@ fn recycle_bin_really_receives_file_then_restore_only_ours() {
     assert_eq!((ex.ok, ex.failed), (1, 0), "{:?}", ex.items);
     assert!(!t.p(&rel).exists(), "原位置应该没有了");
     let vol = volume_root_of(&t.s("")).unwrap();
-    let (i_path, r_path, recorded) = find_in_recycle_bin(&vol, &name).expect("回收站里必须能找到这个文件（$Recycle.Bin 下的 $I 记录）");
+    let (i_path, r_path, recorded) = find_in_recycle_bin(&vol, &t.s(&rel)).expect("回收站里必须能找到这个文件（$Recycle.Bin 下的 $I 记录）");
     assert!(r_path.exists(), "对应的 $R 数据文件必须存在：{}", r_path.display());
     assert_eq!(fs::metadata(&r_path).unwrap().len(), data.len() as u64);
     assert_eq!(sha(&r_path), h0, "回收站里的内容必须与原文件一致");
@@ -706,7 +717,7 @@ fn recycle_bin_really_receives_file_then_restore_only_ours() {
     fs::rename(&r_path, t.p(&rel)).unwrap();
     fs::remove_file(&i_path).unwrap();
     assert_eq!(sha(&t.p(&rel)), h0, "从回收站还原后哈希一致");
-    assert!(find_in_recycle_bin(&vol, &name).is_none());
+    assert!(find_in_recycle_bin(&vol, &t.s(&rel)).is_none());
 }
 
 // ───────────────────────── 7. 占用检测 ─────────────────────────
@@ -724,6 +735,7 @@ fn locked_file_reported_by_restart_manager_and_process_not_killed() {
     let prot = Protector::from_system();
     let q = TempTree::new("locked-q");
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
     let me = std::process::id();
     let item = &plan.items[0];
@@ -766,6 +778,7 @@ fn recycle_low_space_warning_matches_volume_state() {
     let r = scan_dir(&root);
     let prot = Protector::from_system();
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
     let vol = volume_root_of(&root).unwrap();
     let sp = volume_space(&vol).unwrap();
@@ -781,6 +794,7 @@ fn recycle_low_space_warning_matches_volume_state() {
     // 隔离区放在同一个盘上 → 提示不会腾空间
     let q = TempTree::new("space-q");
     let mut plan2 = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan2.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     let rep2 = action::preflight(&mut plan2, &prot, &PreflightOptions::default());
     assert!(rep2.warnings.iter().any(|w| w.code == "quarantine_same_volume"));
 }
@@ -799,6 +813,7 @@ fn action_log_one_line_per_action_with_all_fields() {
     let prot = Protector::from_system();
     let q = TempTree::new("log-q");
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     action::preflight(&mut plan, &prot, &PreflightOptions::default());
     let logp = t.p("actions.log");
     let log = ActionLog::open(&logp);
@@ -823,7 +838,11 @@ fn action_log_one_line_per_action_with_all_fields() {
     assert_eq!(count("rmdir", "ok"), 1, "{ops:?}");
     assert_eq!(count("restore", "ok"), 2, "{ops:?}");
     assert_eq!(ops.iter().filter(|(o, _)| *o == "summary").count(), 2, "执行和还原各一行汇总：{ops:?}");
-    assert_eq!(lines.len(), 2 + 1 + 1 + 1 + 2 + 1);
+    assert_eq!(count("start", "ok"), 1, "阶段 J：执行开始写一条 start：{ops:?}");
+    assert_eq!(count("batch_begin", "ok"), 1, "阶段 J 取证：每块开始前一条 batch_begin（这里只有一块）：{ops:?}");
+    let st = lines.iter().find(|l| l["op"] == "start").unwrap();
+    assert!(st["reason"].as_str().unwrap().contains("父进程"), "start 记录带父进程号和程序路径：{st}");
+    assert_eq!(lines.len(), 1 + 1 + 2 + 1 + 1 + 1 + 2 + 1);
     let q0 = lines.iter().find(|l| l["op"] == "quarantine").unwrap();
     assert_eq!(q0["source"], "t-cache");
     assert_eq!(q0["tier"], "safe");
@@ -847,6 +866,7 @@ fn refresh_rescans_only_affected_subtree() {
     let prot = Protector::from_system();
     let q = TempTree::new("refresh-q");
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     action::preflight(&mut plan, &prot, &PreflightOptions::default());
     let log = ActionLog::open(&t.p("actions.log"));
     let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
@@ -932,6 +952,7 @@ fn quarantine_purge_removes_only_that_batch() {
     // 隔离区根目录里另放一个不相关的文件，清空批次时不能动它
     write_old(&q.p("unrelated.txt"), b"not ours");
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     action::preflight(&mut plan, &prot, &PreflightOptions::default());
     let log = ActionLog::open(&t.p("actions.log"));
     let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
@@ -965,6 +986,7 @@ fn quarantine_unwritable_destination_is_blocked_before_anything_moves() {
     let out = Command::new("icacls").arg(q.s("")).args(["/deny", "*S-1-1-0:(AD,WD)"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
     let w = rep.warnings.iter().find(|w| w.code == "quarantine_bad_dest").expect("不能写的隔离区必须被拦下");
     assert!(w.blocking && w.message.contains("建不了隔离区文件夹"), "{}", w.message);
@@ -1026,6 +1048,7 @@ fn probe_then_restart_manager_flags_only_locked_files() {
     let r = scan_dir(&root);
     let prot = Protector::from_system();
     let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    plan.safe_direct = false; // 阶段 J：测的是回收站 / 暂存区本身，safe 档也按策略走
     let opts = PreflightOptions { rm_chunk: 4, rm_sessions: 3, ..PreflightOptions::default() };
     let prog = action::Progress::default();
     let t0 = std::time::Instant::now();
@@ -1138,4 +1161,578 @@ fn parent_cache_derived_paths_match_real_resolution() {
     let a = prot.entry_blocked(&entry);
     let b = prot.entry_blocked_cached(&entry, &c2);
     assert!(a.is_some() && b.is_some(), "经过链接指到 Windows 目录的条目必须被拦：{a:?} / {b:?}");
+}
+
+// ───────────────────────── 阶段 J：直接删除 / 统一队列 / 停止 / 整夹回收 / 跨盘 ─────────────────────────
+
+/// 一次扫描回收站，把原路径在 `originals` 里的项（文件或整夹）挪回原处，并删掉对应的 $I（只动我们自己的）。
+/// 返回挪回来的个数。
+fn restore_from_bin(vol: &str, originals: &[String]) -> usize {
+    let want: std::collections::HashMap<String, String> = originals.iter().map(|o| (o.to_lowercase(), o.clone())).collect();
+    let sizes: std::collections::HashSet<u64> = originals.iter().map(|o| 28 + 2 * (o.encode_utf16().count() as u64 + 1)).collect();
+    let rb = Path::new(vol).join("$Recycle.Bin");
+    let mut n = 0;
+    let Ok(sids) = fs::read_dir(&rb) else { return 0 };
+    for sid in sids.flatten() {
+        let Ok(rd) = fs::read_dir(sid.path()) else { continue };
+        for f in rd.flatten() {
+            let fname = f.file_name().to_string_lossy().to_string();
+            if !fname.starts_with("$I") || !f.metadata().map(|m| sizes.contains(&m.len())).unwrap_or(false) {
+                continue;
+            }
+            let Ok(b) = fs::read(f.path()) else { continue };
+            if b.len() < 28 || u64::from_le_bytes(b[0..8].try_into().unwrap()) != 2 {
+                continue;
+            }
+            let chars = u32::from_le_bytes(b[24..28].try_into().unwrap()) as usize;
+            let u: Vec<u16> = b[28..(28 + chars * 2).min(b.len())].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+            let orig = String::from_utf16_lossy(&u);
+            if let Some(o) = want.get(&orig.to_lowercase()) {
+                let r = sid.path().join(format!("$R{}", &fname[2..]));
+                if let Some(parent) = Path::new(o).parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if fs::rename(&r, o).is_ok() {
+                    let _ = fs::remove_file(f.path());
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+fn read_log(p: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(p).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+/// safe 档直接删除：9 条护栏照样生效——受保护路径、热文件、被占用（预检时 / 执行时）、指纹变了、
+/// 链接只删链接本身、云文件（预检时 / 执行时变成云文件），只读文件也能删；报告按去向分计。
+#[test]
+fn permanent_delete_honours_all_guardrails() {
+    use diskwhy_core::action::Dest;
+    let t = TempTree::new("perm");
+    for i in 0..3 {
+        write_old(&t.p(&format!(r"target\keep{i}.txt")), &content(&format!("k{i}"), 1000));
+    }
+    let target_hash = sha(&t.p(r"target\keep0.txt"));
+    for n in ["a", "b", "changed", "locked-pre", "locked-exec", "cloud-exec", "ro"] {
+        write_old(&t.p(&format!(r"cache\sub\{n}.bin")), &content(n, 3000));
+    }
+    write_old(&t.p(r"cache\.ssh\key"), b"secret"); // 预检时就因保护路径跳过
+    write_old(&t.p(r"cache\cloud.bin"), b"cloud");
+    assert!(Command::new("attrib").arg("+O").arg(t.p(r"cache\cloud.bin")).output().unwrap().status.success());
+    fs::write(t.p(r"cache\hot.bin"), b"hot").unwrap();
+    mklink_j(&t.p(r"cache\lnk"), &t.p("target"));
+    let mut perm = fs::metadata(t.p(r"cache\sub\ro.bin")).unwrap().permissions();
+    perm.set_readonly(true);
+    fs::set_permissions(t.p(r"cache\sub\ro.bin"), perm).unwrap();
+    let _pre_lock = fs::OpenOptions::new().read(true).share_mode(0x1).open(t.p(r"cache\sub\locked-pre.bin")).unwrap();
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    // 策略选的是回收站，但 safe 档 + safe_direct（默认）→ 直接删除
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    assert!(plan.safe_direct);
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    assert_eq!(rep.by_dest.recycle.count, 0, "safe 档不进回收站：{:?}", rep.by_dest);
+    assert!(rep.by_dest.permanent.count >= 6, "{:?}", rep.by_dest);
+    assert!(!rep.warnings.iter().any(|w| w.code == "recycle_low_space" || w.code == "recycle_over_capacity"), "没东西进回收站就不该有回收站提示：{:?}", rep.warnings);
+    assert!(rep.est_secs > 0.0 && rep.scan_total_bytes > 0);
+    assert_eq!(rep.skipped_by_reason.get("protected").map(|c| c.count), Some(1), "{:?}", rep.skipped_by_reason);
+    assert_eq!(rep.skipped_by_reason.get("hot").map(|c| c.count), Some(1));
+    assert_eq!(rep.skipped_by_reason.get("cloud").map(|c| c.count), Some(1));
+    assert_eq!(rep.skipped_by_reason.get("locked").map(|c| c.count), Some(1));
+    assert_eq!(rep.skipped_bytes, rep.skipped_by_reason.values().map(|c| c.bytes).sum::<u64>());
+    // 预检之后：改一个、占住一个（不给删除共享）、把一个变成“云文件”
+    fs::OpenOptions::new().append(true).open(t.p(r"cache\sub\changed.bin")).unwrap().write_all(b"x").unwrap();
+    backdate(&t.p(r"cache\sub\changed.bin"), 7200);
+    let _exec_lock = fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(t.p(r"cache\sub\locked-exec.bin")).unwrap();
+    assert!(Command::new("attrib").arg("+O").arg(t.p(r"cache\sub\cloud-exec.bin")).output().unwrap().status.success());
+    // 再塞一条“预检说能删”、但其实在受保护路径里的条目：执行时的保护路径检查必须拦住
+    let ssh_key = t.s(r"cache\.ssh\key");
+    {
+        let item = &mut plan.items[0];
+        let i = item.entries.iter().position(|e| e.path == ssh_key).unwrap();
+        item.entries[i].fp = Some(action::winops::fingerprint(&ssh_key, true).unwrap());
+        item.decisions[i] = Decision::Delete;
+    }
+    let logp = t.p("actions.log");
+    let log = ActionLog::open(&logp);
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
+    drop(log);
+    let det = |n: &str| ex.items[0].details.iter().find(|d| d.path.ends_with(n)).map(|d| (d.result.clone(), d.reason.clone()));
+    for n in ["a.bin", "b.bin", "ro.bin"] {
+        assert!(!t.p(&format!(r"cache\sub\{n}")).exists(), "{n} 应该被直接删掉");
+    }
+    assert!(det("changed.bin").unwrap().1.contains("大小"), "{:?}", det("changed.bin"));
+    assert!(det("locked-exec.bin").unwrap().1.contains("占用"), "{:?}", det("locked-exec.bin"));
+    assert_eq!(det("cloud-exec.bin").unwrap().0, "skipped");
+    assert!(det(r".ssh\key").unwrap().0 == "skipped", "{:?}", det(r".ssh\key"));
+    for n in [r"sub\changed.bin", r"sub\locked-pre.bin", r"sub\locked-exec.bin", r"sub\cloud-exec.bin", r".ssh\key", "cloud.bin", "hot.bin"] {
+        assert!(t.p(&format!(r"cache\{n}")).exists(), "{n} 必须还在");
+    }
+    assert!(fs::symlink_metadata(t.p(r"cache\lnk")).is_err(), "链接本身被删掉");
+    assert_eq!(sha(&t.p(r"target\keep0.txt")), target_hash, "链接目标完好");
+    assert_eq!(ex.failed, 0, "{:?}", ex.items[0].details);
+    assert_eq!(ex.by_dest.permanent.count, 4, "a / b / ro + 链接：{:?}", ex.by_dest);
+    assert_eq!(ex.by_dest.recycle.count + ex.by_dest.quarantine.count, 0);
+    assert_eq!(ex.ok, 4);
+    assert!(ex.skipped_by_reason.get("changed").is_some() && ex.skipped_by_reason.get("locked").map(|c| c.count) == Some(2), "{:?}", ex.skipped_by_reason);
+    assert!(ex.duration_ms > 0 || ex.ok > 0);
+    let lines = read_log(&logp);
+    assert_eq!(lines.iter().filter(|l| l["op"] == "delete" && l["result"] == "ok").count(), 3);
+    assert_eq!(lines.iter().filter(|l| l["op"] == "start").count(), 1);
+    assert_eq!(lines.iter().filter(|l| l["op"] == "summary").count(), 1);
+    // 执行时才发现的热文件（把热窗口调成 100 年）：同样跳过
+    let t2 = TempTree::new("perm-hot");
+    write_old(&t2.p(r"cache\x.bin"), b"x");
+    let root2 = t2.s("");
+    let r2 = scan_dir(&root2);
+    let mut plan2 = action::build_plan(&r2, &ctx_for(&root2), &prot, &[req(&t2.s("cache"))], Strategy::Permanent);
+    action::preflight(&mut plan2, &prot, &PreflightOptions::default());
+    let log2 = ActionLog::open(&t2.p("actions.log"));
+    let mut o = ExecOptions::new(&log2);
+    o.hot_window_secs = 100 * 365 * 86_400;
+    let ex2 = action::execute(&plan2, &prot, &o, |_| {}).unwrap();
+    assert_eq!((ex2.ok, ex2.skipped), (0, 1));
+    assert!(ex2.skipped_by_reason.contains_key("hot"));
+    assert!(t2.p(r"cache\x.bin").exists());
+    let _ = Dest::Permanent;
+    // 清理只读属性，让 TempTree 能删干净
+    let _ = Command::new("attrib").args(["-R", "-O", "/S"]).arg(format!("{}\\*", t.0.display())).output();
+}
+
+/// safe 档直接删、review 档按策略（暂存区）；用户明确选回收站时（safe_direct = false）safe 也按策略。
+#[test]
+fn safe_goes_direct_review_follows_strategy() {
+    let t = TempTree::new("split");
+    for i in 0..5 {
+        write_old(&t.p(&format!(r"cache\c{i}.bin")), &content(&format!("c{i}"), 2000));
+        write_old(&t.p(&format!(r"review\deep\r{i}.bin")), &content(&format!("r{i}"), 2000));
+    }
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let q = TempTree::new("split-q");
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache")), req(&t.s("review"))], Strategy::Quarantine { dest_root: q.s("") });
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    assert_eq!((rep.by_dest.permanent.count, rep.by_dest.quarantine.count, rep.by_dest.recycle.count), (5, 5, 0), "{:?}", rep.by_dest);
+    assert!(rep.can_execute, "{:?}", rep.warnings);
+    let log = ActionLog::open(&t.p("actions.log"));
+    let events: std::sync::Mutex<Vec<action::ExecProgress>> = std::sync::Mutex::new(Vec::new());
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |p| events.lock().unwrap().push(p.clone())).unwrap();
+    assert_eq!((ex.ok, ex.failed), (10, 0), "{:?}", ex.items);
+    assert_eq!((ex.by_dest.permanent.count, ex.by_dest.quarantine.count), (5, 5));
+    let last = events.lock().unwrap().last().cloned().expect("至少有最后一次进度");
+    assert_eq!((last.done, last.total), (10, 10));
+    assert!(last.cost_total > 0.0 && (last.cost_done - last.cost_total).abs() < 1e-6, "{last:?}");
+    assert_eq!(last.total_bytes, ex.ok_bytes);
+    assert!(!t.p(r"review\deep").exists(), "暂存后变空的子文件夹删掉");
+    let m = Manifest::load(Path::new(ex.manifest_path.as_ref().unwrap())).unwrap();
+    assert_eq!(m.entries.len(), 5, "只有 review 档进暂存区");
+    assert!(m.entries.iter().all(|e| e.original.contains(r"\review\")));
+    let rr = quarantine::restore(Path::new(ex.manifest_path.as_ref().unwrap()), &log).unwrap();
+    assert_eq!(rr.restored, 5);
+    // 用户明确选回收站 → safe_direct = false：safe 档也进回收站（这里只看预检的去向，不真的回收）
+    let mut plan2 = action::build_plan(&r, &ctx, &prot, &[req(&t.s("review"))], Strategy::RecycleBin);
+    plan2.safe_direct = false;
+    let rep2 = action::preflight(&mut plan2, &prot, &PreflightOptions::default());
+    assert_eq!((rep2.by_dest.recycle.count, rep2.by_dest.permanent.count), (5, 0));
+}
+
+/// 统一队列 + 停止：多个清单项、上千个文件，处理一部分后停止 → 报告 cancelled、剩下的原样不动，
+/// 只删“里面的东西全处理完”的空文件夹；统计守恒（成功 + 跳过 + 失败 + 没处理 = 计划总数）。
+#[test]
+fn cancel_stops_quickly_and_leaves_the_rest_untouched() {
+    let t = TempTree::new("cancel");
+    let mut all = Vec::new();
+    for d in 0..30 {
+        for f in 0..100 {
+            let rel = format!(r"cache\d{d:02}\f{f:03}.bin");
+            write_old(&t.p(&rel), b"0123456789");
+            all.push(rel);
+        }
+    }
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Permanent);
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    assert_eq!(rep.total_entries, 3000);
+    let log = ActionLog::open(&t.p("actions.log"));
+    let cancel = AtomicBool::new(false);
+    let mut o = ExecOptions::new(&log);
+    o.cancel = Some(&cancel);
+    o.workers = 1;
+    o.progress_ms = 1;
+    let ex = action::execute(&plan, &prot, &o, |p| {
+        if p.done >= 300 {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    })
+    .unwrap();
+    assert!(ex.cancelled);
+    let left = all.iter().filter(|rel| t.p(rel).exists()).count();
+    println!("停止：成功 {}，没处理 {}，还在 {left}", ex.ok, ex.not_processed.count);
+    assert!(ex.ok >= 300 && ex.ok < 3000, "{}", ex.ok);
+    assert_eq!(ex.ok + ex.skipped + ex.failed + ex.not_processed.count, 3000);
+    assert_eq!(left, ex.not_processed.count, "没处理的必须都还在");
+    // 文件夹：全删光的删掉了，还有文件的留着
+    for d in 0..30 {
+        let dir = t.p(&format!(r"cache\d{d:02}"));
+        let remaining = (0..100).filter(|f| dir.join(format!("f{f:03}.bin")).exists()).count();
+        assert_eq!(dir.exists(), remaining > 0, "d{d:02} 还剩 {remaining} 个");
+    }
+    let lines = read_log(&t.p("actions.log"));
+    assert!(lines.iter().any(|l| l["op"] == "cancel"));
+    assert!(lines.iter().any(|l| l["op"] == "summary" && l["reason"].as_str().unwrap().contains("已停止")));
+}
+
+/// 回收站模式的整夹回收：满足条件的子文件夹整个进回收站（日志仍逐个文件记），条件不满足
+/// （预检后多了一个文件）的退回逐个文件，多出来的文件不动。测完把我们自己的东西从回收站挪回来。
+#[test]
+fn recycle_whole_dir_when_strictly_safe_else_per_file() {
+    let t = TempTree::new("rdir");
+    for i in 0..40 {
+        write_old(&t.p(&format!(r"cache\whole\w{i:02}.bin")), &content(&format!("w{i}"), 500));
+    }
+    write_old(&t.p(r"cache\whole\inner\x.bin"), b"inner");
+    for i in 0..20 {
+        write_old(&t.p(&format!(r"cache\grown\g{i:02}.bin")), &content(&format!("g{i}"), 500));
+    }
+    write_old(&t.p(r"cache\top.bin"), b"top");
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    plan.safe_direct = false;
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    assert_eq!(rep.total_entries, 62);
+    write_old(&t.p(r"cache\grown\new-after-plan.txt"), b"not in plan");
+    let logp = t.p("actions.log");
+    let log = ActionLog::open(&logp);
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
+    drop(log);
+    let vol = volume_root_of(&root).unwrap();
+    let mut originals = vec![t.s(r"cache\whole"), t.s(r"cache\top.bin")];
+    originals.extend((0..20).map(|i| t.s(&format!(r"cache\grown\g{i:02}.bin"))));
+    let lines = read_log(&logp);
+    let restored = restore_from_bin(&vol, &originals);
+    assert_eq!((ex.ok, ex.failed), (62, 0), "{:?}", ex.items);
+    assert_eq!(ex.by_dest.recycle.count, 62);
+    assert_eq!(lines.iter().filter(|l| l["op"] == "recycle_dir").count(), 1, "整夹回收一次（whole）");
+    assert_eq!(lines.iter().filter(|l| l["method"] == "ifileoperation_dir").count(), 41 + 1, "41 个文件逐个记 + 1 条文件夹记录");
+    assert_eq!(lines.iter().filter(|l| l["op"] == "recycle" && l["method"] == "ifileoperation").count(), 21);
+    assert!(t.p(r"cache\grown\new-after-plan.txt").exists(), "预检之后多出来的文件不能动");
+    assert_eq!(restored, 22, "whole 整夹 + top + 20 个 grown 都该在回收站里");
+    assert!(t.p(r"cache\whole\inner\x.bin").exists() && t.p(r"cache\grown\g00.bin").exists());
+    assert_eq!(fs::read(t.p(r"cache\whole\w07.bin")).unwrap(), content("w7", 500));
+}
+
+/// 跨盘暂存：链接数 > 1 的文件跳过（硬链接，删了不腾空间）；CopyFileExW 收到停止信号时中断、半截的复制品删掉。
+#[test]
+fn cross_volume_quarantine_skips_hardlinks_and_copy_can_be_cancelled() {
+    let Ok(base) = std::env::var("DISKWHY_TEST_XVOL_DIR") else {
+        println!("SKIP：没设 DISKWHY_TEST_XVOL_DIR");
+        return;
+    };
+    let base = PathBuf::from(base);
+    fs::create_dir_all(&base).unwrap();
+    let t = TempTree::new("xhl");
+    write_old(&t.p(r"cache\plain.bin"), &content("plain", 5000));
+    write_old(&t.p(r"cache\linked.bin"), &content("linked", 5000));
+    fs::hard_link(t.p(r"cache\linked.bin"), t.p(r"other-name.bin")).unwrap();
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let q = TempTree::in_dir(&base, "xhl-q");
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::Quarantine { dest_root: q.s("") });
+    plan.safe_direct = false;
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    assert_eq!(rep.skipped_by_reason.get("hardlink").map(|c| c.count), Some(1), "{:?}", rep.skipped_by_reason);
+    let hl = rep.items[0].skipped.iter().find(|s| s.code == "hardlink").unwrap();
+    assert_eq!(hl.reason, "硬链接，删了不腾空间");
+    let log = ActionLog::open(&t.p("actions.log"));
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
+    assert_eq!((ex.ok, ex.by_dest.quarantine.count), (1, 1));
+    assert!(t.p(r"cache\linked.bin").exists());
+    let rr = quarantine::restore(Path::new(ex.manifest_path.as_ref().unwrap()), &log).unwrap();
+    assert_eq!(rr.restored, 1);
+    // CopyFileExW 中断
+    let big = t.p("big.bin");
+    write_old(&big, &vec![7u8; 8 << 20]);
+    let dst = q.p("big-copy.bin");
+    let flag = std::sync::atomic::AtomicI32::new(1);
+    let e = action::winops::copy_file_cancellable(&big.to_string_lossy(), &dst.to_string_lossy(), Some(&flag)).unwrap_err();
+    assert_eq!(e, action::winops::ERROR_REQUEST_ABORTED);
+    assert!(!dst.exists(), "半截的复制品必须删掉");
+    let err = quarantine::move_file_cancellable(&big.to_string_lossy(), &dst.to_string_lossy(), Some(&flag)).unwrap_err();
+    assert!(err.starts_with("已停止"), "{err}");
+    assert!(big.exists() && !dst.exists(), "停止后原文件不动、没有复制品");
+}
+
+/// 暂存区落点：盘根不可写时的回退链；提权子进程参数检查；新旧文件夹名都认。
+#[test]
+fn quarantine_destination_fallback_chain() {
+    use diskwhy_core::action::quarantine::{elevated_mkdir_from_args, mkdir_exit, prepare_dest_with, DestStatus};
+    assert!(matches!(prepare_dest_with(r"C:\Windows", false, &[], 3), DestStatus::Failed { .. }));
+    assert_eq!(elevated_mkdir_from_args(&["diskwhy.exe".into()]), None);
+    assert_eq!(elevated_mkdir_from_args(&["x".into(), "--mkdir-quarantine".into(), r"C:\Windows".into(), "--grant-sid".into(), "S-1-5-21-1".into()]), Some(mkdir_exit::BAD_ARGS));
+    assert_eq!(elevated_mkdir_from_args(&["x".into(), "--mkdir-quarantine".into(), r"C:\".into(), "--grant-sid".into(), "S-1-1-0;rm".into()]), Some(mkdir_exit::BAD_ARGS));
+    assert_eq!(quarantine::mkdir_params(r"D:\", "S-1-5-21-9"), r#"--mkdir-quarantine "D:\\" --grant-sid S-1-5-21-9"#);
+    // 真机：D:\ 根目录普通用户建不了文件夹（docs/PHASE_J_PLAN.md §0）
+    let Ok(base) = std::env::var("DISKWHY_TEST_XVOL_DIR") else { return };
+    let vol = volume_root_of(&base).unwrap();
+    let q_at_root = Path::new(&vol).join(quarantine::DIR_NAME);
+    let root_writable = quarantine::dir_writable(&vol);
+    println!("{vol} 根目录可写：{root_writable}，{} 已存在：{}", q_at_root.display(), q_at_root.exists());
+    if !root_writable && !q_at_root.exists() {
+        assert_eq!(prepare_dest_with(&vol, false, &[], 3), DestStatus::NeedsElevation);
+        assert!(matches!(prepare_dest_with(&vol, false, &[], 1), DestStatus::Failed { .. }), "非管理员直接给“选文件夹”");
+        // ③ 以前用过的位置仍可写 → 用它
+        assert_eq!(prepare_dest_with(&vol, false, &[base.clone()], 3), DestStatus::Ok { dest_root: base.clone() });
+        assert!(!Path::new(&base).join(quarantine::DIR_NAME).exists(), "只是试探，不留下文件夹");
+    } else {
+        assert_eq!(prepare_dest_with(&vol, false, &[], 3), DestStatus::Ok { dest_root: vol.clone() });
+    }
+    // 旧名 DiskWhy-Quarantine 下的批次照样能列出来
+    let q = TempTree::in_dir(Path::new(&base), "oldname");
+    let dir = q.p(r"DiskWhy-Quarantine\20260101-000000-aa");
+    fs::create_dir_all(&dir).unwrap();
+    let mut m = Manifest::new("20260101-000000-aa", &q.s(""), &dir.to_string_lossy());
+    m.entries.push(quarantine::ManifestEntry {
+        original: r"C:\nowhere\x.bin".into(),
+        stored: Some(dir.join(r"C\nowhere\x.bin").to_string_lossy().to_string()),
+        kind: EntryKind::File,
+        size: 1,
+        bytes: 4096,
+        mtime: 0,
+        quarantined_at: 0,
+        item: r"C:\nowhere".into(),
+        source: "t".into(),
+        tier: diskwhy_core::explain::Tier::Safe,
+        method: "rename".into(),
+        status: "stored".into(),
+        note: String::new(),
+    });
+    m.save(&dir.join(quarantine::MANIFEST)).unwrap();
+    let b = quarantine::list_batches(&[q.s("")]);
+    assert_eq!(b.len(), 1);
+    let log = ActionLog::open(&q.p("actions.log"));
+    let pr = quarantine::purge(&dir.join(quarantine::MANIFEST), &log).unwrap();
+    assert!(pr.removed);
+}
+
+/// 日志轮转（> 阈值改名为 actions.1.log，只留一份旧的）；回收站上限 / 用量读得到；perf 模型能学。
+#[test]
+fn log_rotation_and_recycle_capacity_readable() {
+    use diskwhy_core::action::log::rotated_path;
+    let t = TempTree::new("rot");
+    let p = t.p("actions.log");
+    fs::write(&p, vec![b'x'; 2000]).unwrap();
+    fs::write(rotated_path(&p), b"older").unwrap();
+    let log = ActionLog::open_rotating(&p, 1000);
+    log.write(&diskwhy_core::action::log::LogRecord::new("b", "start", "p"));
+    drop(log);
+    assert_eq!(fs::metadata(rotated_path(&p)).unwrap().len(), 2000, "旧日志改名为 actions.1.log，更早的那份去掉");
+    assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 1);
+    let vol = volume_root_of(&t.s("")).unwrap();
+    let t0 = std::time::Instant::now();
+    let usage = action::winops::recycle_bin_usage(&vol);
+    let cap = action::winops::recycle_bin_max_capacity(&vol);
+    println!("{vol} 回收站：{usage:?}（{:?}），上限 {cap:?}，卷 {:?}", t0.elapsed(), action::winops::volume_guid(&vol));
+    assert!(action::winops::volume_guid(&vol).is_some());
+    assert!(usage.is_some());
+}
+
+// ───────────────────────── 阶段 J harden（PHASE_J_CRASH.md）─────────────────────────
+
+/// 回收站：每一项的结果来自 IFileOperationProgressSink::PostDeleteItem——进了回收站 / 被占用（带 HRESULT）/ 打不开。
+#[test]
+fn recycle_items_reports_per_item_results() {
+    use action::winops::{self, RecycleOutcome};
+    let t = TempTree::new("ritems");
+    write_old(&t.p("a.bin"), b"a");
+    write_old(&t.p("b.bin"), b"b");
+    // b 被别的程序以“读写共享、不共享删除”打开着
+    let hold = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(t.p("b.bin")).unwrap();
+    let r = {
+        let _com = winops::ComSta::init();
+        winops::recycle_items(&[t.s("a.bin"), t.s("b.bin"), t.s("missing.bin")])
+    };
+    drop(hold);
+    let vol = volume_root_of(&t.s("")).unwrap();
+    let restored = restore_from_bin(&vol, &[t.s("a.bin")]);
+    println!("{r:?}");
+    assert_eq!(r[0], RecycleOutcome::Recycled);
+    assert!(matches!(&r[1], RecycleOutcome::Failed { hr, .. } if *hr < 0), "被占用的应带失败 HRESULT：{:?}", r[1]);
+    assert!(matches!(&r[2], RecycleOutcome::Failed { .. }));
+    assert_eq!(restored, 1);
+    assert!(t.p("b.bin").exists());
+}
+
+/// 预检之后才被占用的文件：回收时不再报“回收站操作被中止（你点了否）”，而是“跳过 · 被占用”。
+#[test]
+fn recycle_locked_after_preflight_is_skipped_locked_not_failed() {
+    let t = TempTree::new("rlock");
+    for i in 0..3 {
+        write_old(&t.p(&format!(r"cache\f{i}.bin")), &content(&format!("f{i}"), 1000));
+    }
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    plan.safe_direct = false;
+    action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    let hold = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(t.p(r"cache\f1.bin")).unwrap();
+    let logp = t.p("actions.log");
+    let log = ActionLog::open(&logp);
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
+    drop(log);
+    drop(hold);
+    let vol = volume_root_of(&root).unwrap();
+    let restored = restore_from_bin(&vol, &[t.s(r"cache\f0.bin"), t.s(r"cache\f2.bin")]);
+    assert_eq!((ex.ok, ex.skipped, ex.failed), (2, 1, 0), "{:?}", ex.items);
+    assert_eq!(ex.skipped_by_reason.get("locked").map(|c| c.count), Some(1));
+    assert_eq!(restored, 2);
+    assert!(t.p(r"cache\f1.bin").exists());
+    let lines = read_log(&logp);
+    let l = lines.iter().find(|l| l["op"] == "recycle" && l["result"] == "skipped").expect("占用的那条记成 skipped");
+    assert!(l["reason"].as_str().unwrap().contains("占用"), "{l}");
+}
+
+/// 稀疏文件：逻辑大小很大、几乎不占盘。只有真的设上了稀疏属性才返回 true（否则 set_len 会真占空间，不能做）。
+fn make_sparse(p: &Path, size: u64) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    if let Some(d) = p.parent() {
+        fs::create_dir_all(d).unwrap();
+    }
+    let Ok(f) = fs::OpenOptions::new().read(true).write(true).create_new(true).open(p) else { return false };
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    let mut ret = 0u32;
+    let ok = unsafe {
+        windows_sys::Win32::System::IO::DeviceIoControl(
+            f.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut ret,
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    let sparse = ok && fs::metadata(p).map(|m| m.file_attributes() & 0x200 != 0).unwrap_or(false);
+    if !sparse {
+        drop(f);
+        let _ = fs::remove_file(p);
+        return false;
+    }
+    f.set_len(size).is_ok()
+}
+
+/// 比回收站上限还大的文件：预检就标成“跳过 · 回收站放不下”，执行时不送进回收站（否则 Windows 会直接永久删除），
+/// 原样不动；同一项里的小文件照常进回收站。用稀疏文件，不真的占空间。
+#[test]
+fn recycle_refuses_file_bigger_than_bin_capacity() {
+    let Ok(base) = std::env::var("DISKWHY_TEST_XVOL_DIR") else {
+        println!("SKIP：没设 DISKWHY_TEST_XVOL_DIR（要一个空间充足的盘放稀疏文件）");
+        return;
+    };
+    let t = TempTree::in_dir(Path::new(&base), "rbig");
+    write_old(&t.p(r"cache\small.bin"), b"small");
+    let vol = volume_root_of(&t.s("")).unwrap();
+    let info = action::winops::RecycleBinInfo::read(&vol);
+    println!("{vol} 回收站设置：{info:?}");
+    let Some(cap) = info.max_bytes.filter(|_| !info.nuke) else {
+        println!("SKIP：读不到回收站上限，或这个盘的回收站是“直接删除”");
+        return;
+    };
+    let big = t.p(r"cache\big.bin");
+    if !make_sparse(&big, cap + (1 << 20)) {
+        println!("SKIP：建不了稀疏文件");
+        return;
+    }
+    backdate(&big, 7200);
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    plan.safe_direct = false;
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    assert_eq!(rep.skipped_by_reason.get("recycle_unavailable").map(|c| c.count), Some(1), "{:?}", rep.skipped_by_reason);
+    let logp = t.p("actions.log");
+    let log = ActionLog::open(&logp);
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
+    drop(log);
+    let restored = restore_from_bin(&vol, &[t.s(r"cache\small.bin")]);
+    assert!(big.exists(), "太大的文件不能被送进回收站（会被直接删掉）");
+    assert_eq!(fs::metadata(&big).unwrap().len(), cap + (1 << 20));
+    assert_eq!((ex.ok, ex.by_dest.recycle.count, ex.by_dest.permanent.count), (1, 1, 0));
+    assert_eq!(ex.skipped_by_reason.get("recycle_unavailable").map(|c| c.count), Some(1));
+    assert_eq!(restored, 1);
+    // 判断规则本身
+    let b = action::winops::RecycleBinInfo { max_bytes: Some(100), nuke: false };
+    assert!(b.refuse(100).is_none() && b.refuse(101).is_some());
+    assert!(action::winops::RecycleBinInfo { max_bytes: None, nuke: true }.refuse(1).is_some());
+    assert!(action::winops::RecycleBinInfo { max_bytes: Some(0), nuke: false }.refuse(1).is_some());
+}
+
+/// 正在运行的 Chromium / Electron 程序的磁盘缓存：程序用“全共享（含删除）”打开缓存文件，占用探测看不出来，
+/// 但 Restart Manager 能查到 → 整个缓存文件夹跳过（被占用），没人用的缓存照常删。
+#[test]
+fn live_chromium_cache_is_skipped_even_when_opened_with_share_delete() {
+    let t = TempTree::new("chrome");
+    write_old(&t.p(r"cache\app\GPUCache\index"), b"gpu-index");
+    write_old(&t.p(r"cache\app\GPUCache\data_0"), &content("d0", 4000));
+    write_old(&t.p(r"cache\app\GPUCache\data_1"), &content("d1", 4000));
+    write_old(&t.p(r"cache\app\Cache\Cache_Data\index"), b"idx");
+    write_old(&t.p(r"cache\app\Cache\Cache_Data\0123456789abcdef_0"), &content("e0", 3000));
+    write_old(&t.p(r"cache\app\Cache\Cache_Data\index-dir\the-real-index"), b"real");
+    write_old(&t.p(r"cache\other.bin"), &content("o", 2000));
+    // “某个程序”正在用 GPUCache：FILE_SHARE_READ | WRITE | DELETE 打开 index（Chromium 的做法）
+    let hold = fs::OpenOptions::new().read(true).share_mode(1 | 2 | 4).open(t.p(r"cache\app\GPUCache\index")).unwrap();
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let mut plan = action::build_plan(&r, &ctx, &prot, &[req(&t.s("cache"))], Strategy::RecycleBin);
+    assert!(plan.safe_direct, "safe 档默认直接删除");
+    let dirs = action::preflight::chromium_cache_dirs(&plan);
+    assert_eq!(dirs.len(), 2, "{dirs:?}");
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    println!("{:?} / {:?}", rep.skipped_by_reason, rep.timing_ms);
+    assert_eq!(rep.skipped_by_reason.get("locked").map(|c| c.count), Some(3), "GPUCache 里 3 个都跳过：{:?}", rep.skipped_by_reason);
+    let logp = t.p("actions.log");
+    let log = ActionLog::open(&logp);
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
+    drop(log);
+    drop(hold);
+    assert_eq!((ex.ok, ex.failed), (4, 0), "{:?}", ex.items);
+    assert!(t.p(r"cache\app\GPUCache\index").exists() && t.p(r"cache\app\GPUCache\data_0").exists() && t.p(r"cache\app\GPUCache\data_1").exists());
+    assert!(!t.p(r"cache\app\Cache\Cache_Data\index").exists() && !t.p(r"cache\other.bin").exists());
+}
+
+/// DiskWhy 自己的数据（日志 / 设置 / 界面的 WebView2 数据）受保护：正在运行时删自己的 EBWebView 缓存会弄坏自己的界面。
+#[test]
+fn protect_own_app_data() {
+    let vars: Vec<(String, String)> = [("USERPROFILE", r"C:\Users\alice"), ("LOCALAPPDATA", r"C:\Users\alice\AppData\Local")]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    let p = Protector::with(&vars, &[], &[r"C:\".into()]);
+    assert_blocked(&p, r"C:\Users\alice\AppData\Local\com.diskwhy.desktop\EBWebView\Default\Cache\Cache_Data\index", "DiskWhy");
+    assert_blocked(&p, r"C:\Users\alice\AppData\Local\com.diskwhy.desktop", "DiskWhy");
+    assert_blocked(&p, r"C:\Users\alice\AppData\Local\DiskWhy\actions.log", "DiskWhy");
+    assert_allowed(&p, r"C:\Users\alice\AppData\Local\Temp\x.tmp");
+    assert_allowed(&p, r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cache");
 }

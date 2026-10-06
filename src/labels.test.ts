@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LoseKind } from "./api";
-import { advice, checkLine, cleanCat, clipWidth, isHardTag, LOSE_LABEL, LOSE_ORDER, loseLabel, loseTag, worstLose } from "./labels";
+import { advice, checkLine, cleanCat, clipWidth, driveName, isHardTag, LOSE_LABEL, LOSE_ORDER, loseLabel, loseTag, worstLose } from "./labels";
 
 describe("后果标签 lose_kind → 中文", () => {
   it("八种都有固定的标签", () => {
@@ -105,5 +105,18 @@ describe("具体后果标签和建议（阶段 H）", () => {
     expect(advice("keep", ["none"]).head).toBe("别动");
     expect(advice("safe", ["delete"], "  关掉 Chrome 后删  ").detail).toBe("关掉 Chrome 后删");
     expect(advice("safe", ["delete"]).detail).toBe("");
+  });
+});
+
+describe("driveName（盘名从扫描根推导）", () => {
+  it("盘根和文件夹都取盘符", () => {
+    expect(driveName("C:\\")).toBe("C 盘");
+    expect(driveName("d:\\")).toBe("D 盘");
+    expect(driveName("E:\\Games\\x")).toBe("E 盘");
+  });
+  it("认不出盘符", () => {
+    expect(driveName("")).toBe("磁盘");
+    expect(driveName(null)).toBe("磁盘");
+    expect(driveName("\\\\server\\share")).toBe("磁盘");
   });
 });

@@ -2,11 +2,12 @@
 // 清理页：左边分类是纯文字行（名字 + 大小 + 细条），右边是表格式列表（名称 / 位置 / 大小），
 // 按“可放心清理”“需你判断”分组，行高 50px、细线分隔；需你判断的行只挂一个后果标签（来自规则的 lose_kind）。
 // 点一行在行内展开说明（这是什么 / 删了会怎样 / 建议，阶段 H）。底部通栏 + 一个主按钮。
+// 窄窗口 / 竖屏（阶段 J §3.7）：左边分类变成顶上一行可横向滚动的标签，表格只留 勾选 / 名字（带标签）/ 大小。
 // 行上的标签是规则写的具体后果（lose_short，比如“不能休眠”），颜色按 lose_kind（找不回来实心、其余浅底）。
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { getGuidance, openSystemSettings, type CandidateGroup } from "../api";
 import { gbNum, sizeParts } from "../capacity";
-import { advice, CLEAN_CATS, isHardTag, loseTag, shortPath, type CleanCat } from "../labels";
+import { advice, CLEAN_CATS, driveName, isHardTag, loseTag, shortPath, type CleanCat } from "../labels";
 import {
   canCheck,
   candidates,
@@ -16,6 +17,7 @@ import {
   doPreview,
   groupCat,
   previewBusy,
+  scanRoot,
   setGroups,
   summary,
   toggleGroup,
@@ -102,6 +104,7 @@ watch(previewBusy, (busy) => {
 onBeforeUnmount(() => clearInterval(timer));
 
 const free = computed(() => summary.value?.free_bytes ?? 0);
+const dname = computed(() => driveName(summary.value?.root ?? scanRoot.value));
 const keepBytes = computed(() => summary.value?.tiers.keep_bytes ?? 0);
 const totalChecked = computed(() => checkedGroups.value.length);
 </script>
@@ -205,11 +208,13 @@ const totalChecked = computed(() => checkedGroups.value.length);
     </main>
 
     <footer class="bar">
-      <div><span class="k">已选</span><span class="v num">{{ totalChecked }}<small>项</small></span></div>
-      <div class="sep"></div>
+      <div class="cnt"><span class="k">已选</span><span class="v num">{{ totalChecked }}<small>项</small></span></div>
+      <div class="sep cnt-sep"></div>
       <div class="big"><span class="k">能腾出</span><span class="v num">{{ gbNum(checkedBytes) }}<small>GB</small></span></div>
       <div class="sep"></div>
-      <div class="free">C 盘剩余 <b class="num">{{ gbNum(free) }}</b><span class="arr">→</span><b class="num">{{ gbNum(free + checkedBytes) }} GB</b></div>
+      <div class="free">
+        <span class="k">{{ dname }}剩余</span><span class="fv"><b class="num">{{ gbNum(free) }}</b><span class="arr">→</span><b class="num">{{ gbNum(free + checkedBytes) }} GB</b></span>
+      </div>
       <button class="btn" :disabled="!totalChecked || previewBusy" @click="doPreview()">
         <template v-if="previewBusy">正在检查 <span class="num">{{ elapsed }} 秒</span></template>
         <template v-else>清理 <span class="num">{{ gbNum(checkedBytes) }} GB</span></template>
@@ -457,6 +462,7 @@ const totalChecked = computed(() => checkedGroups.value.length);
   display: flex;
   align-items: center;
   gap: 10px;
+  padding-right: 14px;
   font-size: var(--fs-body);
   font-weight: var(--w-med);
   color: var(--ink);
@@ -667,6 +673,15 @@ const totalChecked = computed(() => checkedGroups.value.length);
   display: flex;
   align-items: center;
   gap: 10px;
+  white-space: nowrap;
+}
+.bar .free .k {
+  margin-bottom: 0;
+}
+.bar .free .fv {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 .bar .free b {
   font-weight: var(--w-semi);
@@ -706,5 +721,158 @@ const totalChecked = computed(() => checkedGroups.value.length);
   color: #141412;
   border-color: var(--accent);
   box-shadow: none;
+}
+
+/* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：分类变成顶上一行横向标签；表格只留 勾选 / 名字 / 大小 ───────── */
+@media (max-width: 1099px), (max-aspect-ratio: 1/1) {
+  .rail {
+    left: var(--gutter);
+    right: var(--gutter);
+    top: 52px;
+    bottom: auto;
+    width: auto;
+    height: 52px;
+    padding: 0 6px 0 0;
+    border-right: 0;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent);
+  }
+  .rail::-webkit-scrollbar {
+    display: none;
+  }
+  .rail h6,
+  .rail-foot {
+    display: none;
+  }
+  .cat {
+    flex: none;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    height: 38px;
+    padding: 9px 14px 0;
+    margin: 0;
+    border: var(--bw) solid var(--line);
+    border-radius: var(--r-pill);
+    white-space: nowrap;
+  }
+  .cat .cbar,
+  .cat.on::before {
+    display: none;
+  }
+  .cat .nm {
+    font-size: 14px;
+  }
+  .cat .sz {
+    font-size: 12px;
+  }
+  .cat.on {
+    background: var(--ink);
+    border-color: var(--ink);
+  }
+  .cat.on .nm,
+  .cat.on .sz {
+    color: var(--bg);
+  }
+  [data-theme="B"] .cat.on {
+    background: var(--line2);
+    border-color: var(--line2);
+  }
+  [data-theme="B"] .cat.on .nm,
+  [data-theme="B"] .cat.on .sz {
+    color: var(--ink);
+  }
+  [data-theme="C"] .cat {
+    margin: 0;
+    border: 2px solid #141412;
+    background: #fff;
+    border-radius: 999px;
+  }
+  [data-theme="C"] .cat:hover:not(.on) {
+    background: var(--safe-soft);
+  }
+  [data-theme="C"] .cat.on {
+    background: var(--accent);
+    border-radius: 999px;
+    box-shadow: 3px 3px 0 #141412;
+  }
+  [data-theme="C"] .cat.on .nm,
+  [data-theme="C"] .cat.on .sz {
+    color: #141412;
+  }
+  [data-theme="C"] .cat .nm {
+    font-size: 15px;
+  }
+
+  .main {
+    left: var(--gutter);
+    right: var(--gutter);
+    top: 116px;
+  }
+  .head {
+    padding: 0 0 12px;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .grid {
+    grid-template-columns: 36px minmax(0, 1fr) 84px 26px;
+  }
+  .cols > span:nth-of-type(2),
+  .row .loc {
+    display: none;
+  }
+  .grp {
+    padding-left: 36px;
+  }
+  .grp .hint {
+    margin-right: 26px;
+  }
+  .detail {
+    padding: 2px 4px 16px 36px;
+  }
+  .detail dl {
+    grid-template-columns: 72px minmax(0, 1fr);
+    column-gap: 12px;
+  }
+  .detail .paths span {
+    min-width: 0;
+  }
+  .detail code {
+    overflow-wrap: anywhere;
+  }
+
+  .bar {
+    padding: 0 var(--gutter);
+    gap: 24px;
+  }
+  .bar .free {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+  .bar .free .k {
+    margin-bottom: 2px;
+  }
+  .bar .btn {
+    min-width: 0;
+    padding: 0 24px;
+  }
+}
+@media (max-width: 819px) {
+  .bar .cnt,
+  .bar .cnt-sep {
+    display: none;
+  }
+  .bar {
+    gap: 20px;
+  }
+  .bar .big .v {
+    font-size: 38px;
+  }
 }
 </style>

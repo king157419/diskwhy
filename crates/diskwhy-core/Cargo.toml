@@ -14,9 +14,14 @@ toml = { workspace = true }
 ureq = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
+# 阶段 J 闪退取证（crash.rs）：MiniDumpWriteDump 需要 Kernel + Memory + Storage_FileSystem（windows-sys 0.61 的 cfg）；
+# GetSystemTime 在 SystemInformation；父进程号（start 记录）用 ToolHelp。
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO"] }
 # 只用于回收站的 IFileOperation（COM 接口，windows-sys 不含 COM 接口）。0.61.3 已在 Cargo.lock 里（Tauri 依赖它）。
+# 阶段 J：回收站结果用 IFileOperationProgressSink（#[implement]，windows-core 自带）逐条拿真实结果。
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com"] }
+# #[implement] 宏展开成 `windows_core::…`，必须直接依赖（0.61.2 已在 Cargo.lock 里）。
+windows-core = "0.61"
 
 [dev-dependencies]
 # 测试里对文件内容算 SHA-256，核对隔离区 / 回收站往返后内容一致（0.10.9 已在 Cargo.lock 里）。

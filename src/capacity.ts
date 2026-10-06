@@ -1,4 +1,4 @@
-// 首页 C 盘竖向容量柱的布局（纯函数，便于单元测试，见 capacity.test.ts）。
+// 首页容量柱的布局（竖放 / 横放；纯函数，便于单元测试，见 capacity.test.ts）。
 // 难点（设计稿 README 第 2 点）：四段比例随机器变化，“剩余”只有几 GB 时段高可能只有十几像素，
 // 标签会叠在一起。做法：
 // 1. 段高按字节比例分配，但每个非空段至少 minSeg 像素（从更高的段里按比例扣回来）；
@@ -114,4 +114,67 @@ export function sizeParts(bytes: number): [string, string] {
   if (m >= 1) return [m >= 100 ? m.toFixed(0) : m.toFixed(1), "MB"];
   const k = bytes / 1024;
   return [k >= 1 ? k.toFixed(0) : String(bytes), k >= 1 ? "KB" : "B"];
+}
+
+// ───── 横放的容量柱（阶段 J：窄窗口 / 竖屏时首页容量柱横过来，标签在柱子下面） ─────
+
+/**
+ * “清理后剩余”水位：从柱子起点（剩余那头）往里 afterBytes 字节处的像素位置。
+ * 按已经排好的段（含最小段高和段间缝）换算，竖放 / 横放共用。没有或 ≤ 0 时为 null。
+ */
+export function afterOffset(placed: PlacedSeg[], afterBytes: number | null | undefined): number | null {
+  if (afterBytes == null || afterBytes <= 0) return null;
+  let acc = 0;
+  for (const p of placed) {
+    if (p.height <= 0) continue;
+    if (afterBytes <= acc + p.bytes + 1) {
+      const f = p.bytes > 0 ? (afterBytes - acc) / p.bytes : 1;
+      return Math.round(p.top + p.height * Math.min(1, Math.max(0, f)));
+    }
+    acc += p.bytes;
+  }
+  return null;
+}
+
+export interface HSeg extends Seg {
+  left: number;
+  width: number;
+}
+
+export interface HLabel {
+  key: string;
+  /** 标签框的左边 */
+  left: number;
+  /** 标签框中心 */
+  x: number;
+  /** 想放的位置（段中点） */
+  want: number;
+  leader: boolean;
+}
+
+/**
+ * 横放：段宽按字节比例（复用 layoutSegments，非空段至少 minSeg 像素），
+ * 标签框（宽 labelW）放在各段中点下方，用 layoutLabels 一维挤开（相邻中心至少 labelW + space），
+ * 并整个落在 [0, width] 内。字节为 0 的段不出标签。
+ */
+export function layoutHorizontal(
+  segs: Seg[],
+  width: number,
+  labelW: number,
+  opt: { minSeg?: number; sep?: number; space?: number } = {},
+): { segs: HSeg[]; labels: HLabel[] } {
+  const placed = layoutSegments(segs, width, opt.minSeg ?? 14, opt.sep ?? 2);
+  const out = placed.map((p) => ({ key: p.key, bytes: p.bytes, left: p.top, width: p.height }));
+  const live = out.filter((p) => p.width > 0);
+  const half = labelW / 2;
+  const pos = layoutLabels(
+    live.map((p) => p.left + p.width / 2),
+    labelW + (opt.space ?? 8),
+    Math.min(half, width / 2),
+    Math.max(width - half, width / 2),
+  );
+  return {
+    segs: out,
+    labels: live.map((p, i) => ({ key: p.key, left: Math.round(pos[i].y - half), x: pos[i].y, want: pos[i].want, leader: pos[i].leader })),
+  };
 }

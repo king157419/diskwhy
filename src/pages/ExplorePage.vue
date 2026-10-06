@@ -2,7 +2,9 @@
 // 看看都是什么（空间分析）：左方块图（两层，颜色 = 三档），右列表（选中的那个文件夹的子项）。
 // 行 = 色点、图标、名字、灰色类别（≤ 8 字）、细条、大小；混合 / 零散的用空心点，排在最后。
 // 点一行在行内展开说明；有子项的文件夹点右端“›”进去。右上切「方块图 / 并排 / 列表」。
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+// 阶段 J：面包屑每一级都能点（盘根 → 方块图和列表都是盘根；其余 → 上一级做方块图、它自己做列表）；
+// 「图例」按钮（悬停 / 点击出现，色块复用方块的配色类）；窄窗口 / 竖屏时方块图在上、列表在下。
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   AppWindow,
   Box,
@@ -21,6 +23,7 @@ import TreemapView from "../components/TreemapView.vue";
 import { askAi, type Category, type Explanation, type NodeView } from "../api";
 import { sizeParts, gbNum } from "../capacity";
 import { advice, CATEGORY_LABEL, clipWidth, isHardTag, loseTag } from "../labels";
+import { crumbTarget } from "../treemap";
 import {
   enterBlock,
   enterRow,
@@ -48,17 +51,33 @@ const VIEWS: { id: ExploreView; name: string }[] = [
 
 const isScanRoot = computed(() => !!summary.value && !!listing.value && listing.value.node.path === summary.value.root);
 
-/** 面包屑：右边列表那个文件夹的完整路径（最后一段加粗） */
+/** 面包屑：右边列表那个文件夹的完整路径（最后一段加粗 = 当前选中） */
 const crumbs = computed(() => {
   const bc = (focus.value ?? listing.value)?.breadcrumb ?? [];
   return bc.map((c, i) => ({ name: i === 0 ? c.name.replace(/\\$/, "") : c.name, path: c.path }));
 });
-/** 点面包屑：那一段成为右边列表，它的上一层成为方块图 */
+/** 点面包屑第 i 级：见 treemap.ts crumbTarget（盘根也能选中，列在右边） */
 async function crumbGo(i: number) {
-  const bc = crumbs.value;
-  if (i >= bc.length - 1) return;
-  if (i === 0) await openDir(bc[0].path);
-  else await openDir(bc[i - 1].path, bc[i].path);
+  const t = crumbTarget(crumbs.value, i);
+  if (t) await openDir(t.open, t.focus);
+}
+// 路径很长时面包屑横向滚动，总是露出最后一段
+const crumbEl = ref<HTMLElement | null>(null);
+watch(crumbs, () => nextTick(() => crumbEl.value && (crumbEl.value.scrollLeft = crumbEl.value.scrollWidth)));
+
+// ── 图例：悬停出现，点一下钉住（再点 / 点别处 / Esc 收起） ──
+const LEGEND: { tone: string; name: string; note: string }[] = [
+  { tone: "safe", name: "可放心清理", note: "删了会自动重建" },
+  { tone: "review", name: "需你判断", note: "删了有代价" },
+  { tone: "keep", name: "先别动", note: "系统 · 程序 · 你的文件" },
+  { tone: "mix", name: "认不出来", note: "含“其他 N 项”" },
+  { tone: "na", name: "扫不到", note: "无权限 · 系统保留" },
+];
+const lgHover = ref(false);
+const lgPinned = ref(false);
+const lgShow = computed(() => lgHover.value || lgPinned.value);
+function onDocDown(e: MouseEvent) {
+  if (lgPinned.value && !(e.target as Element | null)?.closest?.(".lg-wrap")) lgPinned.value = false;
 }
 
 type Tone = "safe" | "review" | "keep" | "mix";
@@ -131,33 +150,49 @@ function adviceOf(e: Explanation) {
 }
 
 function onKey(e: KeyboardEvent) {
+  if (e.key === "Escape") lgPinned.value = false;
   if (e.key === "Backspace" && !(e.target instanceof HTMLInputElement)) {
     e.preventDefault();
     void goUp();
   }
 }
-onMounted(() => window.addEventListener("keydown", onKey));
-onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
+onMounted(() => {
+  window.addEventListener("keydown", onKey);
+  document.addEventListener("mousedown", onDocDown);
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKey);
+  document.removeEventListener("mousedown", onDocDown);
+});
 </script>
 
 <template>
   <div class="explore" :class="'v-' + exploreView">
     <div class="sub">
-      <div class="crumb">
+      <nav ref="crumbEl" class="crumb" aria-label="位置">
         <template v-for="(c, i) in crumbs" :key="c.path + i">
           <span v-if="i > 0" class="sep">/</span>
-          <b v-if="i === crumbs.length - 1">{{ c.name }}</b>
-          <button v-else class="cr" @click="crumbGo(i)">{{ c.name }}</button>
+          <b v-if="i === crumbs.length - 1" class="cur">{{ c.name }}</b>
+          <button v-else class="cr" :aria-label="'选中：' + c.name" @click="crumbGo(i)">{{ c.name }}</button>
         </template>
         <span class="sz num">{{ gbNum(focusTotal) }} GB</span>
-      </div>
-      <div class="key">
-        <span><i class="dot safe"></i>可放心清理</span><span><i class="dot review"></i>需你判断</span><span><i class="dot keep"></i>先别动</span>
-      </div>
-      <div class="seg-t" role="radiogroup" aria-label="视图">
-        <button v-for="v in VIEWS" :key="v.id" :class="{ on: exploreView === v.id }" role="radio" :aria-checked="exploreView === v.id" @click="setExploreView(v.id)">
-          {{ v.name }}
-        </button>
+      </nav>
+      <div class="tools">
+        <div class="lg-wrap" @mouseenter="lgHover = true" @mouseleave="lgHover = false">
+          <button class="lg-btn" :class="{ on: lgPinned }" :aria-expanded="lgShow" aria-label="图例" @click="lgPinned = !lgPinned">
+            <span class="lg-ico" aria-hidden="true"><i class="tm-tone safe"></i><i class="tm-tone review"></i><i class="tm-tone keep"></i></span>图例
+          </button>
+          <div v-if="lgShow" class="lg-pop" role="tooltip">
+            <div v-for="r in LEGEND" :key="r.tone" class="lg-row">
+              <i class="sw tm-tone" :class="r.tone"></i><b>{{ r.name }}</b><span>{{ r.note }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="seg-t" role="radiogroup" aria-label="视图">
+          <button v-for="v in VIEWS" :key="v.id" :class="{ on: exploreView === v.id }" role="radio" :aria-checked="exploreView === v.id" @click="setExploreView(v.id)">
+            {{ v.name }}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -232,17 +267,20 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 </template>
 
 <style scoped>
+.explore {
+  display: flex;
+  flex-direction: column;
+  padding: 52px 24px 24px;
+}
 .sub {
-  position: absolute;
-  left: 24px;
-  right: 24px;
-  top: 52px;
-  height: 44px;
+  flex: none;
+  min-height: 44px;
   display: flex;
   align-items: center;
   gap: 24px;
 }
 .crumb {
+  flex: 1 1 auto;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -250,7 +288,21 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   color: var(--ink3);
   min-width: 0;
   white-space: nowrap;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.crumb::-webkit-scrollbar {
+  display: none;
+}
+.crumb .cr {
+  flex: none;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  border-radius: 4px;
+}
+.crumb .cr:hover {
+  background: var(--hover);
 }
 .crumb b {
   color: var(--ink);
@@ -275,18 +327,114 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   font-weight: 700;
   font-size: 18px;
 }
-.key {
+.tools {
   margin-left: auto;
-  display: flex;
-  gap: 18px;
-  font-size: var(--fs-sub);
-  color: var(--ink2);
-  white-space: nowrap;
-}
-.key span {
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 16px;
+}
+/* ── 图例 ── */
+.lg-wrap {
+  position: relative;
+}
+.lg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px 0 10px;
+  font-size: var(--fs-sub);
+  color: var(--ink2);
+  border-radius: var(--r);
+  border: var(--bw) solid transparent;
+  transition: background-color var(--dur-1) var(--ease);
+}
+.lg-btn:hover,
+.lg-btn.on {
+  background: var(--hover);
+  color: var(--ink);
+}
+.lg-ico {
+  display: inline-grid;
+  grid-template-columns: repeat(3, 6px);
+  gap: 2px;
+}
+.lg-ico i {
+  width: 6px;
+  height: 12px;
+  border-radius: 1.5px;
+}
+[data-theme="C"] .lg-btn {
+  border-color: #141412;
+  border-radius: 999px;
+  font-family: var(--heading);
+  font-weight: 700;
+  font-size: 14px;
+  color: #141412;
+  background: #fff;
+}
+[data-theme="C"] .lg-btn:hover,
+[data-theme="C"] .lg-btn.on {
+  background: var(--accent);
+}
+[data-theme="C"] .lg-ico i {
+  border: 1px solid #141412;
+}
+.lg-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 20;
+  width: 300px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop);
+  display: flex;
+  flex-direction: column;
+  animation: lg-in var(--dur-2) var(--ease);
+}
+@keyframes lg-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+[data-theme="C"] .lg-pop {
+  border: 2px solid #141412;
+  box-shadow: 4px 4px 0 #141412;
+}
+.lg-row {
+  display: grid;
+  grid-template-columns: 30px auto 1fr;
+  align-items: center;
+  column-gap: 10px;
+  height: 38px;
+  font-size: var(--fs-sub);
+}
+.lg-row + .lg-row {
+  border-top: 1px solid var(--line);
+}
+.lg-row .sw {
+  width: 30px;
+  height: 22px;
+  border-radius: 4px;
+}
+[data-theme="C"] .lg-row .sw {
+  border: 2px solid #141412;
+  border-radius: 6px;
+}
+.lg-row b {
+  font-weight: var(--w-semi);
+  color: var(--ink);
+  white-space: nowrap;
+}
+.lg-row span {
+  color: var(--ink3);
+  font-size: var(--fs-meta);
+  text-align: right;
+  white-space: nowrap;
 }
 .seg-t {
   display: flex;
@@ -328,11 +476,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 }
 
 .body {
-  position: absolute;
-  left: 24px;
-  right: 24px;
-  top: 108px;
-  bottom: 24px;
+  flex: 1;
+  min-height: 0;
+  margin-top: 12px;
   display: flex;
   gap: 24px;
 }
@@ -530,5 +676,48 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 }
 .link.small {
   font-size: var(--fs-meta);
+}
+
+/* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：方块图约 45% 高在上，列表在下 ───────── */
+@media (max-width: 1099px), (max-aspect-ratio: 1/1) {
+  .explore {
+    padding: 52px var(--gutter) 16px;
+  }
+  .body {
+    flex-direction: column;
+    gap: 14px;
+  }
+  .v-split .mapbox {
+    flex: 0 0 45%;
+    min-height: 0;
+  }
+  .list {
+    width: auto;
+    flex: 1;
+  }
+  .lh {
+    height: 48px;
+    padding-top: 4px;
+  }
+}
+/* 更窄：副栏换行，面包屑独占一行 */
+@media (max-width: 819px) {
+  .sub {
+    flex-wrap: wrap;
+    row-gap: 6px;
+    column-gap: 12px;
+  }
+  .crumb {
+    flex: 1 1 100%;
+  }
+  .tools {
+    margin-left: 0;
+    flex: 1 1 100%;
+    justify-content: space-between;
+  }
+  .lg-pop {
+    right: auto;
+    left: 0;
+  }
 }
 </style>

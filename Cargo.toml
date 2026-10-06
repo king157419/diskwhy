@@ -31,4 +31,8 @@ windows-sys = { version = "0.61", features = [
 codegen-units = 1
 lto = true
 opt-level = 3
-strip = true
+# 阶段 J 闪退取证：panic 的 backtrace / minidump 要能对上函数名和行号——只要行号表（不是完整调试信息），
+# 不剥符号，调试信息放进单独的 .pdb（MSVC 上 packed = 和 exe 同目录的 diskwhy.pdb；exe 本身几乎不变大）。
+debug = "line-tables-only"
+strip = "none"
+split-debuginfo = "packed"

@@ -1,6 +1,6 @@
 // 全局界面状态 + 动作（阶段 F：首页 / 清理 / 看看都是什么 / 确认弹层 / 隔离区 / 设置）。
 // 只调用 api.ts 里的后端命令；清理候选由后端算好（ScanSummary.candidates），这里只管勾选和预检。
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import {
   actionEnv,
   cancelScan,
@@ -34,7 +34,7 @@ import {
   type TreemapNode,
 } from "./api";
 import { cleanCat, type CleanCat } from "./labels";
-import { collapseChain } from "./treemap";
+import { collapseChain, samePath } from "./treemap";
 
 export type Phase = "idle" | "scanning" | "done";
 export type Page = "home" | "cleanup" | "explore" | "quarantine" | "settings";
@@ -297,15 +297,19 @@ export function setExploreView(v: ExploreView) {
   }
 }
 
-/** 打开一个文件夹作为方块图的根；focusPath 给了就把它当右边列表，否则挑最大的子文件夹 */
+/**
+ * 打开一个文件夹作为方块图的根；focusPath 给了就把它当右边列表（可以就是根自己）。
+ * 没给 focusPath 时：第一次进入分析页（listing 还是 null）自动挑最大的子文件夹；之后一律列根自己（阶段 J §3.9）。
+ */
 export async function openDir(path: string, focusPath?: string) {
+  const first = listing.value === null;
   try {
     tmLoading.value = true;
     const [l, t] = await Promise.all([listDir(path), getTreemap(path, 3)]);
     listing.value = l;
     tm.value = t;
     openRow.value = null;
-    const target = focusPath ?? defaultFocus(t);
+    const target = focusPath ?? (first ? defaultFocus(t) : undefined);
     await setFocus(target ?? null);
   } catch (e) {
     message.value = String(e);
@@ -314,7 +318,7 @@ export async function openDir(path: string, focusPath?: string) {
   }
 }
 
-/** 默认的右边列表：最大的子文件夹；它如果只是个“外壳”（Users 里几乎全是 king），就再往里走一层 */
+/** 第一次进入时的右边列表：最大的子文件夹；它如果只是个“外壳”（Users 里几乎全是 king），就再往里走一层 */
 function defaultFocus(t: TreemapNode): string | undefined {
   const dirs = t.children.filter((c) => c.kind === "Dir" && c.children.length > 0);
   if (!dirs.length) return undefined;
@@ -322,9 +326,10 @@ function defaultFocus(t: TreemapNode): string | undefined {
   return collapseChain(big).node.path;
 }
 
+/** 右边列表换成 path；path 为空或就是方块图的根 → 列根自己（方块图里不框任何块） */
 export async function setFocus(path: string | null) {
   openRow.value = null;
-  if (!path) {
+  if (!path || (listing.value && samePath(path, listing.value.node.path))) {
     focus.value = listing.value;
     focusKey.value = null;
     return;
@@ -344,9 +349,34 @@ export async function enterRow(n: NodeView) {
   await openDir(focus.value.node.path, n.path);
 }
 
-/** 进入方块图里的某一块（双击） */
+/** 进入方块图里的某一块（双击）：它成为方块图的根，右边列表也是它 */
 export async function enterBlock(path: string) {
-  await openDir(path);
+  await openDir(path, path);
+}
+
+/** 换盘（阶段 J §3.6）：首页盘名下拉选了另一个盘 → 扫那个盘；正在扫就先停下当前这次 */
+export async function switchDrive(root: string) {
+  if (!root) return;
+  if (phase.value === "scanning") {
+    if (samePath(root, scanRoot.value)) return;
+    await doCancel();
+    await new Promise<void>((resolve) => {
+      const stop = watch(phase, (p) => {
+        if (p !== "scanning") {
+          stop();
+          resolve();
+        }
+      });
+      if (phase.value !== "scanning") {
+        stop();
+        resolve();
+      }
+    });
+  }
+  scanRoot.value = root;
+  message.value = "";
+  page.value = "home";
+  await doScan();
 }
 
 export async function goUp() {

@@ -11,6 +11,7 @@
 //! | 用户的 桌面 / 文档 / 图片 / 视频 / 音乐 / 下载 | 根及其直接子项（`X:\Users\任何人\<名字>` + 已知文件夹的真实位置） |
 //! | `.ssh` / `.gnupg` / `.aws` | 路径里任何一段是这些名字 → 本身及里面全部 |
 //! | OneDrive 根 | `%OneDrive*%` 和 `X:\Users\任何人\OneDrive*` 本身 |
+//! | DiskWhy 自己的数据（阶段 J） | `%LOCALAPPDATA%\DiskWhy`、`%LOCALAPPDATA%\com.diskwhy.desktop`（界面的 WebView2 数据）本身及里面全部 |
 //! | `$Recycle.Bin` / `System Volume Information` / `WinSxS` | 路径里任何一段是这些名字 → 本身及里面全部 |
 //!
 //! 比较前先规范化：去掉 `\\?\`、`/` 换成 `\`、去掉每段结尾的 `.` 和空格（Windows 会自动忽略）、
@@ -137,6 +138,7 @@ impl Protector {
             "OneDrive",
             "OneDriveConsumer",
             "OneDriveCommercial",
+            "LOCALAPPDATA",
         ] {
             if let Some(v) = env(k) {
                 vars.push((k.to_string(), v));
@@ -189,6 +191,12 @@ impl Protector {
         }
         for (path, label) in known {
             add(path, format!("你的{label}文件夹（{path}）"), Depth::SelfAndChildren);
+        }
+        // 阶段 J（PHASE_J_CRASH.md 隐患 5）：DiskWhy 自己的数据——日志 / 设置 / 执行状态（%LOCALAPPDATA%\DiskWhy）
+        // 和界面的 WebView2 数据（%LOCALAPPDATA%\com.diskwhy.desktop\EBWebView，正在运行时删它的缓存会弄坏自己的界面）。
+        if let Some(v) = get("LOCALAPPDATA") {
+            add(&format!("{v}\\DiskWhy"), "DiskWhy 自己的日志和设置".into(), Depth::Tree);
+            add(&format!("{v}\\com.diskwhy.desktop"), "DiskWhy 自己的界面数据（WebView2）".into(), Depth::Tree);
         }
         for k in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
             if let Some(v) = get(k) {

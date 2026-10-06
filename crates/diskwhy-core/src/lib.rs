@@ -12,6 +12,7 @@
 #[cfg(windows)]
 pub mod action;
 pub mod attribution;
+pub mod crash;
 pub mod dedup;
 pub mod explain;
 pub mod fs;

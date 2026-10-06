@@ -1,10 +1,13 @@
 <script setup lang="ts">
-// 首页：左重右轻。左边“可放心清理”大数字 + 分类小字 + 主按钮 + 文字链接；右边 C 盘竖向容量柱。
-// 可点的只有：清理、看看都是什么、设置（标题栏）+ 底栏的主题切换。一打开就自动扫描，扫描时同一个布局显示进度。
-import { computed } from "vue";
+// 首页：左重右轻。左边“可放心清理”大数字 + 分类小字 + 主按钮 + 文字链接；右边所扫盘的竖向容量柱。
+// 可点的只有：清理、看看都是什么、设置（标题栏）+ 底栏的主题切换 + 盘名下拉（有不止一个固定盘时，阶段 J）。
+// 一打开就自动扫描 C 盘，扫描时同一个布局显示进度。窄窗口 / 竖屏（阶段 J §3.7）：大数字在上，容量柱横放在下面。
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import CapacityColumn, { type ColSeg } from "../components/CapacityColumn.vue";
 import { gbNum } from "../capacity";
-import { CLEAN_CAT_NAME } from "../labels";
+import { CLEAN_CAT_NAME, driveName } from "../labels";
+import { NARROW_QUERY, useMedia } from "../layout";
+import type { DriveInfo } from "../api";
 import { elapsedText, filesCount, scanSegs } from "../scanview";
 import { THEMES, setTheme, theme } from "../theme";
 import {
@@ -13,6 +16,7 @@ import {
   doCancel,
   doScan,
   drive,
+  drives,
   goExplore,
   message,
   page,
@@ -23,8 +27,37 @@ import {
   safeBytes,
   safeGroups,
   scanFinishedAt,
+  scanRoot,
   summary,
+  switchDrive,
 } from "../store";
+
+const narrow = useMedia(NARROW_QUERY);
+
+// ── 盘名 + 换盘下拉（只有固定盘 > 1 个时才是下拉） ──
+const curRoot = computed(() => summary.value?.root ?? scanRoot.value);
+const dname = computed(() => driveName(curRoot.value));
+const canSwitch = computed(() => drives.value.length > 1);
+const isCur = (d: DriveInfo) => curRoot.value.toUpperCase().startsWith(d.root.toUpperCase());
+const menu = ref(false);
+function pick(d: DriveInfo) {
+  menu.value = false;
+  if (!isCur(d)) void switchDrive(d.root);
+}
+function onDoc(e: Event) {
+  if (!menu.value) return;
+  if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+  if (e instanceof MouseEvent && (e.target as Element | null)?.closest?.(".drv-wrap")) return;
+  menu.value = false;
+}
+onMounted(() => {
+  document.addEventListener("mousedown", onDoc);
+  document.addEventListener("keydown", onDoc);
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("mousedown", onDoc);
+  document.removeEventListener("keydown", onDoc);
+});
 
 // 还没开始（启动那一瞬间）也按“扫描中”显示；扫描失败 / 取消（有错误提示）时显示“重新扫描”
 const scanning = computed(() => phase.value === "scanning" || (phase.value === "idle" && !summary.value && !message.value));
@@ -71,6 +104,15 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
     <div class="panel"></div>
     <section class="hero">
       <div class="hero-in">
+        <!-- C 主题插画：文件块从柱顶被弹出去 -->
+        <svg class="deco" width="230" height="104" viewBox="0 0 200 92" fill="none" stroke="#141412" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
+          <rect x="18" y="44" width="30" height="24" rx="5" fill="#FF8A76" transform="rotate(-18 33 56)" />
+          <rect x="70" y="14" width="34" height="26" rx="5" fill="#fff" transform="rotate(12 87 27)" />
+          <path d="M78 24h18M78 30h12" transform="rotate(12 87 27)" />
+          <rect x="128" y="34" width="26" height="22" rx="5" fill="#D4F24C" transform="rotate(-8 141 45)" />
+          <path d="M58 70l8-10M112 60l10-8M40 30l4-8" stroke-linecap="round" />
+          <path d="M176 18l3 7 7 3-7 3-3 7-3-7-7-3 7-3z" fill="#141412" />
+        </svg>
         <div class="eyebrow">
           <span class="dot safe"></span>
           <template v-if="scanning">正在扫描<span class="cnt num">{{ elapsedText(progress?.elapsed_ms ?? 0) }}</span></template>
@@ -79,7 +121,7 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
         <div class="big">
           <span class="n display num">{{ bigNumber }}</span><span class="u" :class="{ cjk: scanning }">{{ bigUnit }}</span>
         </div>
-        <div v-if="scanning" class="split scan-path mono">{{ progress?.current_path || "C:\\" }}</div>
+        <div v-if="scanning" class="split scan-path mono">{{ progress?.current_path || curRoot }}</div>
         <div v-else class="split">
           <span v-for="s in split" :key="s.name">{{ s.name }}<b class="num">{{ s.v }}</b></span>
         </div>
@@ -100,49 +142,74 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
           </template>
         </div>
       </div>
-      <div class="foot">
-        <template v-if="foot">
-          <span>扫描完成</span><i>/</i><span class="num">{{ foot.dur }}</span><i>/</i><span class="num">{{ foot.when }}</span>
-          <template v-if="expired"><i>/</i><button class="foot-link" @click="page = 'quarantine'">隔离区 {{ expired }} 批到期</button></template>
-        </template>
-        <span v-else-if="scanning">约需 1 分钟</span>
-        <span class="themes" role="radiogroup" aria-label="主题">
-          <button
-            v-for="t in THEMES"
-            :key="t.id"
-            class="sw"
-            :class="['sw-' + t.id, { on: theme === t.id }]"
-            role="radio"
-            :aria-checked="theme === t.id"
-            :aria-label="'主题：' + t.name"
-            :title="t.name"
-            @click="setTheme(t.id)"
-          ></button>
-        </span>
-      </div>
     </section>
 
     <section class="disk">
       <div class="disk-h">
-        <span class="lbl">C 盘</span><span class="pct">已用 <b class="num">{{ usedPct }}%</b></span>
+        <div class="drv-wrap">
+          <button
+            v-if="canSwitch"
+            class="lbl drv"
+            :class="{ open: menu }"
+            aria-haspopup="menu"
+            :aria-expanded="menu"
+            :aria-label="'换盘：' + dname"
+            @click="menu = !menu"
+          >
+            {{ dname }}<svg class="i chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+          <span v-else class="lbl">{{ dname }}</span>
+          <div v-if="menu" class="drv-menu" role="menu">
+            <button
+              v-for="d in drives"
+              :key="d.root"
+              class="drv-row"
+              :class="{ on: isCur(d) }"
+              role="menuitemradio"
+              :aria-checked="isCur(d)"
+              @click="pick(d)"
+            >
+              <b>{{ driveName(d.root) }}</b><span class="num">剩 {{ gbNum(d.free_bytes) }} GB</span>
+              <svg v-if="isCur(d)" class="i ok" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
+            </button>
+          </div>
+        </div>
+        <span class="pct">已用 <b class="num">{{ usedPct }}%</b></span>
       </div>
       <div class="disk-read">
         <span class="a num">{{ gbNum(used) }}</span><span class="b num">/ {{ gbNum(total) }} GB</span>
       </div>
       <div class="colwrap">
-        <CapacityColumn :segs="segs" :after-bytes="scanning ? undefined : free + safeBytes" :after-value="gbNum(free + safeBytes) + ' GB'" />
+        <CapacityColumn
+          :segs="segs"
+          :horizontal="narrow"
+          :after-bytes="scanning ? undefined : free + safeBytes"
+          :after-value="gbNum(free + safeBytes) + ' GB'"
+        />
       </div>
     </section>
 
-    <!-- C 主题插画：文件块从柱顶被弹出去 -->
-    <svg class="deco" width="230" height="104" viewBox="0 0 200 92" fill="none" stroke="#141412" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
-      <rect x="18" y="44" width="30" height="24" rx="5" fill="#FF8A76" transform="rotate(-18 33 56)" />
-      <rect x="70" y="14" width="34" height="26" rx="5" fill="#fff" transform="rotate(12 87 27)" />
-      <path d="M78 24h18M78 30h12" transform="rotate(12 87 27)" />
-      <rect x="128" y="34" width="26" height="22" rx="5" fill="#D4F24C" transform="rotate(-8 141 45)" />
-      <path d="M58 70l8-10M112 60l10-8M40 30l4-8" stroke-linecap="round" />
-      <path d="M176 18l3 7 7 3-7 3-3 7-3-7-7-3 7-3z" fill="#141412" />
-    </svg>
+    <div class="foot">
+      <template v-if="foot">
+        <span>扫描完成</span><i>/</i><span class="num">{{ foot.dur }}</span><i>/</i><span class="num">{{ foot.when }}</span>
+        <template v-if="expired"><i>/</i><button class="foot-link" @click="page = 'quarantine'">暂存区 {{ expired }} 批到期</button></template>
+      </template>
+      <span v-else-if="scanning">约需 1 分钟</span>
+      <span class="themes" role="radiogroup" aria-label="主题">
+        <button
+          v-for="t in THEMES"
+          :key="t.id"
+          class="sw"
+          :class="['sw-' + t.id, { on: theme === t.id }]"
+          role="radio"
+          :aria-checked="theme === t.id"
+          :aria-label="'主题：' + t.name"
+          :title="t.name"
+          @click="setTheme(t.id)"
+        ></button>
+      </span>
+    </div>
+
   </div>
 </template>
 
@@ -207,7 +274,7 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
   min-height: 21px;
 }
 .split span {
-  padding: 0 18px;
+  padding: 0 clamp(10px, 1.25vw, 18px);
   border-left: 1px solid var(--line);
 }
 .split span:first-child {
@@ -238,7 +305,6 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
 .foot {
   position: absolute;
   left: var(--gutter);
-  right: 40px;
   bottom: 30px;
   font-size: var(--fs-meta);
   color: var(--ink3);
@@ -286,7 +352,7 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
   border-color: #141412;
 }
 
-/* ── 右：C 盘容量柱 ── */
+/* ── 右：所扫盘的容量柱 ── */
 .disk {
   position: absolute;
   left: max(560px, 61.4%);
@@ -373,11 +439,12 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
   opacity: 0.5;
   background: radial-gradient(rgba(20, 20, 18, 0.18) 1px, transparent 1.3px) 0 0 / 16px 16px;
 }
+/* 插画在 hero-in 里面（窄窗口时跟着内容走）；宽窗口时位置按整页算：.home 占满视口宽，61.4% = 61.4vw */
 [data-theme="C"] .deco {
   display: block;
   position: absolute;
-  left: min(470px, calc(max(560px, 61.4%) - 414px));
-  top: 112px;
+  left: calc(min(470px, max(560px, 61.4vw) - 414px) - var(--gutter));
+  top: calc(112px - var(--hero-top));
 }
 [data-theme="C"] .eyebrow {
   font-family: var(--heading);
@@ -421,7 +488,6 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
 }
 [data-theme="C"] .foot {
   color: rgba(20, 20, 18, 0.55);
-  right: auto;
 }
 [data-theme="C"] .foot i {
   color: rgba(20, 20, 18, 0.3);
@@ -479,5 +545,268 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
   height: 700px;
   background: radial-gradient(closest-side, rgba(235, 196, 122, 0.07), transparent);
   pointer-events: none;
+}
+
+/* ── 盘名下拉（阶段 J §3.6） ── */
+.drv-wrap {
+  position: relative;
+}
+.drv {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: -8px;
+  padding: 2px 6px 2px 8px;
+  border-radius: var(--r);
+  border: var(--bw) solid transparent;
+  transition: background-color var(--dur-1) var(--ease);
+}
+.drv:hover,
+.drv.open {
+  background: var(--hover);
+}
+.drv .chev {
+  width: 16px;
+  height: 16px;
+  color: var(--ink3);
+  transition: transform var(--dur-2) var(--ease);
+}
+.drv.open .chev {
+  transform: rotate(180deg);
+}
+[data-theme="C"] .drv {
+  border-color: #141412;
+  border-radius: 999px;
+  padding: 0 8px 0 12px;
+  margin-left: 0;
+  background: #fff;
+  box-shadow: 2px 2px 0 #141412;
+}
+[data-theme="C"] .drv:hover,
+[data-theme="C"] .drv.open {
+  background: var(--accent);
+}
+[data-theme="C"] .drv .chev {
+  color: #141412;
+}
+.drv-menu {
+  position: absolute;
+  left: -8px;
+  top: calc(100% + 8px);
+  z-index: 30;
+  min-width: 196px;
+  padding: 6px;
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop);
+  display: flex;
+  flex-direction: column;
+  animation: menu-in var(--dur-2) var(--ease);
+}
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+[data-theme="C"] .drv-menu {
+  left: 0;
+  border: 2px solid #141412;
+  box-shadow: 4px 4px 0 #141412;
+}
+.drv-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 40px;
+  padding: 0 12px;
+  border-radius: var(--r);
+  font-size: var(--fs-body);
+}
+.drv-row b {
+  font-weight: var(--w-semi);
+  color: var(--ink);
+}
+.drv-row span {
+  font-size: var(--fs-meta);
+  color: var(--ink3);
+}
+.drv-row .ok {
+  margin-left: auto;
+  width: 16px;
+  height: 16px;
+  color: var(--ink2);
+}
+.drv-row:hover {
+  background: var(--hover);
+}
+[data-theme="C"] .drv-row:hover {
+  background: var(--accent);
+}
+[data-theme="C"] .drv-row b {
+  font-family: var(--heading);
+  font-weight: 700;
+}
+
+/* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：大数字在上，容量柱横放在下面，整页上下排 ───────── */
+@media (max-width: 1099px), (max-aspect-ratio: 1/1) {
+  .home {
+    --big: min(250px, 29vw, 22vh);
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    padding: calc(var(--titlebar) + 12px) var(--gutter) 22px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: thin;
+  }
+  .hero {
+    position: relative;
+    left: auto;
+    top: auto;
+    bottom: auto;
+    width: auto;
+    flex: 1 0 auto;
+    display: flex;
+    align-items: center;
+    padding: 8px 0;
+  }
+  .hero-in {
+    position: relative;
+    left: auto;
+    top: auto;
+    z-index: 1;
+    min-width: 0;
+  }
+  .big {
+    margin-top: 16px;
+  }
+  .split {
+    margin-top: 26px;
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .actions {
+    margin-top: 34px;
+    gap: 28px;
+  }
+  .disk {
+    position: relative;
+    left: auto;
+    right: auto;
+    top: auto;
+    bottom: auto;
+    flex: none;
+  }
+  .disk-read .a {
+    font-size: 60px;
+  }
+  .disk-read .b {
+    font-size: 22px;
+  }
+  .colwrap {
+    flex: none;
+    min-height: 0;
+    margin-top: 6px;
+  }
+  .foot {
+    position: relative;
+    left: auto;
+    bottom: auto;
+    flex: none;
+  }
+  .themes {
+    margin-left: auto;
+  }
+  [data-theme="C"] .panel {
+    display: none;
+  }
+  /* C：大色块就是 hero 自己 */
+  [data-theme="C"] .hero {
+    padding: 36px 40px;
+    background: var(--accent);
+    border: 2px solid #141412;
+    border-radius: 28px;
+    box-shadow: 6px 6px 0 #141412;
+    margin-right: 6px;
+  }
+  [data-theme="C"] .hero::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 26px;
+    opacity: 0.5;
+    pointer-events: none;
+    background: radial-gradient(rgba(20, 20, 18, 0.18) 1px, transparent 1.3px) 0 0 / 16px 16px;
+  }
+  [data-theme="C"] .deco {
+    left: auto;
+    right: -24px;
+    top: -34px;
+    width: 160px;
+    height: 72px;
+  }
+  [data-theme="C"] .foot {
+    color: var(--ink3);
+  }
+  [data-theme="B"] .hero::before {
+    left: -120px;
+    top: -40px;
+    width: 760px;
+    height: 520px;
+  }
+}
+/* 窄而且矮（720×640 这类）：收紧上下间距，插画让位 */
+@media (max-width: 1099px) and (max-height: 759px), (max-aspect-ratio: 1/1) and (max-height: 759px) {
+  .home {
+    gap: 18px;
+    padding-bottom: 14px;
+  }
+  .big {
+    margin-top: 10px;
+  }
+  .split {
+    margin-top: 16px;
+  }
+  .actions {
+    margin-top: 20px;
+  }
+  .disk-read .a {
+    font-size: 46px;
+  }
+  [data-theme="C"] .hero {
+    padding: 22px 32px;
+  }
+  [data-theme="C"] .deco {
+    display: none;
+  }
+  /* 盘名、读数、已用并成一行 */
+  .disk {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    column-gap: 18px;
+  }
+  .disk-h {
+    display: contents;
+  }
+  .disk-h .pct {
+    order: 3;
+  }
+  .disk-read {
+    order: 2;
+    margin-top: 0;
+  }
+  .colwrap {
+    order: 4;
+    grid-column: 1 / -1;
+    --hbar: 50px;
+  }
+  .disk-read .a {
+    font-size: 40px;
+  }
+  .disk-read .b {
+    font-size: 18px;
+  }
 }
 </style>

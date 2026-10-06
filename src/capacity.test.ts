@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { gbNum, layoutLabels, layoutSegments, sizeParts } from "./capacity";
+import { afterOffset, gbNum, layoutHorizontal, layoutLabels, layoutSegments, sizeParts } from "./capacity";
 
 const GB = 1024 ** 3;
 
@@ -95,5 +95,85 @@ describe("数字格式", () => {
     expect(sizeParts(1.55 * GB)).toEqual(["1.55", "GB"]);
     expect(sizeParts(380 * 1024 ** 2)).toEqual(["380", "MB"]);
     expect(sizeParts(27.4 * GB)).toEqual(["27.4", "GB"]);
+  });
+});
+
+describe("afterOffset（清理后剩余水位）", () => {
+  it("落在第二段中间", () => {
+    const s = layoutSegments(
+      [
+        { key: "free", bytes: 10 * GB },
+        { key: "safe", bytes: 10 * GB },
+        { key: "other", bytes: 80 * GB },
+      ],
+      102,
+      1,
+      2,
+    );
+    // free 0..10, safe 12..22 → free + 一半 safe = 17
+    expect(afterOffset(s, 15 * GB)).toBe(17);
+  });
+  it("没有或为 0 时不画", () => {
+    const s = layoutSegments([{ key: "a", bytes: GB }], 100);
+    expect(afterOffset(s, 0)).toBeNull();
+    expect(afterOffset(s, undefined)).toBeNull();
+  });
+});
+
+describe("layoutHorizontal（横放容量柱）", () => {
+  const segs = [
+    { key: "free", bytes: 14 * GB },
+    { key: "safe", bytes: 23.7 * GB },
+    { key: "review", bytes: 42.3 * GB },
+    { key: "keep", bytes: 119 * GB },
+  ];
+
+  it("段从左到右铺满宽度，互不重叠", () => {
+    const { segs: h } = layoutHorizontal(segs, 656, 116);
+    const last = h[h.length - 1];
+    expect(h[0].left).toBe(0);
+    expect(last.left + last.width).toBe(656);
+    for (let i = 1; i < h.length; i++) expect(h[i].left).toBeGreaterThanOrEqual(h[i - 1].left + h[i - 1].width);
+  });
+
+  it("标签框不重叠、整个在柱宽之内（720 宽窗口）", () => {
+    const W = 656;
+    const LW = 116;
+    const { labels } = layoutHorizontal(segs, W, LW, { space: 8 });
+    expect(labels).toHaveLength(4);
+    for (const l of labels) {
+      expect(l.left).toBeGreaterThanOrEqual(0);
+      expect(l.left + LW).toBeLessThanOrEqual(W);
+    }
+    for (let i = 1; i < labels.length; i++) expect(labels[i].left).toBeGreaterThanOrEqual(labels[i - 1].left + LW + 8);
+  });
+
+  it("很窄的剩余段：标签被挤开并画引线，顺序不变", () => {
+    const tiny = [
+      { key: "free", bytes: 0.4 * GB },
+      { key: "safe", bytes: 0.3 * GB },
+      { key: "review", bytes: 30 * GB },
+      { key: "keep", bytes: 160 * GB },
+    ];
+    const { segs: h, labels } = layoutHorizontal(tiny, 800, 116);
+    expect(h[0].width).toBeGreaterThanOrEqual(14);
+    expect(h[1].width).toBeGreaterThanOrEqual(14);
+    expect(labels.map((l) => l.key)).toEqual(["free", "safe", "review", "keep"]);
+    expect(labels[0].left).toBe(0);
+    expect(labels.some((l) => l.leader)).toBe(true);
+    for (let i = 1; i < labels.length; i++) expect(labels[i].x).toBeGreaterThan(labels[i - 1].x);
+  });
+
+  it("字节为 0 的段没有标签", () => {
+    const { labels } = layoutHorizontal(
+      [
+        { key: "free", bytes: 10 * GB },
+        { key: "safe", bytes: 0 },
+        { key: "keep", bytes: 90 * GB },
+      ],
+      600,
+      116,
+    );
+    expect(labels.map((l) => l.key)).toEqual(["free", "keep"]);
   });
 });

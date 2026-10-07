@@ -780,7 +780,11 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
     top: auto;
     bottom: auto;
     width: auto;
-    flex: 1 0 auto;
+    /* 按内容定高（不再撑满剩余高度：竖屏 864×1400 时会拉成 1200 px 的空卡片）；
+       多出来的高度由 margin-top:auto（这里和 .foot）分到上下两头：大数字 + 容量柱这一组在页中间，脚注贴底 */
+    flex: none;
+    min-height: clamp(260px, 36vh, 520px);
+    margin-top: auto;
     display: flex;
     align-items: center;
     padding: 8px 0;
@@ -828,6 +832,7 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
     left: auto;
     bottom: auto;
     flex: none;
+    margin-top: auto;
   }
   .themes {
     margin-left: auto;
@@ -868,6 +873,19 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
     top: -40px;
     width: 760px;
     height: 520px;
+  }
+}
+/* 窄、高度中等（1000×800 这类）：间距收一点，整页不出滚动条 */
+@media (max-width: 1099px) and (max-height: 879px), (max-aspect-ratio: 1/1) and (max-height: 879px) {
+  .home {
+    gap: 20px;
+    padding-bottom: 16px;
+  }
+  .actions {
+    margin-top: 26px;
+  }
+  [data-theme="C"] .hero {
+    padding: 26px 40px;
   }
 }
 /* 窄而且矮（720×640 这类）：收紧上下间距，插画让位 */

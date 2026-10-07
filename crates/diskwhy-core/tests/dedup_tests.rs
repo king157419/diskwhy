@@ -55,8 +55,8 @@ impl FsBackend for LinkFs {
     fn file_info(&self, path: &str) -> Option<FileInfo> {
         let on_disk = self.size_of(path)?;
         match self.links.get(&path.to_lowercase()) {
-            Some(&(n, k)) => Some(FileInfo { on_disk, links: n, key: Some(k) }),
-            None => Some(FileInfo { on_disk, links: 1, key: None }),
+            Some(&(n, k)) => Some(FileInfo { on_disk, links: n, key: Some(k), alloc: None }),
+            None => Some(FileInfo { on_disk, links: 1, key: None, alloc: None }),
         }
     }
     fn dir_key(&self, path: &str) -> Option<FileKey> {
@@ -65,7 +65,7 @@ impl FsBackend for LinkFs {
 }
 
 fn vol(used: u64) -> VolumeSpace {
-    VolumeSpace { total_bytes: 1 << 40, free_bytes: (1u64 << 40) - used, cluster_size: CL }
+    VolumeSpace { total_bytes: 1 << 40, free_bytes: (1u64 << 40) - used, cluster_size: CL, ntfs: false }
 }
 
 fn kid<'a>(n: &'a Node, name: &str) -> &'a Node {

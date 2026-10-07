@@ -1830,6 +1830,36 @@ fn tiny_mft_resident_files_count_as_zero_bytes() {
     assert_eq!(rep.total_bytes, 5000u64.div_ceil(cluster) * cluster, "64 字节的文件不占簇：{}", rep.total_bytes);
 }
 
+/// 扫描（首页 / 清理页的数字）和预检（确认弹层）对小文件用同一条规则：常驻 MFT 的按 0，其余按簇取整。
+/// 2026-10-07 在 D: 实测：短名字时 720 字节还常驻、750 起整簇；这里取 64 / 400 / 700（常驻）和 800 / 1000 / 5000（不常驻）。
+#[test]
+fn scan_and_preflight_agree_on_tiny_files() {
+    let t = TempTree::new("tiny2");
+    let sizes = [0usize, 64, 400, 700, 800, 1000, 5000];
+    for (i, n) in sizes.iter().enumerate() {
+        for k in 0..20 {
+            write_old(&t.p(&format!(r"cache\s{i}\f{k:02}.bin")), &content(&format!("{i}-{k}"), *n));
+        }
+    }
+    let root = t.s("");
+    let vol = volume_space(&volume_root_of(&root).unwrap()).unwrap();
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let mut plan = action::build_plan(&r, &ctx_for(&root), &prot, &[req(&t.s("cache"))], Strategy::Permanent);
+    action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    let cache = r.tree.children.iter().find(|c| c.name == "cache").expect("cache");
+    for (i, n) in sizes.iter().enumerate() {
+        let scan_bytes = cache.children.iter().find(|c| c.name == format!("s{i}")).expect("s{i}").allocated;
+        let sub = format!("\\s{i}\\");
+        let pre_bytes: u64 = plan.items[0].entries.iter().filter(|e| e.path.contains(&sub)).map(|e| e.bytes).sum();
+        assert_eq!(scan_bytes, pre_bytes, "{n} 字节 × 20：扫描 {scan_bytes} vs 预检 {pre_bytes}");
+        if vol.ntfs {
+            let expect = if *n <= 700 { 0 } else { 20 * (*n as u64).div_ceil(vol.cluster_size) * vol.cluster_size };
+            assert_eq!(scan_bytes, expect, "{n} 字节 × 20（NTFS）");
+        }
+    }
+}
+
 /// 预检时没人用、执行前才打开的浏览器缓存：执行开始时再问一次 Restart Manager，整个缓存文件夹跳过（被占用）。
 #[test]
 fn chromium_cache_opened_after_preflight_is_skipped_at_execute() {

@@ -5,7 +5,7 @@ use super::protect::Protector;
 use super::winops;
 use super::{new_id, Decision, Entry, EntryKind, Plan, PlanItem, PlanRequest, Progress, Strategy, MAX_ENTRIES_PER_ITEM};
 use crate::explain::{self, ExplainCtx, Source, Target, Tier};
-use crate::fs::{attrs, join, reparse, round_up};
+use crate::fs::{attrs, cluster_bytes, join, reparse};
 use crate::model::{NodeKind, ScanResult};
 use crate::view;
 use std::collections::HashMap;
@@ -61,7 +61,7 @@ pub fn build_plan_quick(result: &ScanResult, ctx: &ExplainCtx, protector: &Prote
             }
         }
     }
-    let mut cluster_cache: HashMap<String, u64> = HashMap::new();
+    let mut cluster_cache: HashMap<String, (u64, bool)> = HashMap::new();
     let mut items = Vec::new();
     for (i, r) in paths.iter().enumerate() {
         if !keep[i] {
@@ -101,6 +101,7 @@ fn blocked_item(path: &str, reason: String) -> PlanItem {
         dirs: Vec::new(),
         enum_errors: Vec::new(),
         cluster: 4096,
+        ntfs: false,
     }
 }
 
@@ -110,7 +111,7 @@ fn build_item(
     protector: &Protector,
     req: &PlanRequest,
     path: &str,
-    cluster_cache: &mut HashMap<String, u64>,
+    cluster_cache: &mut HashMap<String, (u64, bool)>,
 ) -> PlanItem {
     // 1. 保护路径（最先查，连解释都不用做）
     if let Some(why) = protector.check(path) {
@@ -146,6 +147,7 @@ fn build_item(
         dirs: Vec::new(),
         enum_errors: Vec::new(),
         cluster: 4096,
+        ntfs: false,
     };
     // 3. 节点本身（系统保留 / 映射 / 无权限 / 云占位 / 其余小文件）
     if let Some(why) = node_gate(node) {
@@ -163,7 +165,8 @@ fn build_item(
         return item;
     }
     let vol = crate::scan::volume_root_of(&full).unwrap_or_default();
-    item.cluster = *cluster_cache.entry(vol.clone()).or_insert_with(|| crate::win::volume_space(&vol).map(|v| v.cluster_size).unwrap_or(4096));
+    (item.cluster, item.ntfs) =
+        *cluster_cache.entry(vol.clone()).or_insert_with(|| crate::win::volume_space(&vol).map(|v| (v.cluster_size, v.ntfs)).unwrap_or((4096, false)));
     item
 }
 
@@ -173,7 +176,7 @@ fn is_cloud(a: u32, tag: u32) -> bool {
 
 /// 由目录项（FindFirstFileExW 的结果）生成一条。**这里不打开任何文件**：指纹（文件 ID / 大小 / 修改时间）
 /// 在预检里和占用探测用同一次打开取（阶段 G），云占位 / 云文件永远不打开。
-fn make_entry(path: String, a: u32, tag: u32, size: u64, mtime: i64, cluster: u64) -> Entry {
+fn make_entry(path: String, a: u32, tag: u32, size: u64, mtime: i64, cluster: u64, ntfs: bool) -> Entry {
     if is_cloud(a, tag) {
         return Entry { path, kind: EntryKind::File, attrs: a, reparse_tag: tag, size, bytes: 0, mtime, fp: None, link_is_dir: false };
     }
@@ -182,8 +185,10 @@ fn make_entry(path: String, a: u32, tag: u32, size: u64, mtime: i64, cluster: u6
     if a & attrs::REPARSE_POINT != 0 && (tag & 0x2000_0000 != 0 || a & attrs::DIRECTORY != 0) {
         return Entry { path, kind: EntryKind::Link, attrs: a, reparse_tag: tag, size, bytes: 0, mtime, fp: None, link_is_dir: a & attrs::DIRECTORY != 0 };
     }
-    // 预检取到指纹后按真实磁盘占用 / 硬链接数重算；这里先按逻辑大小取整。
-    Entry { path, kind: EntryKind::File, attrs: a, reparse_tag: tag, size, bytes: round_up(size, cluster), mtime, fp: None, link_is_dir: false }
+    // 预检取到指纹后按真实磁盘占用 / 硬链接数重算；这里先按逻辑大小估（和扫描同一条规则：常驻 MFT 的小文件按 0）。
+    let plain = a & (attrs::COMPRESSED | attrs::SPARSE_FILE | attrs::REPARSE_POINT) == 0;
+    let bytes = cluster_bytes(size, None, plain, crate::fs::name_units(&path), cluster, ntfs);
+    Entry { path, kind: EntryKind::File, attrs: a, reparse_tag: tag, size, bytes, mtime, fp: None, link_is_dir: false }
 }
 
 /// 枚举每个没被拦下的清单项在磁盘上的实际内容：文件、链接（不跟随）、云目录（不进去）、子目录。
@@ -202,10 +207,10 @@ pub fn enumerate_plan(plan: &mut Plan, prog: &Progress) {
         if item.blocked.is_some() || !item.entries.is_empty() {
             continue;
         }
-        let cluster = item.cluster;
+        let (cluster, ntfs) = (item.cluster, item.ntfs);
         if !item.is_dir {
             match winops::stat_entry(&item.path) {
-                Ok(r) => item.entries.push(make_entry(item.path.clone(), r.attrs, r.reparse_tag, r.size, r.mtime, cluster)),
+                Ok(r) => item.entries.push(make_entry(item.path.clone(), r.attrs, r.reparse_tag, r.size, r.mtime, cluster, ntfs)),
                 Err(code) => item.enum_errors.push(format!("读不到「{}」（Win32 错误 {code}）", item.path)),
             }
             continue;
@@ -257,7 +262,7 @@ pub fn enumerate_plan(plan: &mut Plan, prog: &Progress) {
                     continue;
                 }
             };
-            let cluster = item.cluster;
+            let (cluster, ntfs) = (item.cluster, item.ntfs);
             for r in list {
                 let p = join(dir, &r.name);
                 let a = r.attrs;
@@ -275,13 +280,13 @@ pub fn enumerate_plan(plan: &mut Plan, prog: &Progress) {
                             link_is_dir: true,
                         });
                     } else if a & attrs::REPARSE_POINT != 0 {
-                        item.entries.push(make_entry(p, a, r.reparse_tag, 0, r.mtime, cluster));
+                        item.entries.push(make_entry(p, a, r.reparse_tag, 0, r.mtime, cluster, ntfs));
                     } else {
                         raw_dirs[ii].push((p.clone(), depth + 1));
                         next.push((ii, p, depth + 1));
                     }
                 } else {
-                    item.entries.push(make_entry(p, a, r.reparse_tag, r.size, r.mtime, cluster));
+                    item.entries.push(make_entry(p, a, r.reparse_tag, r.size, r.mtime, cluster, ntfs));
                 }
             }
             if item.entries.len() > MAX_ENTRIES_PER_ITEM {

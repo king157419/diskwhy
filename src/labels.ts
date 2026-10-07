@@ -243,16 +243,57 @@ export function remainSecs(samples: RateSample[], costTotal: number, minElapsedM
   return Math.max(0, costTotal - b.c) / rate / 1000;
 }
 
-/** 剩余时间：null → 空；< 15 秒「快好了」；< 1 分「剩约 N 秒」；< 1 小时「剩约 N 分」；其余「剩约 N 小时 M 分」 */
-export function remainText(secs: number | null): string {
-  if (secs === null || !Number.isFinite(secs)) return "";
-  if (secs < 15) return "快好了";
-  if (secs < 60) return `剩约 ${Math.max(15, Math.round(secs / 5) * 5)} 秒`;
+/**
+ * 剩余时间（执行中进度条下面）：null（前 2 秒 / 速率不明）→ 空；≥ 1 分「剩约 N 分」（≥ 1 小时「剩约 N 小时 M 分」）；
+ * < 1 分「剩约 N 秒」（按 5 秒取整，至少 5）；只有剩不到 10 秒**而且**进度 ≥ 80% 时才说「快好了」
+ * （大文件先做完、进度还在 30% 时速率估出来的“几秒”不可信）。
+ */
+export function remainText(secs: number | null, pct = 100): string {
+  if (secs === null || !Number.isFinite(secs) || secs < 0) return "";
+  if (secs < 10 && pct >= 80) return "快好了";
+  if (secs < 60) return `剩约 ${Math.min(55, Math.max(5, Math.round(secs / 5) * 5))} 秒`;
   const min = Math.ceil(secs / 60);
   if (min < 60) return `剩约 ${min} 分`;
   const h = Math.floor(min / 60);
   const m = min % 60;
   return m ? `剩约 ${h} 小时 ${m} 分` : `剩约 ${h} 小时`;
+}
+
+/** 执行中的大数字：按估算成本加权的百分比（和进度条同一个值），向下取整，没做完不显示 100 */
+export function pctText(pct: number): string {
+  if (!Number.isFinite(pct) || pct <= 0) return "0";
+  return String(Math.min(100, Math.floor(pct)));
+}
+
+/** 个数：< 1 万「9,800」，≥ 1 万「4.1 万」，≥ 100 万「123 万」 */
+export function countText(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "0";
+  if (n < 10000) return Math.round(n).toLocaleString("zh-CN");
+  const w = n / 10000;
+  return `${w >= 100 ? Math.round(w) : (Math.floor(w * 10) / 10).toFixed(1)} 万`;
+}
+
+/** 已处理的量按总量的单位写（同一个单位，好比较）：「12.3 / 29.3 GB」「0 / 480 MB」 */
+export function bytesPair(done: number, total: number): string {
+  const [, unit] = sizeParts(Math.max(total, done));
+  const div = unit === "GB" ? 1024 ** 3 : unit === "MB" ? 1024 ** 2 : unit === "KB" ? 1024 : 1;
+  const f = (b: number) => {
+    const v = b / div;
+    if (v <= 0) return "0";
+    if (unit === "B" || v >= 100) return Math.round(v).toString();
+    return v.toFixed(v >= 1 ? 1 : 2);
+  };
+  return `${f(Math.min(done, total || done))} / ${f(total)} ${unit}`;
+}
+
+/** 执行中进度条下面的一行小字：「已处理 12.3 / 29.3 GB · 4.1 万 / 39.6 万个」（个数不明时只有字节） */
+export function processedLine(p: { bytes_done: number; total_bytes: number; done: number; total: number }): string {
+  const parts = [`已处理 ${bytesPair(p.bytes_done, p.total_bytes)}`];
+  if (p.total > 0) {
+    const t = countText(p.total);
+    parts.push(`${countText(Math.min(p.done, p.total))} / ${t}${t.endsWith("万") ? "" : " "}个`);
+  }
+  return parts.join(" · ");
 }
 
 /** 去向 → 短字（destLine 里用） */
@@ -295,12 +336,19 @@ export function skipRows(byReason: Record<string, CountBytes | number> | null | 
     .sort((a, b) => b.bytes - a.bytes || b.count - a.count);
 }
 
+/** 字节最多的原因（同字节按个数）；没有为 undefined */
+export function mainSkip(rows: SkipRow[]): SkipRow | undefined {
+  let best: SkipRow | undefined;
+  for (const r of rows) if (!best || r.bytes > best.bytes || (r.bytes === best.bytes && r.count > best.count)) best = r;
+  return best;
+}
+
 export interface SkipSummary {
   /** 跳过的条目数 + 被拦下的项数 */
   count: number;
   /** = 扫描时的估算（含被拦下的）− 真正要处理的（解释 30.1 → 29.3） */
   bytes: number;
-  /** 最主要的原因（字节最多的那一行） */
+  /** 最主要的原因（字节最多的那一行，含“已变小”） */
   main: string;
   rows: SkipRow[];
 }
@@ -339,7 +387,8 @@ export function skipSummary(r: {
   const rest = r.scan_total_bytes !== undefined ? r.scan_total_bytes - r.total_bytes - skippedBytes : 0;
   if (rest >= 1024 * 1024) rows.push({ code: "shrunk", label: SKIP_LABEL.shrunk, tip: SKIP_TIP.shrunk, count: 0, bytes: rest });
   rows.sort((a, b) => b.bytes - a.bytes || b.count - a.count);
-  const main = rows.find((x) => x.code !== "shrunk") ?? rows[0];
+  // 主要原因 = 字节最多的那一行（“已变小”也算一种原因）
+  const main = mainSkip(rows);
   return {
     count: r.total_skipped + blocked.length,
     bytes: rows.reduce((a, x) => a + x.bytes, 0),
@@ -362,7 +411,7 @@ export interface DoneRow {
   note?: string;
 }
 
-/** 完成页的小字（§3.5）：只列非零的。直接删除 / 暂存到 D 盘 / 回收站 · 还没腾出 / 没成功 / 跳过 N / 没处理 N */
+/** 完成页的小字（§3.5）：只列非零的。直接删除 / 暂存到 D 盘 / 回收站 · 还没腾出 / 没成功 / 跳过 N（主要原因按字节）/ 没处理 N */
 export function doneRows(
   r: {
     by_dest?: ByDest;
@@ -370,15 +419,24 @@ export function doneRows(
     skipped: number;
     failed: number;
     not_processed?: CountBytes;
+    skipped_by_reason?: Record<string, CountBytes>;
   },
   stashDrive?: string,
 ): DoneRow[] {
   const out: DoneRow[] = [];
   const bd = r.by_dest;
   if (bd) {
-    if (bd.permanent.count || bd.permanent.bytes) out.push({ key: "permanent", label: "直接删除", value: size(bd.permanent.bytes) });
+    // 个数放在小字里：几十万个小文件的字节数可能只有几 MB 甚至 0（存在 MFT 里），只写字节会像“什么都没做”
+    const n = (c: number) => `${countText(c)}${countText(c).endsWith("万") ? "" : " "}个`;
+    if (bd.permanent.count || bd.permanent.bytes)
+      out.push({ key: "permanent", label: "直接删除", value: size(bd.permanent.bytes), note: bd.permanent.count ? n(bd.permanent.count) : undefined });
     if (bd.quarantine.count || bd.quarantine.bytes)
-      out.push({ key: "quarantine", label: stashDrive ? `暂存到 ${stashDrive}` : "暂存", value: size(bd.quarantine.bytes) });
+      out.push({
+        key: "quarantine",
+        label: stashDrive ? `暂存到 ${stashDrive}` : "暂存",
+        value: size(bd.quarantine.bytes),
+        note: bd.quarantine.count ? n(bd.quarantine.count) : undefined,
+      });
     if (bd.recycle.count || bd.recycle.bytes) out.push({ key: "recycle", label: "回收站", value: size(bd.recycle.bytes), note: "还没腾出" });
     // 本该进回收站、却被 Windows 直接删掉的（正常不会有）
     if (bd.nuked && (bd.nuked.count || bd.nuked.bytes)) out.push({ key: "nuked", label: "回收站没收", value: size(bd.nuked.bytes), note: "找不回" });
@@ -386,7 +444,10 @@ export function doneRows(
     out.push({ key: "permanent", label: "已处理", value: size(r.ok_bytes) });
   }
   if (r.failed > 0) out.push({ key: "failed", label: "没成功", value: `${r.failed.toLocaleString("zh-CN")} 个` });
-  if (r.skipped > 0) out.push({ key: "skipped", label: "跳过", value: `${r.skipped.toLocaleString("zh-CN")} 个` });
+  if (r.skipped > 0) {
+    const main = mainSkip(skipRows(r.skipped_by_reason));
+    out.push({ key: "skipped", label: "跳过", value: `${r.skipped.toLocaleString("zh-CN")} 个`, note: main?.label });
+  }
   const np = r.not_processed;
   if (np && np.count > 0) out.push({ key: "not_processed", label: "没处理", value: `${np.count.toLocaleString("zh-CN")} 个` });
   return out;
@@ -422,4 +483,14 @@ export const KAI_MISSING = "识暂获密钥义千授准备崩溃退码";
 export function kaiSafe(s: string): boolean {
   for (const ch of s) if (KAI_MISSING.includes(ch)) return false;
   return true;
+}
+
+/** 「D:\」「d:」这样的盘根 */
+export function isDriveRoot(p: string | null | undefined): boolean {
+  return /^[A-Za-z]:\\?$/.test((p ?? "").trim());
+}
+
+/** 暂存区 dest_root → 真正放东西的文件夹：「D:\备份」→「D:\备份\DiskWhy暂存区」（批次放在它下面） */
+export function stashFolder(destRoot: string): string {
+  return destRoot.replace(/\\+$/, "") + "\\DiskWhy暂存区";
 }

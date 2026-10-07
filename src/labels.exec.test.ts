@@ -1,13 +1,20 @@
 // 阶段 J：清理执行相关的纯函数（预计时间、剩余时间、去向一行、跳过汇总、完成页小字、上次中断）
 import { describe, expect, it } from "vitest";
 import {
+  bytesPair,
+  countText,
   destLine,
   doneRows,
   driveOf,
   estText,
   interruptedCause,
   interruptedLine,
+  isDriveRoot,
+  stashFolder,
   kaiSafe,
+  mainSkip,
+  pctText,
+  processedLine,
   pushSample,
   remainSecs,
   remainText,
@@ -71,16 +78,69 @@ describe("剩余时间：5 秒滑窗速率", () => {
     // 窗口 10–15 秒：50 单位 / 5 秒 = 10/秒；剩 1880 → 188 秒
     expect(remainSecs(s, 5000)).toBeCloseTo(188);
   });
-  it("文字：快好了 / 剩约 N 秒 / 剩约 N 分 / 剩约 N 小时 M 分", () => {
+  it("文字：剩约 N 分（≥ 1 分）/ 剩约 N 秒（按 5 秒取整）/ 快好了（< 10 秒且 ≥ 80%）", () => {
     expect(remainText(null)).toBe("");
+    expect(remainText(NaN, 50)).toBe("");
     expect(remainText(3)).toBe("快好了");
-    expect(remainText(14.9)).toBe("快好了");
-    expect(remainText(15)).toBe("剩约 15 秒");
+    expect(remainText(9.9, 80)).toBe("快好了");
+    // 剩不到 10 秒，但进度还不到 80%：不说「快好了」
+    expect(remainText(3, 79)).toBe("剩约 5 秒");
+    expect(remainText(9, 37)).toBe("剩约 10 秒");
+    expect(remainText(0.4, 10)).toBe("剩约 5 秒");
+    expect(remainText(10, 95)).toBe("剩约 10 秒");
+    expect(remainText(14.9)).toBe("剩约 15 秒");
     expect(remainText(42)).toBe("剩约 40 秒");
+    expect(remainText(43)).toBe("剩约 45 秒");
+    expect(remainText(59)).toBe("剩约 55 秒");
+    expect(remainText(60)).toBe("剩约 1 分");
     expect(remainText(61)).toBe("剩约 2 分");
     expect(remainText(120)).toBe("剩约 2 分");
     expect(remainText(3600)).toBe("剩约 1 小时");
     expect(remainText(3600 + 600)).toBe("剩约 1 小时 10 分");
+  });
+  it("前 2 秒什么都不写（remainSecs 给 null → 空）", () => {
+    const s = feed([
+      [500, 5],
+      [1900, 19],
+    ]);
+    expect(remainText(remainSecs(s, 100), 19)).toBe("");
+  });
+});
+
+describe("执行中：百分比大数字 + 已处理一行", () => {
+  it("百分比向下取整，没做完不到 100", () => {
+    expect(pctText(0)).toBe("0");
+    expect(pctText(-3)).toBe("0");
+    expect(pctText(NaN)).toBe("0");
+    expect(pctText(0.4)).toBe("0");
+    expect(pctText(37.9)).toBe("37");
+    expect(pctText(99.99)).toBe("99");
+    expect(pctText(100)).toBe("100");
+    expect(pctText(130)).toBe("100");
+  });
+  it("个数：< 1 万原样带千分位，≥ 1 万写「万」", () => {
+    expect(countText(0)).toBe("0");
+    expect(countText(9800)).toBe("9,800");
+    expect(countText(10000)).toBe("1.0 万");
+    expect(countText(41234)).toBe("4.1 万");
+    expect(countText(396000)).toBe("39.6 万");
+    expect(countText(99999)).toBe("9.9 万");
+    expect(countText(1234567)).toBe("123 万");
+  });
+  it("字节按总量的单位写", () => {
+    expect(bytesPair(12.3 * GB, 29.3 * GB)).toBe("12.3 / 29.3 GB");
+    expect(bytesPair(0, 29.3 * GB)).toBe("0 / 29.3 GB");
+    expect(bytesPair(0.4 * GB, 2 * GB)).toBe("0.40 / 2.0 GB");
+    expect(bytesPair(120 * MB, 480 * MB)).toBe("120 / 480 MB");
+    expect(bytesPair(3 * MB, 4.5 * MB)).toBe("3.0 / 4.5 MB");
+    expect(bytesPair(40 * GB, 29.3 * GB)).toBe("29.3 / 29.3 GB");
+  });
+  it("一行：「已处理 12.3 / 29.3 GB · 4.1 万 / 39.6 万个」", () => {
+    expect(processedLine({ bytes_done: 12.3 * GB, total_bytes: 29.3 * GB, done: 41000, total: 396000 })).toBe("已处理 12.3 / 29.3 GB · 4.1 万 / 39.6 万个");
+    expect(processedLine({ bytes_done: 120 * MB, total_bytes: 490 * MB, done: 2460, total: 9800 })).toBe("已处理 120 / 490 MB · 2,460 / 9,800 个");
+    expect(processedLine({ bytes_done: 120 * MB, total_bytes: 490 * MB, done: 9000, total: 12000 })).toBe("已处理 120 / 490 MB · 9,000 / 1.2 万个");
+    // 个数不明（旧后端）只写字节
+    expect(processedLine({ bytes_done: GB, total_bytes: 2 * GB, done: 0, total: 0 })).toBe("已处理 1.0 / 2.0 GB");
   });
 });
 
@@ -125,6 +185,22 @@ describe("跳过汇总（解释 30.1 → 29.3）", () => {
     expect(s.rows.find((r) => r.code === "shrunk")!.bytes).toBeCloseTo(0.1 * GB, -3);
     expect(skipHeadline(s)).toBe("跳过 540 个 · 1.00 GB · 正在使用");
   });
+  it("主要原因按字节（不是按个数），「已变小」也算", () => {
+    const s = skipSummary({
+      total_skipped: 600,
+      total_bytes: 10 * GB,
+      scan_total_bytes: 12 * GB,
+      skipped_bytes: 0.5 * GB,
+      skipped_by_reason: { hot: cb(580, 0.1 * GB), locked: cb(20, 0.4 * GB) },
+      items: [],
+    });
+    // 变小了 1.5 GB，比任何一个原因都多
+    expect(s.main).toBe("已变小");
+    expect(skipHeadline(s)).toBe("跳过 600 个 · 2.00 GB · 已变小");
+    const t = skipSummary({ total_skipped: 600, total_bytes: 10 * GB, skipped_by_reason: { hot: cb(580, 0.1 * GB), locked: cb(20, 0.4 * GB) }, items: [] });
+    expect(t.main).toBe("正在使用");
+    expect(mainSkip([])).toBeUndefined();
+  });
   it("变小不到 1 MB 不单列；没有跳过时标题为空", () => {
     const s = skipSummary({ total_skipped: 0, total_bytes: 10 * GB, scan_total_bytes: 10 * GB + 0.5 * MB, skipped_bytes: 0, skipped_by_reason: {}, items: [] });
     expect(s.rows).toEqual([]);
@@ -155,14 +231,15 @@ describe("完成页小字 doneRows", () => {
         skipped: 565,
         failed: 0,
         not_processed: { count: 2624, bytes: GB },
+        skipped_by_reason: { hot: { count: 500, bytes: 0.1 * GB }, locked: { count: 65, bytes: 0.6 * GB } },
       },
       "D 盘",
     );
     expect(rows.map((r) => `${r.label} ${r.value}${r.note ? " · " + r.note : ""}`)).toEqual([
-      "直接删除 28.10 GB".replace("28.10", "28.1"),
-      "暂存到 D 盘 2.00 GB",
+      "直接删除 28.10 GB · 9 个".replace("28.10", "28.1"),
+      "暂存到 D 盘 2.00 GB · 2 个",
       "回收站 410 MB · 还没腾出",
-      "跳过 565 个",
+      "跳过 565 个 · 正在使用",
       "没处理 2,624 个",
     ]);
   });
@@ -199,6 +276,14 @@ describe("上次中断 / 盘名 / 文楷缺字", () => {
     expect(driveOf("暂存区（D:\\）")).toBe("D 盘");
     expect(driveOf("e:\\备份")).toBe("E 盘");
     expect(driveOf("回收站")).toBeUndefined();
+  });
+  it("暂存区的真实位置：盘根是默认，别的是以前选过的文件夹", () => {
+    expect(isDriveRoot("D:\\")).toBe(true);
+    expect(isDriveRoot("e:")).toBe(true);
+    expect(isDriveRoot("D:\\备份")).toBe(false);
+    expect(isDriveRoot("")).toBe(false);
+    expect(stashFolder("D:\\备份\\")).toBe("D:\\备份\\DiskWhy暂存区");
+    expect(stashFolder("D:\\")).toBe("D:\\DiskWhy暂存区");
   });
   it("文楷子集缺的字", () => {
     expect(kaiSafe("清理完成")).toBe(true);

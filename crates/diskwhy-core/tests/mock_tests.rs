@@ -117,7 +117,7 @@ fn sample_volume() -> MockFs {
 }
 
 fn volume(used: u64) -> VolumeSpace {
-    VolumeSpace { total_bytes: 1 << 40, free_bytes: (1u64 << 40) - used, cluster_size: CLUSTER }
+    VolumeSpace { total_bytes: 1 << 40, free_bytes: (1u64 << 40) - used, cluster_size: CLUSTER, ntfs: false }
 }
 
 fn find<'a>(n: &'a Node, name: &str) -> &'a Node {

@@ -223,11 +223,61 @@ export const freesByDefault = computed(() => {
 });
 
 /**
+ * 这次运行里用户在下拉里**明确**选过的去向，按源盘记（"D:\\" → 回收站 …）。下次打开弹层时，只要还能用就照它来，
+ * 不再每次都退回默认（扫 D 盘时默认是回收站，用户每次都得重新选）。不落盘：重开程序回到默认。
+ */
+type DestMemo = Pick<DestState, "mode" | "drive" | "dest">;
+const destMemo = new Map<string, DestMemo>();
+/** 某个源盘记住的去向（测试 / 调试用） */
+export function rememberedDest(src = sourceDrive()): DestMemo | null {
+  return destMemo.get(src.toUpperCase()) ?? null;
+}
+export function forgetDestChoices() {
+  destMemo.clear();
+}
+function rememberDest(mode: DestMode, arg?: string) {
+  const src = sourceDrive().toUpperCase();
+  if (!src) return;
+  // 只有可放心清理时下拉里的「直接删除」就是默认（可放心清理本来就直接删）：不记，免得下次把需你判断的也变成直接删
+  if (mode === "permanent" && !reviewNeed().has) {
+    destMemo.delete(src);
+    return;
+  }
+  destMemo.set(src, { mode, drive: mode === "stash" ? (arg ?? "") : "", dest: mode === "folder" ? (arg ?? "") : "" });
+}
+
+/** 用记住的去向（还能用时）：回收站 / 直接删除总能用；暂存区要那个盘还在、空间够、暂存区能用或能授权；文件夹交给预检去判断 */
+async function useRemembered(need: { has: boolean; bytes: number }): Promise<boolean> {
+  const m = destMemo.get(sourceDrive().toUpperCase());
+  if (!m) return false;
+  const base: DestState = { mode: m.mode, drive: "", dest: "", status: "", failMsg: "", explicit: true };
+  switch (m.mode) {
+    case "recycle":
+    case "permanent":
+      dest.value = base;
+      return true;
+    case "folder":
+      if (!m.dest) return false;
+      dest.value = { ...base, dest: m.dest, status: "ok" };
+      return true;
+    case "stash": {
+      const d = stashDrives.value.find((x) => x.root.toUpperCase() === m.drive.toUpperCase());
+      if (!d || (need.has && d.free_bytes <= need.bytes + STASH_SLACK)) return false;
+      dest.value = { ...base, drive: d.root };
+      if (!need.has) return true;
+      const st = await resolveStash(d.root);
+      return st === "ok" || st === "needs_elevation";
+    }
+  }
+}
+
+/**
  * 默认去向（§3.1）：有别的固定盘、空间够、暂存区能用或能授权 → 「D 盘暂存区」；否则 → 「回收站」。
  * 清单里没有需你判断的时不去解析（不在 D:\ 白建文件夹），去向只影响需你判断的那部分。
  */
 async function pickDefaultDest() {
   const need = reviewNeed();
+  if (await useRemembered(need)) return;
   const cands = defaultStashDrives(need.bytes);
   const recycle: DestState = { mode: "recycle", drive: "", dest: "", status: "", failMsg: "", explicit: false };
   if (!cands.length) {
@@ -270,7 +320,7 @@ export const checkProgress = ref<PreviewProgress | null>(null);
 /** 当前这次预检的序号：关掉弹层 / 换了删到哪里之后，旧的结果回来也不用 */
 let previewSeq = 0;
 
-/** 清理页「清理」：每次打开弹层都重新挑默认去向，然后预检 */
+/** 清理页「清理」：每次打开弹层都重新挑去向（这个源盘上次明确选过的优先，否则默认），然后预检 */
 export async function doPreview() {
   // 清理进行中 / 完成页还开着：不再开新的预检（后端也会拒绝）
   if (!checkedGroups.value.length || execPhase.value !== "idle") return;
@@ -340,6 +390,7 @@ export function closeReport() {
 
 /** 弹层下拉里选了去向：暂存区（某个盘）/ 回收站 / 直接删除 / 其他文件夹（已选好的路径）→ 重新预检 */
 export async function chooseDest(mode: DestMode, arg?: string) {
+  if (mode !== "folder" || arg) rememberDest(mode, arg);
   if (mode === "stash") {
     dest.value = { mode, drive: arg ?? "", dest: "", status: "pending", failMsg: "", explicit: true };
     if (report.value) report.value = { ...report.value, pending: true, est_secs: 0 };

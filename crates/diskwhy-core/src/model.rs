@@ -232,6 +232,9 @@ pub struct VolumeSpace {
     pub total_bytes: u64,
     pub free_bytes: u64,
     pub cluster_size: u64,
+    /// 文件系统是 NTFS（小文件的数据可能常驻在 MFT 文件记录里、不占簇，见 [`crate::fs::cluster_bytes`]）。
+    #[serde(default)]
+    pub ntfs: bool,
 }
 
 impl VolumeSpace {

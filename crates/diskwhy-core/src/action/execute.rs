@@ -11,7 +11,10 @@
 //!   跨卷时链接数 > 1 的文件跳过（硬链接，删了不腾空间）；每移进来一个就往 `manifest.journal` 追加一行（不缓冲），结束时整份写 `manifest.json`；
 //! - 链接：同卷暂存时把链接自身改名进暂存区；否则 `RemoveDirectoryW` / `DeleteFileW` 只删链接本身；
 //! - 所有清单项的条目切成 256 条一块，放进**同一个队列**（各项交错），`clamp(CPU 数, 4, 16)` 个线程取块；
-//!   每项有剩余块计数，做完最后一块的线程删这一项变空的子文件夹（最深的先删）并保存 manifest；
+//!   每项有剩余块计数，做完最后一块的线程删这一项变空的子文件夹（最深的先删）；manifest.json 最后整份写一次；
+//! - 进度条的总成本含收尾（子文件夹数 × rmdir_ms + 暂存条数 × manifest_ms，按加速比折算成和并行部分同一单位），
+//!   收尾时每看一个子文件夹 / 写完 manifest 都往前推，进度条和剩余时间在收尾时不停住；
+//! - 完成页的“X 盘多出”：剩余空间实测差值按该腾出的量封顶（[`honest_freed`]）；
 //! - 停止（`cancel`）：不再取新块，当前文件做完 / 中断（跨盘大文件复制会中断），剩下的原样不动，
 //!   报告 `cancelled = true`；
 //! - 进度每 ~200 ms 由计时线程发一次（按估计成本加权），每 30 秒写一条 `heartbeat` 日志并更新
@@ -173,9 +176,16 @@ pub struct ExecReport {
     /// 受影响的文件夹（清单项本身；文件项为其父目录），界面据此重扫这些子树。
     pub affected_dirs: Vec<String>,
     pub notes: Vec<String>,
-    /// 阶段 J：源盘执行前后剩余空间的实测差值之和（每个盘 ≥ 0）。
+    /// 阶段 J：源盘腾出的空间（完成页的“C 盘多出”）。每个源盘 = 执行前后剩余空间的实测差值，再按这次真正
+    /// 该腾出的量封顶（见 [`honest_freed`]：别的程序同时在写这个盘时，实测差值会差出几百 MB）。
     #[serde(default)]
     pub freed_bytes: u64,
+    /// 各源盘剩余空间实测差值之和（可以为负；没封顶的原始值，只给诊断用）。
+    #[serde(default)]
+    pub freed_measured_bytes: i64,
+    /// 这次该腾出的量：直接删除 + 回收站没收被直接删掉的 + 跨盘暂存（回收站和同盘暂存不腾出源盘空间）。
+    #[serde(default)]
+    pub freed_expected_bytes: u64,
     /// 阶段 J：按去向分别成功了多少个 / 多少字节。
     #[serde(default)]
     pub by_dest: ByDest,
@@ -257,6 +267,10 @@ struct Shared<'a> {
     total: usize,
     total_bytes: u64,
     cost_total: f64,
+    /// 收尾每看一个子文件夹记的成本（= 单线程毫秒 × 多线程加速比：收尾是单线程做的，进度条按墙钟时间匀速走）。
+    dir_cost: f64,
+    /// 收尾写 manifest.json 的成本（同上折算）。
+    manifest_cost: f64,
     /// 给 CopyFileExW 的 pbCancel（BOOL）。
     cancel_i32: AtomicI32,
     current: Mutex<String>,
@@ -299,6 +313,11 @@ impl Shared<'_> {
     fn tick(&self, ok_bytes: u64, cost_ms: f64) {
         self.done.fetch_add(1, Ordering::Relaxed);
         self.bytes_done.fetch_add(ok_bytes, Ordering::Relaxed);
+        self.add_cost(cost_ms);
+    }
+
+    /// 只推进度条（收尾：删空文件夹、写 manifest），不算处理了一个条目。
+    fn add_cost(&self, cost_ms: f64) {
         self.cost_done.fetch_add((cost_ms * 1000.0) as u64, Ordering::Relaxed);
     }
 
@@ -483,6 +502,8 @@ where
         total,
         total_bytes,
         cost_total: 0.0,
+        dir_cost: 0.0,
+        manifest_cost: 0.0,
         cancel_i32: AtomicI32::new(0),
         current: Mutex::new(String::new()),
         bins: if needs_sta { src_vols.iter().map(|v| (v.to_lowercase(), winops::RecycleBinInfo::read(v))).collect() } else { Vec::new() },
@@ -491,6 +512,23 @@ where
         units_total: units.len(),
         live_caches,
     };
+    let workers = opts.workers.clamp(1, MAX_WORKERS).min(units.len().max(1));
+    // 进度条的总成本 = 逐个文件的（单线程毫秒，多线程一起做）+ 收尾（单线程：删空文件夹 + 写 manifest.json）。
+    // 收尾的单线程毫秒乘上加速比，和并行部分换算成同一种“单位”：进度条、按速率算的剩余时间在收尾时也匀速走
+    let fin_scale = opts.perf.speedup(workers as f64);
+    let fin_dirs: usize = plan.items.iter().enumerate().filter(|(ii, _)| active(*ii)).map(|(_, it)| it.dirs.len()).sum();
+    let fin_manifest: usize = if manifest_path.is_some() {
+        plan.items
+            .iter()
+            .enumerate()
+            .filter(|(ii, it)| active(*ii) && plan.dest_for(it) == Dest::Quarantine)
+            .map(|(_, it)| it.will_delete().count())
+            .sum()
+    } else {
+        0
+    };
+    shared.dir_cost = opts.perf.rmdir_ms * fin_scale;
+    shared.manifest_cost = fin_manifest as f64 * opts.perf.manifest_ms * fin_scale;
     shared.cost_total = plan
         .items
         .iter()
@@ -498,8 +536,9 @@ where
         .filter(|(ii, _)| active(*ii))
         .flat_map(|(_, it)| it.will_delete().map(move |(e, _)| (it, e)))
         .map(|(it, e)| shared.cost(it, e))
-        .sum();
-    let workers = opts.workers.clamp(1, MAX_WORKERS).min(units.len().max(1));
+        .sum::<f64>()
+        + fin_dirs as f64 * shared.dir_cost
+        + shared.manifest_cost;
 
     // 取证：start 记录 + 状态文件
     let mut st = LogRecord::new(&batch_id, "start", &plan.id);
@@ -675,18 +714,39 @@ where
     if let Some(j) = &shared.journal {
         j.close();
     }
+    // 文件和空文件夹都做完了：先报一次进度（计时线程已经停了），再整份写 manifest.json（10 万条约 1 秒）
+    progress(&shared.snapshot(t0));
+    let t_m = Instant::now();
+    let manifest_n = shared.manifest.lock().map(|g| g.as_ref().map(|m| m.entries.len()).unwrap_or(0)).unwrap_or(0);
     let manifest_error = shared
         .save_manifest()
         .err()
         .map(|e| format!("暂存区清单保存失败：{e}。移走的文件还在批次文件夹里（另有 {} 记着），可以在暂存区里还原。", quarantine::JOURNAL));
-    let freed_bytes: u64 = src_vols
-        .iter()
-        .zip(&free_before)
-        .map(|(v, b)| match (b, crate::win::volume_space(v)) {
-            (Some(b), Ok(a)) => a.free_bytes.saturating_sub(*b),
-            _ => 0,
-        })
-        .sum();
+    if manifest_n > 0 {
+        main_meas.manifest.0 += manifest_n;
+        main_meas.manifest.1 += ms(t_m);
+    }
+    shared.add_cost(shared.manifest_cost);
+    // 每个源盘：实测差值，按这个盘上这次该腾出的量封顶
+    let mut expected_by_vol = vec![0u64; src_vols.len()];
+    for (ii, (it, r)) in plan.items.iter().zip(&items).enumerate() {
+        if !active(ii) {
+            continue;
+        }
+        let Some(v) = crate::scan::volume_root_of(&it.path) else { continue };
+        if let Some(k) = src_vols.iter().position(|x| x.eq_ignore_ascii_case(&v)) {
+            expected_by_vol[k] += expected_freed(&r.by_dest, plan.crosses_volume(&it.path));
+        }
+    }
+    let (mut freed_bytes, mut freed_measured_bytes) = (0u64, 0i64);
+    for ((v, b), exp) in src_vols.iter().zip(&free_before).zip(&expected_by_vol) {
+        if let (Some(b), Ok(a)) = (b, crate::win::volume_space(v)) {
+            let delta = a.free_bytes as i64 - *b as i64;
+            freed_measured_bytes += delta;
+            freed_bytes += honest_freed(delta, *exp);
+        }
+    }
+    let freed_expected_bytes: u64 = expected_by_vol.iter().sum();
     let mut by_dest = ByDest::default();
     let mut not_processed = CountBytes::default();
     for r in &items {
@@ -727,6 +787,8 @@ where
         items,
         notes: Vec::new(),
         freed_bytes,
+        freed_measured_bytes,
+        freed_expected_bytes,
         by_dest,
         skipped_by_reason,
         not_processed,
@@ -771,7 +833,7 @@ where
     sum.method = plan.method_label();
     sum.result = if rep.failed == 0 { "ok".into() } else { "failed".into() };
     sum.reason = format!(
-        "成功 {}，跳过 {}，失败 {}{}；直接删除 {} / 回收站 {} / 暂存 {}；实测腾出 {} 字节，用时 {} 毫秒",
+        "成功 {}，跳过 {}，失败 {}{}；直接删除 {} / 回收站 {} / 暂存 {}；腾出 {} 字节（该腾出 {}，实测差值 {}），用时 {} 毫秒",
         rep.ok,
         rep.skipped,
         rep.failed,
@@ -780,6 +842,8 @@ where
         by_dest.recycle.count,
         by_dest.quarantine.count,
         freed_bytes,
+        freed_expected_bytes,
+        freed_measured_bytes,
         wall_ms
     );
     opts.log.write(&sum);
@@ -795,9 +859,35 @@ where
         model.learn(&rep.measured, wall_ms as f64, workers);
         let _ = model.save(p);
     }
-    progress(&shared.snapshot(t0));
+    // 最后一次：做完了（没停止）就是 100%（成本按整数累加，差一点点凑不满；跳过 / 失败的也已经算过成本）
+    let mut last = shared.snapshot(t0);
+    if !cancelled {
+        last.cost_done = last.cost_total;
+    }
+    progress(&last);
     rep.log_failures = opts.log.failures.load(Ordering::Relaxed);
     Ok(rep)
+}
+
+// ───────────────────────── 腾出空间（完成页） ─────────────────────────
+
+/// 一个清单项这次该腾出源盘多少空间：直接删除 + 回收站没收被 Windows 直接删掉的 + 跨盘暂存（`cross_volume`）。
+/// 送回收站、同盘暂存只是在同一个盘上挪地方，不腾出空间。
+pub fn expected_freed(d: &ByDest, cross_volume: bool) -> u64 {
+    d.permanent.bytes + d.nuked.bytes + if cross_volume { d.quarantine.bytes } else { 0 }
+}
+
+/// 实测差值的封顶余量：该腾出量的 10% + 64 MB（NTFS 元数据、目录本身、日志文件这些预估里没算的）。
+pub const FREED_SLACK_MIN: u64 = 64 << 20;
+
+/// 完成页报的腾出空间：该腾出 0 → 0（实测差值是别的程序在写盘，不是我们腾出的）；
+/// 否则实测差值夹在 `[0, 该腾出 × 1.1 + 64 MB]` 里。
+pub fn honest_freed(measured_delta: i64, expected: u64) -> u64 {
+    if expected == 0 {
+        return 0;
+    }
+    let cap = expected.saturating_add(expected / 10).saturating_add(FREED_SLACK_MIN);
+    (measured_delta.max(0) as u64).min(cap)
 }
 
 // ───────────────────────── 整夹回收的候选 ─────────────────────────
@@ -1430,37 +1520,47 @@ fn try_recycle_dir(item: &PlanItem, dir: &str, idx: &[usize], subdirs: &[String]
     true
 }
 
-/// 清单项收尾：只删变空的子文件夹（最深的先删），清单项本身保留；保存 manifest。返回删掉的个数。
+/// 清单项收尾：只删变空的子文件夹（最深的先删），清单项本身保留。返回删掉的个数。
+/// 每看一个子文件夹推一格进度条（收尾在单线程里做，文件夹多时要好几秒）；manifest.json 最后统一写。
 fn finalize_item(item: &PlanItem, sh: &Shared, meas: &mut Measured) -> usize {
     let mut n = 0;
     for dir in &item.dirs {
-        // 只删真正的空目录：目录如果在生成清单后被换成了链接，RemoveDirectoryW 也只会删链接本身。
-        // 整夹回收掉的目录已经不在了，列不出来，直接跳过。
-        match winops::list_dir(dir) {
-            Ok(list) if list.is_empty() => {}
-            _ => continue,
-        }
-        if sh.protector.entry_blocked(dir).is_some() {
-            continue;
-        }
         let t = Instant::now();
-        let mut r = LogRecord::new(&sh.batch_id, "rmdir", dir);
-        r.item = item.path.clone();
-        r.source = item.rule_id.clone().unwrap_or_else(|| item.source_label.clone());
-        r.tier = tier_str(item.tier).into();
-        r.method = "remove_directory".into();
-        match winops::remove_dir(dir) {
-            Ok(()) => n += 1,
-            Err(c) => {
-                r.result = "failed".into();
-                r.reason = format!("删不掉空文件夹（Win32 错误 {c}）");
-            }
+        if remove_if_empty(item, dir, sh) {
+            n += 1;
         }
-        sh.opts.log.write(&r);
         meas.rmdir.0 += 1;
         meas.rmdir.1 += ms(t);
+        sh.add_cost(sh.dir_cost);
     }
     n
+}
+
+/// 子文件夹空了就删掉（只删真正的空目录：目录如果在生成清单后被换成了链接，RemoveDirectoryW 也只会删链接本身；
+/// 整夹回收掉的目录已经不在了，列不出来，直接跳过）。删掉了返回 true。
+fn remove_if_empty(item: &PlanItem, dir: &str, sh: &Shared) -> bool {
+    match winops::list_dir(dir) {
+        Ok(list) if list.is_empty() => {}
+        _ => return false,
+    }
+    if sh.protector.entry_blocked(dir).is_some() {
+        return false;
+    }
+    let mut r = LogRecord::new(&sh.batch_id, "rmdir", dir);
+    r.item = item.path.clone();
+    r.source = item.rule_id.clone().unwrap_or_else(|| item.source_label.clone());
+    r.tier = tier_str(item.tier).into();
+    r.method = "remove_directory".into();
+    let ok = match winops::remove_dir(dir) {
+        Ok(()) => true,
+        Err(c) => {
+            r.result = "failed".into();
+            r.reason = format!("删不掉空文件夹（Win32 错误 {c}）");
+            false
+        }
+    };
+    sh.opts.log.write(&r);
+    ok
 }
 
 /// 链接：同盘暂存 → 改名进暂存区（链接对象本身）；否则只删链接本身。
@@ -1518,5 +1618,42 @@ fn add_manifest(sh: &Shared, item: &PlanItem, e: &Entry, stored: Option<String>,
             }
             m.entries.push(me);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MB: u64 = 1 << 20;
+
+    #[test]
+    fn honest_freed_clamps_noisy_measurement() {
+        // 什么都没直接删、没跨盘暂存：别的程序释放的 0.18 GB 不能算成“D 盘多出”（R2 实测的那一次）
+        assert_eq!(honest_freed(180 * MB as i64, 0), 0);
+        assert_eq!(honest_freed(-50 * MB as i64, 0), 0);
+        // 实测在范围内：原样
+        assert_eq!(honest_freed(300 * MB as i64, 347 * MB), 300 * MB);
+        assert_eq!(honest_freed(366 * MB as i64, 347 * MB), 366 * MB, "多出一点（元数据）照实测");
+        // 实测比该腾出的多太多：封顶在 ×1.1 + 64 MB
+        let cap = 347 * MB + 347 * MB / 10 + 64 * MB;
+        assert_eq!(honest_freed(2000 * MB as i64, 347 * MB), cap);
+        // 小量：64 MB 的余量
+        assert_eq!(honest_freed(100 * MB as i64, 1), 1 + 64 * MB);
+        // 别的程序同时占用了空间：实测为负 → 0，不报负数
+        assert_eq!(honest_freed(-300 * MB as i64, 347 * MB), 0);
+        assert_eq!(honest_freed(i64::MAX, u64::MAX), i64::MAX as u64, "不溢出");
+    }
+
+    #[test]
+    fn expected_freed_counts_only_space_leaving_the_source() {
+        let mut d = ByDest::default();
+        d.permanent.add(100);
+        d.recycle.add(1000);
+        d.quarantine.add(10_000);
+        d.nuked.add(7);
+        assert_eq!(expected_freed(&d, false), 107, "回收站、同盘暂存不腾出空间");
+        assert_eq!(expected_freed(&d, true), 10_107, "跨盘暂存腾出源盘空间");
+        assert_eq!(expected_freed(&ByDest::default(), true), 0);
     }
 }

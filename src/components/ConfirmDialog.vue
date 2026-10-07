@@ -3,7 +3,8 @@
 // 确认：一行标题、真正要处理的总数 + 所扫盘剩余、去向一行（可放心清理 直接删 · 需你判断 暂存到 D 盘 ▾）、
 //   可收起的清单（需你判断的置顶高亮，其余按分类一行）、「跳过 N 个 · X GB · 主要原因 ›」（展开按原因带字节，
 //   解释数字为什么比首页小）、只有清单里有需你判断的项时才出现的勾选、主按钮 + 预计用时。
-// 执行中：大数字 = 已处理 GB，进度条按估计耗时（单调），下面「剩约 2 分 · 停止」；执行中关窗被拦下时「停止」闪一下。
+// 执行中：大数字 = 按估计耗时加权的百分比（和进度条同一个值，单调；大文件先做完，按 GB 算会和进度条对不上），
+//   条下一行小字「已处理 12.3 / 29.3 GB · 4.1 万 / 39.6 万个」，再下面「剩约 2 分 · 停止」；执行中关窗被拦下时「停止」闪一下。
 // 完成：大数字 = 所扫盘实测多出来的空间，下面只列非零的去向 / 跳过 / 没处理。
 // 护栏逻辑和阶段 D 一样，全部在后端：被拦下的项不会删、阻止性警告时按钮不可用、被占用的文件跳过、执行后只重扫受影响的子树。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
@@ -17,8 +18,11 @@ import {
   driveName,
   driveOf,
   estText,
+  isDriveRoot,
   isHardTag,
   loseTag,
+  pctText,
+  processedLine,
   pushSample,
   remainSecs,
   remainText,
@@ -26,6 +30,7 @@ import {
   skipHeadline,
   skipRows,
   skipSummary,
+  stashFolder,
   type CleanCat,
   type RateSample,
 } from "../labels";
@@ -163,6 +168,16 @@ const destParts = computed(() => {
 });
 /** 可放心清理这次进回收站（只有明确选了「回收站」时），否则直接删（和 currentPlanArgs 一致） */
 const safeToBin = computed(() => dest.value.mode === "recycle" && dest.value.explicit);
+/**
+ * 去向一行悬停：暂存区不在默认的「X:\DiskWhy暂存区」（盘根建不了、用的是以前选过的文件夹），
+ * 或选了「其他文件夹…」时，给出真正放到哪里
+ */
+const destTip = computed(() => {
+  const d = dest.value;
+  if (!hasReview.value || !d.dest) return undefined;
+  if (d.mode === "folder" || (d.mode === "stash" && d.status === "ok" && !isDriveRoot(d.dest))) return stashFolder(d.dest);
+  return undefined;
+});
 /** 下拉里「其他文件夹…」选中的文件夹（显示在那一行） */
 const folderShort = computed(() => (dest.value.mode === "folder" ? shortPath(dest.value.dest) : ""));
 
@@ -303,7 +318,12 @@ watch(
 );
 const remain = computed(() => {
   const p = execProg.value;
-  return p ? remainText(remainSecs(samples.value, p.cost_total)) : "";
+  return p ? remainText(remainSecs(samples.value, p.cost_total), pct.value) : "";
+});
+/** 条下一行：已处理 12.3 / 29.3 GB · 4.1 万 / 39.6 万个 */
+const doneLine = computed(() => {
+  const p = execProg.value;
+  return p && (p.total_bytes > 0 || p.total > 0) ? processedLine(p) : "";
 });
 
 // 执行中关窗被拦下：「停止」闪一下 + 一行「先停止再关」，几秒后收起
@@ -361,13 +381,13 @@ function close() {
           <button class="x" aria-label="关闭" @click="close"><svg class="i" viewBox="0 0 24 24"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
         </div>
         <div class="m-total">
-          <span class="v num" title="按清理前后剩余空间实测">{{ gbNum(res.freed_bytes ?? 0) }}<small>GB</small></span>
+          <span class="v num" title="按清理前后剩余空间实测">{{ res.freed_bytes ? gbNum(res.freed_bytes) : "0" }}<small>GB</small></span>
           <span class="after"><b>{{ dname }} 多出</b></span>
         </div>
         <div class="m-list done">
           <template v-for="r in rows" :key="r.key">
             <button v-if="r.key === 'skipped' && doneSkips.length" class="m-row" :aria-expanded="doneSkipOpen" @click="doneSkipOpen = !doneSkipOpen">
-              <span class="n">{{ r.label }}</span><span class="s num">{{ r.value }}</span>
+              <span class="n">{{ r.label }}</span><span v-if="r.note" class="c">{{ r.note }}</span><span class="s num">{{ r.value }}</span>
               <span class="chev"><svg class="i" viewBox="0 0 24 24"><path :d="doneSkipOpen ? 'm6 9 6 6 6-6' : 'm9 18 6-6-6-6'" /></svg></span>
             </button>
             <button v-else-if="r.key === 'quarantine'" class="m-row" title="去暂存区" @click="goQuarantine">
@@ -397,12 +417,12 @@ function close() {
       <template v-else-if="execPhase === 'running'">
         <div class="m-top"><h2>正在清理</h2></div>
         <div class="m-total">
-          <span class="v num">{{ gbNum(execProg?.bytes_done ?? 0) }}<small>GB</small></span>
-          <span v-if="execProg?.total_bytes" class="after num">共 <b>{{ gbNum(execProg.total_bytes) }} GB</b></span>
+          <span class="v num pct">{{ pctText(pct) }}<small>%</small></span>
         </div>
-        <div class="prog" role="progressbar" :aria-valuenow="Math.round(pct)" aria-valuemin="0" aria-valuemax="100">
+        <div class="prog" role="progressbar" :aria-valuenow="Math.floor(pct)" aria-valuemin="0" aria-valuemax="100" :aria-valuetext="pctText(pct) + '%'">
           <i :style="{ width: pct + '%' }"></i>
         </div>
+        <div class="done-line num">{{ doneLine }}</div>
         <div class="run-line">
           <template v-if="execStopping">
             <span class="spin" aria-hidden="true"></span><span class="stopping">正在停止</span>
@@ -436,7 +456,15 @@ function close() {
           <div class="m-lh">
             <span>清单</span>
             <span class="dest">
-              <button class="dline" :aria-expanded="destOpen" aria-haspopup="menu" aria-label="删到哪里" @click="destOpen = !destOpen">
+              <button
+                class="dline"
+                :class="{ tipped: destTip }"
+                :aria-expanded="destOpen"
+                aria-haspopup="menu"
+                aria-label="删到哪里"
+                :title="destOpen ? undefined : destTip"
+                @click="destOpen = !destOpen"
+              >
                 <template v-for="(p, i) in destParts" :key="p.tier">
                   <i v-if="i" class="sep">·</i>
                   <span class="dp"><span class="dot" :class="p.tier"></span>{{ p.label }} <b>{{ p.dest }}</b></span>
@@ -1167,8 +1195,35 @@ function close() {
   background: repeating-linear-gradient(-45deg, #d4f24c 0 8px, #c3e335 8px 16px);
   border-right: 2px solid #141412;
 }
+/* 条下的小字：已处理多少（字节 + 个数），等宽数字不跳 */
+.done-line {
+  margin-top: 10px;
+  height: 18px;
+  font-size: var(--fs-meta);
+  color: var(--ink3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-total .v.pct {
+  font-variant-numeric: tabular-nums;
+}
+/* 展示字体只有数字：% 用界面字体，比 GB 单位大一号，贴着数字 */
+.m-total .v.pct small {
+  margin-left: 3px;
+  font-size: 30px;
+  font-weight: var(--w-semi);
+}
+[data-theme="B"] .m-total .v.pct small {
+  color: #c99b4a;
+  font-weight: 300;
+}
+[data-theme="C"] .m-total .v.pct small {
+  color: #141412;
+}
 .run-line {
-  margin-top: 14px;
+  margin-top: 10px;
   height: 30px;
   display: flex;
   align-items: center;
@@ -1186,7 +1241,6 @@ function close() {
 .stop {
   height: 30px;
   padding: 0 14px;
-  margin-left: -4px;
   border-radius: var(--r-pill);
   border: var(--bw) solid var(--line2);
   font-family: var(--ui);
@@ -1201,6 +1255,10 @@ function close() {
 .stop:hover {
   border-color: var(--danger);
   color: var(--danger);
+}
+/* 「剩约 2 分 · 停止」：点后面的按钮收紧一点；前 2 秒没有剩余时间时按钮和上面的字左对齐 */
+.run-line .sep + .stop {
+  margin-left: -4px;
 }
 [data-theme="C"] .stop {
   background: #fff;

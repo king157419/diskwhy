@@ -32,7 +32,16 @@ onMounted(() => {
   ro = new ResizeObserver(measure);
   ro.observe(col.value);
 });
-watch(() => props.horizontal, () => requestAnimationFrame(measure));
+// 竖放 ↔ 横放是 v-if / v-else 两个不同的 .col：换了元素就要重新观察，否则之后改窗口大小量不到新柱子
+watch(
+  () => props.horizontal,
+  () =>
+    requestAnimationFrame(() => {
+      ro?.disconnect();
+      if (col.value) ro?.observe(col.value);
+      measure();
+    }),
+);
 onBeforeUnmount(() => ro?.disconnect());
 
 const SEP = 2;

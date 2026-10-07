@@ -273,6 +273,9 @@ pub struct PlanItem {
     /// 所在卷的簇大小（预检取到指纹后按它把磁盘占用取整）。
     #[serde(default = "default_cluster")]
     pub cluster: u64,
+    /// 所在卷是 NTFS（常驻 MFT 的小文件删了不腾空间，见 [`crate::fs::cluster_bytes`]）。
+    #[serde(default)]
+    pub ntfs: bool,
 }
 
 fn default_cluster() -> u64 {

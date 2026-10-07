@@ -358,7 +358,7 @@ pub fn preflight_with(plan: &mut Plan, protector: &Protector, opts: &PreflightOp
                     for &(ii, ei) in &work[b * BLOCK..((b + 1) * BLOCK).min(work.len())] {
                         let item = &items[ii];
                         let e = &item.entries[ei];
-                        let r = decide(e, protector, cache, opts, item.cluster);
+                        let r = decide(e, protector, cache, opts, item.cluster, item.ntfs);
                         if matches!(r.0, Decision::Skip { reason: SkipReason::Locked { .. } }) {
                             prog.locked.fetch_add(1, Relaxed);
                             let _ = tx.send(RmMsg::Locked(ii, ei, e.path.clone()));
@@ -642,7 +642,7 @@ fn rm_coordinator(rx: std::sync::mpsc::Receiver<RmMsg>, opts: &PreflightOptions,
 }
 
 /// 一条的决定 + 预检时取到的指纹 + 能腾出的字节。判断顺序同阶段 D：保护路径 → 云 → 链接 → 读不到 → 热文件 → 占用。
-fn decide(e: &super::Entry, protector: &Protector, cache: &ParentCache, opts: &PreflightOptions, cluster: u64) -> (Decision, Option<Fingerprint>, u64) {
+fn decide(e: &super::Entry, protector: &Protector, cache: &ParentCache, opts: &PreflightOptions, cluster: u64, ntfs: bool) -> (Decision, Option<Fingerprint>, u64) {
     // 护栏 2（条目级）：文件夹里面的 .ssh 之类
     if let Some(why) = protector.entry_blocked_cached(&e.path, cache) {
         return (Decision::Skip { reason: SkipReason::Protected { why } }, None, e.bytes);
@@ -669,10 +669,14 @@ fn decide(e: &super::Entry, protector: &Protector, cache: &ParentCache, opts: &P
         Err(2) | Err(3) => return (Decision::Skip { reason: SkipReason::Missing }, None, e.bytes),
         Err(c) => return (Decision::Skip { reason: SkipReason::Unreadable { code: c } }, None, e.bytes),
     };
-    // 能腾出的字节：硬链接 0（别的名字还指着数据）；数据放在 MFT 文件记录里的小文件（真实分配 < 1 簇）也是 0——
-    // 删掉它不释放任何簇；其余按簇取整
-    let resident = fp.alloc > 0 && fp.alloc < cluster;
-    let bytes = if fp.links > 1 || resident { 0 } else { crate::fs::round_up(fp.on_disk, cluster) };
+    // 能腾出的字节：硬链接 0（别的名字还指着数据）；NTFS 上数据放在 MFT 文件记录里的小文件（真实分配 < 1 簇）也是 0——
+    // 删掉它不释放任何簇；其余按簇取整。和扫描同一条规则（crate::fs::cluster_bytes）
+    let plain = fp.attrs & (crate::fs::attrs::COMPRESSED | crate::fs::attrs::SPARSE_FILE | crate::fs::attrs::REPARSE_POINT) == 0;
+    let bytes = if fp.links > 1 {
+        0
+    } else {
+        crate::fs::cluster_bytes(fp.on_disk, (fp.alloc > 0).then_some(fp.alloc), plain, crate::fs::name_units(&e.path), cluster, ntfs)
+    };
     // 护栏 4：热文件（按刚取到的指纹里的修改时间）
     let age = opts.now - winops::ft_to_unix(fp.mtime_ft);
     if age < opts.hot_window_secs {
@@ -734,8 +738,13 @@ pub fn workload(plan: &Plan) -> Workload {
     let mut w = Workload::default();
     for it in plan.items.iter().filter(|i| i.blocked.is_none()) {
         let mut any = false;
+        let to_q = plan.dest_for(it) == Dest::Quarantine;
         for (e, _) in it.will_delete() {
             any = true;
+            // 进暂存区的（含跨盘时直接删掉、但也记一笔的链接）收尾都要写进 manifest.json
+            if to_q {
+                w.manifest += 1;
+            }
             if e.kind == EntryKind::Link {
                 match plan.entry_dest(it, e) {
                     Dest::Quarantine => w.rename += 1,

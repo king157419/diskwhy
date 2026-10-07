@@ -488,6 +488,13 @@ function gb(v: number) {
   background: #2e2823;
   color: var(--ink3);
 }
+/* 「认不出来」和「先别动」在 A / B 里只差一点明度，看不出来：和 C 一样给细斜条纹（只给 ≥ 24px 的块和图例色块） */
+[data-theme="A"] .tm-tone.mix:not(.solid) {
+  background: repeating-linear-gradient(135deg, #e2ddd3 0 5px, #cdc6b9 5px 7px);
+}
+[data-theme="B"] .tm-tone.mix:not(.solid) {
+  background: repeating-linear-gradient(135deg, #2a241f 0 5px, #4a4037 5px 7px);
+}
 [data-theme="B"] .tm-tone.na {
   color: var(--ink3);
   background:

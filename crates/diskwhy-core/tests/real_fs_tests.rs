@@ -99,9 +99,11 @@ fn real_sizes_and_cluster_rounding() {
         assert_eq!(r.tree.logical, 5000 + 1 + 100_000 + 4096 * 3);
         let a = child(&r.tree, "a");
         assert_eq!(child(a, "f1.bin").allocated, round_up(5000, cl));
-        assert_eq!(child(a, "tiny.txt").allocated, cl, "1 字节文件按簇取整为 1 簇");
+        // 1 字节的文件：NTFS 上数据常驻在 MFT 记录里、不占簇（阶段 J）；别的文件系统按簇取整为 1 簇
+        let tiny = if vol.ntfs { 0 } else { cl };
+        assert_eq!(child(a, "tiny.txt").allocated, tiny, "1 字节文件（ntfs = {}）", vol.ntfs);
         assert_eq!(child(child(a, "b"), "f3.bin").allocated, round_up(100_000, cl));
-        assert_eq!(a.allocated, round_up(5000, cl) + cl + round_up(100_000, cl));
+        assert_eq!(a.allocated, round_up(5000, cl) + tiny + round_up(100_000, cl));
         assert_eq!(r.tree.allocated, a.allocated + round_up(4096 * 3, cl));
         assert_eq!(child(&r.tree, "empty").allocated, 0);
         // 非卷根：差额全部算“扫描范围外”

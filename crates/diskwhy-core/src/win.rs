@@ -3,7 +3,7 @@
 //! 所有 API 签名按 learn.microsoft.com 与 docs.rs windows-sys 0.61 核对过。
 //! 路径一律加 `\\?\` 前缀以绕过 MAX_PATH。
 
-use crate::fs::{filetime_to_unix, FileInfo, FileKey, FsBackend, RawEntry};
+use crate::fs::{filetime_to_unix, FileInfo, ALLOC_QUERY_MAX, FileKey, FsBackend, RawEntry};
 use crate::model::VolumeSpace;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
@@ -16,11 +16,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileCompressionInfo, FileIdInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+    CreateFileW, FileCompressionInfo, FileIdInfo, FileStandardInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
     FindFirstFileExW, FindNextFileW, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW,
     GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx, GetLogicalDrives,
     GetVolumeInformationW, BY_HANDLE_FILE_INFORMATION, FILE_COMPRESSION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_STANDARD_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FIND_FIRST_EX_LARGE_FETCH, OPEN_EXISTING, WIN32_FIND_DATAW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -138,7 +138,7 @@ impl FsBackend for Win32Fs {
                 null_mut(),
             );
             if h == INVALID_HANDLE_VALUE {
-                return self.compressed_size(path).map(|on_disk| FileInfo { on_disk, links: 1, key: None });
+                return self.compressed_size(path).map(|on_disk| FileInfo { on_disk, links: 1, key: None, alloc: None });
             }
             let mut bh: BY_HANDLE_FILE_INFORMATION = zeroed();
             let have_bh = GetFileInformationByHandle(h, &mut bh) != 0;
@@ -159,10 +159,20 @@ impl FsBackend for Win32Fs {
             };
             let links = if have_bh { bh.nNumberOfLinks.max(1) } else { 1 };
             let key = if links > 1 { file_key(h, have_bh.then_some(&bh)) } else { None };
+            // 小的普通文件：再问一次真实分配大小（常驻 MFT 的不占簇，见 crate::fs::cluster_bytes；和预检的指纹同一口径）
+            let size = ((bh.nFileSizeHigh as u64) << 32) | bh.nFileSizeLow as u64;
+            let special = bh.dwFileAttributes & (crate::fs::attrs::COMPRESSED | crate::fs::attrs::SPARSE_FILE | crate::fs::attrs::REPARSE_POINT) != 0;
+            let mut alloc = None;
+            if have_bh && !special && size > 0 && size < ALLOC_QUERY_MAX {
+                let mut si: FILE_STANDARD_INFO = zeroed();
+                if GetFileInformationByHandleEx(h, FileStandardInfo, &mut si as *mut FILE_STANDARD_INFO as *mut c_void, size_of::<FILE_STANDARD_INFO>() as u32) != 0 {
+                    alloc = Some(si.AllocationSize.max(0) as u64);
+                }
+            }
             CloseHandle(h);
             match on_disk {
-                Some(on_disk) => Some(FileInfo { on_disk, links, key }),
-                None => self.compressed_size(path).map(|on_disk| FileInfo { on_disk, links: 1, key: None }),
+                Some(on_disk) => Some(FileInfo { on_disk, links, key, alloc }),
+                None => self.compressed_size(path).map(|on_disk| FileInfo { on_disk, links: 1, key: None, alloc: None }),
             }
         }
     }
@@ -247,7 +257,20 @@ pub fn volume_space(root: &str) -> Result<VolumeSpace, String> {
             total_bytes: total,
             free_bytes: free,
             cluster_size: spc as u64 * bps as u64,
+            ntfs: volume_fs_name(root).eq_ignore_ascii_case("NTFS"),
         })
+    }
+}
+
+/// 卷的文件系统名（GetVolumeInformationW，"NTFS" / "ReFS" / "FAT32" / …）；取不到为空。
+pub fn volume_fs_name(root: &str) -> String {
+    let w = wide(root);
+    let mut fs = [0u16; 64];
+    let ok = unsafe { GetVolumeInformationW(w.as_ptr(), null_mut(), 0, null_mut(), null_mut(), null_mut(), fs.as_mut_ptr(), fs.len() as u32) };
+    if ok != 0 {
+        from_wide_nul(&fs)
+    } else {
+        String::new()
     }
 }
 

@@ -9,7 +9,7 @@
 
 use crate::attribution::{compute_attribution, Measured};
 use crate::dedup::{self, Occurrence};
-use crate::fs::{attrs, errors, join, reparse, round_up, FileKey, FsBackend, RawEntry};
+use crate::fs::{attrs, errors, join, reparse, cluster_bytes, FileKey, FsBackend, RawEntry};
 use crate::model::*;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -76,6 +76,8 @@ struct Ctx<'a, B: FsBackend> {
     fs: &'a B,
     opts: &'a ScanOptions,
     cluster: u64,
+    /// 卷是 NTFS（常驻 MFT 的小文件按 0 计）。
+    ntfs: bool,
     cancel: &'a AtomicBool,
     root_is_volume: bool,
     // 进度
@@ -127,18 +129,21 @@ impl<'a, B: FsBackend> Ctx<'a, B> {
             SizeMode::Exact => true,
             SizeMode::Fast => special || (self.opts.dedup && dense),
         };
+        // 簇取整 + NTFS 常驻小文件按 0（和预检同一条规则，见 crate::fs::cluster_bytes）
+        let name = e.name.encode_utf16().count();
+        let cb = |on_disk: u64, alloc: Option<u64>| cluster_bytes(on_disk, alloc, !special, name, self.cluster, self.ntfs);
         if need_query {
             if self.opts.dedup {
                 if let Some(fi) = self.fs.file_info(path) {
                     let key = if fi.links > 1 { fi.key } else { None };
-                    return (round_up(fi.on_disk, self.cluster), key);
+                    return (cb(fi.on_disk, fi.alloc), key);
                 }
             } else if let Some(v) = self.fs.compressed_size(path) {
-                return (round_up(v, self.cluster), None);
+                return (cb(v, None), None);
             }
         }
         // 取不到时退回逻辑大小（同样按簇取整，与卷上的实际分配粒度一致）。
-        (round_up(e.size, self.cluster), None)
+        (cb(e.size, None), None)
     }
 
     fn record_inaccessible(&self, path: &str, code: u32, sys: bool) {
@@ -397,6 +402,7 @@ where
         fs,
         opts,
         cluster: volume.cluster_size,
+        ntfs: volume.ntfs,
         cancel,
         root_is_volume: is_volume_root(&root),
         files: AtomicU64::new(0),

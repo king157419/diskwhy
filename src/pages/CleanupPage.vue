@@ -13,6 +13,7 @@ import {
   candidates,
   checked,
   checkedBytes,
+  freesByDefault,
   checkedGroups,
   doPreview,
   groupCat,
@@ -88,7 +89,7 @@ function loc(g: CandidateGroup): { text: string; mono: boolean } {
 
 function manualLabel(g: CandidateGroup): string {
   if (g.how.includes("builtin_tool")) return "用自带工具";
-  if (g.how.includes("migrate") && !g.how.includes("manual")) return "搬到 D 盘";
+  if (g.how.includes("migrate") && !g.how.includes("manual")) return "搬到别的盘";
   return "要手动删";
 }
 
@@ -213,7 +214,7 @@ const totalChecked = computed(() => checkedGroups.value.length);
       <div class="big"><span class="k">能腾出</span><span class="v num">{{ gbNum(checkedBytes) }}<small>GB</small></span></div>
       <div class="sep"></div>
       <div class="free">
-        <span class="k">{{ dname }}剩余</span><span class="fv"><b class="num">{{ gbNum(free) }}</b><span class="arr">→</span><b class="num">{{ gbNum(free + checkedBytes) }} GB</b></span>
+        <span class="k">{{ dname }}剩余</span><span class="fv" title="按默认去向估算，回收站不腾空间"><b class="num">{{ gbNum(free) }}</b><span class="arr">→</span><b class="num">{{ gbNum(free + freesByDefault) }} GB</b></span>
       </div>
       <button class="btn" :disabled="!totalChecked || previewBusy" @click="doPreview()">
         <template v-if="previewBusy">正在检查 <span class="num">{{ elapsed }} 秒</span></template>

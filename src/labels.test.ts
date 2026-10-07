@@ -99,8 +99,8 @@ describe("具体后果标签和建议（阶段 H）", () => {
     expect(advice("review", ["manual"]).head).toBe("自己打开看看，手动删");
     expect(advice("review", ["builtin_tool"], "", "windows-system").head).toBe("别直接删，用 Windows 自带工具清");
     expect(advice("review", ["builtin_tool"], "", "cn-apps").head).toBe("别直接删，用软件自带的清理");
-    expect(advice("review", ["migrate"]).head).toBe("别删，搬到 D 盘更好");
-    expect(advice("keep", ["migrate"]).head).toBe("别删，搬到 D 盘更好");
+    expect(advice("review", ["migrate"]).head).toBe("别删，搬到别的盘更好");
+    expect(advice("keep", ["migrate"]).head).toBe("别删，搬到别的盘更好");
     expect(advice("review", ["none"]).head).toBe("别动");
     expect(advice("keep", ["none"]).head).toBe("别动");
     expect(advice("safe", ["delete"], "  关掉 Chrome 后删  ").detail).toBe("关掉 Chrome 后删");

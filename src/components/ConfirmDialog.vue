@@ -1,29 +1,97 @@
 <script setup lang="ts">
-// 确认弹层（阶段 F）：一行标题、一个总数 + C 盘剩余、可收起的清单（需你判断的置顶高亮，其余按分类一行）、
-// 「跳过 N 项 · 正在使用 ›」、只有清单里有需你判断的项时才出现的勾选、一个主按钮。
-// 清单数据全部来自后端预检（按磁盘上的真实内容重新枚举），护栏逻辑和阶段 D 一样：
-// 被拦下的项不会删、阻止性警告时按钮不可用、被占用的文件跳过、执行后只重扫受影响的子树。
-// 阶段 G：点「清理」后弹层立刻出现（report.pending = true，数字是扫描时的大小），逐个文件的检查在后台进行，
-// 「跳过」一行先显示检查进度、主按钮显示“正在检查”且不可用；检查完换成完整报告（同一个 plan_id，勾选状态保留）。
-import { computed, ref } from "vue";
-import { executePlan, pickFolder, type ExecOutcome, type ExecProgress, type ItemReport, type LoseKind, type PreflightReport } from "../api";
+// 确认弹层（阶段 F → J）：确认 → 执行中 → 完成 / 已停止，三个状态都在这一个弹层里。
+// 确认：一行标题、真正要处理的总数 + 所扫盘剩余、去向一行（可放心清理 直接删 · 需你判断 暂存到 D 盘 ▾）、
+//   可收起的清单（需你判断的置顶高亮，其余按分类一行）、「跳过 N 个 · X GB · 主要原因 ›」（展开按原因带字节，
+//   解释数字为什么比首页小）、只有清单里有需你判断的项时才出现的勾选、主按钮 + 预计用时。
+// 执行中：大数字 = 已处理 GB，进度条按估计耗时（单调），下面「剩约 2 分 · 停止」；执行中关窗被拦下时「停止」闪一下。
+// 完成：大数字 = 所扫盘实测多出来的空间，下面只列非零的去向 / 跳过 / 没处理。
+// 护栏逻辑和阶段 D 一样，全部在后端：被拦下的项不会删、阻止性警告时按钮不可用、被占用的文件跳过、执行后只重扫受影响的子树。
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { pickFolder, type ItemReport, type LoseKind, type PreflightReport } from "../api";
 import { gbNum, sizeParts } from "../capacity";
-import { checkLine, CLEAN_CAT_NAME, isHardTag, loseTag, shortPath, type CleanCat } from "../labels";
-import { candidates, checkProgress, groupCat, onExecuted, page, report as reportRef, requote, summary } from "../store";
+import {
+  checkLine,
+  CLEAN_CAT_NAME,
+  destLine,
+  doneRows,
+  driveName,
+  driveOf,
+  estText,
+  isHardTag,
+  loseTag,
+  pushSample,
+  remainSecs,
+  remainText,
+  shortPath,
+  skipHeadline,
+  skipRows,
+  skipSummary,
+  type CleanCat,
+  type RateSample,
+} from "../labels";
+import {
+  authorizeStash,
+  candidates,
+  checkProgress,
+  chooseDest,
+  closeBlockedAt,
+  closeReport,
+  dest,
+  elevating,
+  execError,
+  execPhase,
+  execProg,
+  execResult,
+  execStopping,
+  finishExec,
+  groupCat,
+  page,
+  runExec,
+  scanRoot,
+  stashDrives,
+  stopExec,
+  summary,
+} from "../store";
 
-const props = defineProps<{ report: PreflightReport }>();
-const emit = defineEmits<{ close: [] }>();
+const props = defineProps<{ report: PreflightReport | null }>();
 
-type Phase = "preview" | "running" | "done";
-const phase = ref<Phase>("preview");
-const progress = ref<ExecProgress | null>(null);
-const outcome = ref<ExecOutcome | null>(null);
-const error = ref("");
 const ack = ref(false);
 const listOpen = ref(true);
 const skipOpen = ref(false);
+const doneSkipOpen = ref(false);
 const openCat = ref<string | null>(null);
 const destOpen = ref(false);
+
+const size = (b: number) => sizeParts(b).join(" ");
+const n = (x: number) => x.toLocaleString("zh-CN");
+/** 所扫的盘：「C 盘」 */
+const dname = computed(() => driveName(summary.value?.root ?? scanRoot.value));
+
+// ───────────────────────── 确认 ─────────────────────────
+const rep = computed(() => props.report);
+/** 预览数据还没回来（换了去向）时给模板一个空壳，避免到处判空 */
+const R = computed<PreflightReport>(
+  () =>
+    rep.value ?? {
+      plan_id: "",
+      strategy: { kind: "recycle_bin" },
+      items: [],
+      total_entries: 0,
+      total_bytes: 0,
+      total_skipped: 0,
+      warnings: [],
+      locked_processes: [],
+      locked_count: 0,
+      hot_count: 0,
+      cloud_count: 0,
+      link_count: 0,
+      review_items: [],
+      can_execute: false,
+      quarantine_choices: [],
+      pending: true,
+      timing_ms: {},
+    },
+);
 
 /** 预检项 → 清理页里的那一组（拿名字、分类、后果类型） */
 const groupOf = (p: string) => {
@@ -31,11 +99,11 @@ const groupOf = (p: string) => {
   return candidates.value.find((g) => g.paths.some((x) => x.path.toLowerCase() === k)) ?? null;
 };
 
-const pending = computed(() => props.report.pending === true);
-const live = computed(() => props.report.items.filter((i) => !i.blocked && (pending.value ? i.will_delete_bytes > 0 : i.will_delete_count > 0)));
+const pending = computed(() => R.value.pending === true);
+const live = computed(() => R.value.items.filter((i) => !i.blocked && (pending.value ? i.will_delete_bytes > 0 : i.will_delete_count > 0)));
 /** 检查进度一行：列文件 → 逐个检查 → 问是哪些程序在占用 */
 const check = computed(() => checkLine(checkProgress.value));
-const blocked = computed(() => props.report.items.filter((i) => i.blocked));
+const blocked = computed(() => R.value.items.filter((i) => i.blocked));
 
 /** 需你判断的项：按候选组合并（一组可能有好几个位置） */
 const reviewRows = computed(() => {
@@ -69,138 +137,285 @@ const safeCats = computed(() => {
 
 const itemCount = computed(() => reviewRows.value.length + safeCats.value.reduce((a, c) => a + c.items.length, 0));
 const hasReview = computed(() => reviewRows.value.length > 0);
-const blocking = computed(() => props.report.warnings.filter((w) => w.blocking));
-/** 其余不阻止执行、又没在“跳过”一行里说到的提示（隔离区和要清理的在同一个盘、有几项合并了等），原文照列 */
-const notes = computed(() =>
-  props.report.warnings.filter((w) => !w.blocking && !["locked", "hot", "cloud", "recycle_low_space"].includes(w.code)),
-);
-const lowSpace = computed(() => props.report.warnings.find((w) => w.code === "recycle_low_space") ?? null);
-const isRecycle = computed(() => props.report.strategy.kind === "recycle_bin");
-const destLabel = computed(() => {
-  const s = props.report.strategy;
-  return s.kind === "recycle_bin" ? "回收站" : `隔离到 ${s.dest_root}`;
-});
-const otherDrives = computed(() => props.report.quarantine_choices);
 
-const skipCount = computed(() => props.report.total_skipped + blocked.value.length);
-const skipReason = computed(() => {
-  const r = props.report;
-  if (r.locked_count > 0) return "正在使用";
-  if (r.hot_count > 0) return "刚改过";
-  if (r.cloud_count > 0) return "云端文件";
-  if (blocked.value.length) return "被拦下";
-  return "读不到";
+// ── 去向（§3.1）──
+const isStash = computed(() => dest.value.mode === "stash");
+/** 暂存区还不能用（要授权 / 建不了 / 正在准备），而且确实有东西要去暂存区 */
+const stashBlocked = computed(() => isStash.value && dest.value.status !== "ok" && dest.value.status !== "" && hasReview.value);
+const stashDriveName = computed(() => {
+  const d = dest.value;
+  if (d.mode === "stash") return driveName(d.drive || d.dest);
+  if (d.mode === "folder") return driveName(d.dest);
+  return undefined;
 });
-const REASON: Record<string, string> = {
-  hot: "刚改过",
-  cloud: "云端文件",
-  locked: "正在使用",
-  no_permission: "没权限",
-  protected: "受保护",
-  changed: "被改过",
-  missing: "已不在",
-  unreadable: "读不到",
-};
-function skipText(it: ItemReport): string {
-  return Object.entries(it.skipped_by_reason)
-    .map(([k, n]) => `${REASON[k] ?? k} ${n}`)
-    .join(" · ");
+const destParts = computed(() => {
+  const d = dest.value;
+  const reviewDest = d.mode === "permanent" ? "permanent" : d.mode === "recycle" ? "recycle" : "quarantine";
+  // 可放心清理一律直接删；只有明确选了「回收站」时也进回收站（和 currentPlanArgs 的 safeDirect 一致）
+  const safeDirect = !(d.mode === "recycle" && d.explicit);
+  return destLine({
+    safe: safeCats.value.length > 0,
+    review: hasReview.value,
+    safeDest: safeDirect ? "permanent" : "recycle",
+    reviewDest,
+    drive: stashDriveName.value,
+  });
+});
+/** 可放心清理这次进回收站（只有明确选了「回收站」时），否则直接删（和 currentPlanArgs 一致） */
+const safeToBin = computed(() => dest.value.mode === "recycle" && dest.value.explicit);
+/** 下拉里「其他文件夹…」选中的文件夹（显示在那一行） */
+const folderShort = computed(() => (dest.value.mode === "folder" ? shortPath(dest.value.dest) : ""));
+
+// 换了去向就要重新勾“我知道后果”（直接删除和暂存的后果不一样）
+watch(
+  () => dest.value.mode + dest.value.drive + dest.value.dest,
+  () => (ack.value = false),
+);
+
+async function pick(mode: "stash" | "recycle" | "permanent", root?: string) {
+  destOpen.value = false;
+  await chooseDest(mode, root);
 }
+/** 盘根常常写不进去：让用户挑一个别的盘上的文件夹 */
+async function pickDest() {
+  destOpen.value = false;
+  try {
+    const p = await pickFolder("暂存到哪个文件夹");
+    if (p) await chooseDest("folder", p);
+  } catch (e) {
+    execError.value = String(e);
+  }
+}
+function onDoc(e: Event) {
+  if (e instanceof KeyboardEvent && e.key === "Escape" && !destOpen.value) {
+    close(); // Esc 关弹层（清理中 close 自己会忽略）
+    return;
+  }
+  if (!destOpen.value) return;
+  if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+  if (e instanceof MouseEvent && (e.target as Element | null)?.closest?.(".dest")) return;
+  destOpen.value = false;
+}
+// 打开时把键盘焦点放进弹层（页面和标题栏左边在弹层开着时是 inert 的，Tab 不会跑到后面去）
+const modalEl = ref<HTMLElement | null>(null);
+onMounted(() => void nextTick(() => modalEl.value?.focus({ preventScroll: true })));
+document.addEventListener("mousedown", onDoc);
+document.addEventListener("keydown", onDoc);
+onBeforeUnmount(() => {
+  document.removeEventListener("mousedown", onDoc);
+  document.removeEventListener("keydown", onDoc);
+});
+
+// ── 提示 / 警告 ──
+/** 暂存区要授权 / 建不了时，后端那条“建不了暂存区文件夹”的长警告由「授权」/「选文件夹…」一行代替 */
+const blocking = computed(() =>
+  R.value.warnings
+    .filter((w) => w.blocking && !(stashBlocked.value && w.code === "quarantine_bad_dest"))
+    .map((w) => ({ key: w.code + w.message, code: w.code, text: BLOCK_SHORT[w.code] ?? w.message, tip: w.message })),
+);
+/** 阻止执行的提示：短字 + 「换个文件夹」，原文悬停看 */
+const BLOCK_SHORT: Record<string, string> = {
+  quarantine_no_space: "暂存区放不下",
+  quarantine_bad_dest: "暂存区用不了",
+};
+const NOTE_SHORT: Record<string, string> = {
+  recycle_over_capacity: "回收站会超上限",
+  quarantine_same_volume: "暂存区在同一个盘，不腾空间",
+};
+/** 其余不阻止执行、又没在“跳过”一行里说到的提示：已知的给短字（悬停看原文），其余原文 */
+const notes = computed(() =>
+  R.value.warnings
+    .filter((w) => !w.blocking && !["locked", "hot", "cloud", "recycle_low_space", "merged"].includes(w.code))
+    .map((w) => ({ key: w.code + w.message, text: NOTE_SHORT[w.code] ?? w.message, tip: w.message })),
+);
+/** 有东西进回收站、所扫盘又快满了：回收站不腾空间 → 一键改放别的盘（走暂存区回退链，不会是死路） */
+const lowSpace = computed(() => R.value.warnings.find((w) => w.code === "recycle_low_space") ?? null);
+
+// ── 跳过（解释 30.1 → 29.3）──
+const skip = computed(() => skipSummary(R.value));
+const skipText = computed(() => skipHeadline(skip.value));
+/** 展开后按项列（同名的组合并，跳过字节多的在前，最多 12 行）：「Chrome 缓存  正在使用 4 · 刚改过 2」 */
+const skipItems = computed(() => {
+  const m = new Map<string, { name: string; bytes: number; reasons: Record<string, number> }>();
+  for (const it of live.value.filter((x: ItemReport) => x.skipped_count > 0)) {
+    const name = nameOf(it.path);
+    const cur = m.get(name) ?? { name, bytes: 0, reasons: {} };
+    cur.bytes += it.skipped_bytes;
+    for (const [k, v] of Object.entries(it.skipped_by_reason)) cur.reasons[k] = (cur.reasons[k] ?? 0) + v;
+    m.set(name, cur);
+  }
+  return [...m.values()]
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 12)
+    .map((x) => ({
+      name: x.name,
+      text: skipRows(x.reasons)
+        .map((r) => `${r.label} ${n(r.count)}`)
+        .join(" · "),
+    }));
+});
 function nameOf(p: string) {
   return groupOf(p)?.name ?? p.slice(p.lastIndexOf("\\") + 1);
 }
 
+// ── 总数 / 剩余 / 预计时间 ──
 const free = computed(() => summary.value?.free_bytes ?? 0);
+/** 真能腾出所扫盘空间的部分：直接删 + 暂存到别的盘（回收站、同盘暂存都不腾） */
+const freesBytes = computed(() => {
+  const bd = R.value.by_dest;
+  if (!bd) return R.value.strategy.kind === "recycle_bin" ? 0 : R.value.total_bytes;
+  const src = driveOf(summary.value?.root ?? scanRoot.value);
+  const q = R.value.strategy.kind === "quarantine" && driveOf(R.value.strategy.dest_root) !== src ? bd.quarantine.bytes : 0;
+  return bd.permanent.bytes + q;
+});
+const est = computed(() => (pending.value || !rep.value ? "" : estText(R.value.est_secs ?? 0)));
+
 const canRun = computed(
   () =>
-    phase.value === "preview" &&
+    execPhase.value === "idle" &&
+    !!rep.value &&
     !pending.value &&
-    props.report.can_execute &&
+    R.value.can_execute &&
     !blocking.value.length &&
+    !stashBlocked.value &&
     live.value.length > 0 &&
     (!hasReview.value || ack.value),
 );
 
 async function run() {
-  if (!canRun.value) return;
-  phase.value = "running";
-  error.value = "";
-  progress.value = { done: 0, total: props.report.total_entries, bytes_done: 0, current: "" };
-  try {
-    const o = await executePlan(props.report.plan_id, props.report.locked_count > 0, (p) => (progress.value = p));
-    outcome.value = o;
-    phase.value = "done";
-    await onExecuted(o);
-  } catch (e) {
-    error.value = String(e);
-    phase.value = "preview";
-  }
+  if (!canRun.value || !rep.value) return;
+  await runExec(rep.value);
 }
 
-async function changeDest(kind: "recycle" | "quarantine", root?: string) {
-  destOpen.value = false;
-  const s = kind === "recycle" ? ({ kind: "recycle_bin" } as const) : ({ kind: "quarantine", dest_root: root! } as const);
-  reportRef.value = null;
-  await requote(s);
-}
+// ───────────────────────── 执行中 ─────────────────────────
+const samples = ref<RateSample[]>([]);
+const pct = ref(0);
+watch(
+  execProg,
+  (p) => {
+    if (!p) return;
+    samples.value = pushSample(samples.value, { t: p.elapsed_ms, c: p.cost_done });
+    const v = p.cost_total > 0 ? Math.min(100, (p.cost_done * 100) / p.cost_total) : 0;
+    // 单调：重新附着 / 收尾时偶尔回报小一点的值也不往回走
+    pct.value = Math.max(pct.value, v);
+  },
+  { immediate: true },
+);
+const remain = computed(() => {
+  const p = execProg.value;
+  return p ? remainText(remainSecs(samples.value, p.cost_total)) : "";
+});
 
-/** 盘的根目录普通用户常常写不进去：让用户挑一个别的盘上的文件夹做隔离区 */
-async function pickDest() {
-  destOpen.value = false;
-  try {
-    const p = await pickFolder("选择隔离区放在哪个文件夹");
-    if (p) await changeDest("quarantine", p);
-  } catch (e) {
-    error.value = String(e);
-  }
+// 执行中关窗被拦下：「停止」闪一下 + 一行「先停止再关」，几秒后收起
+const nudge = ref(false);
+let nudgeT: ReturnType<typeof setTimeout> | undefined;
+watch(closeBlockedAt, (t) => {
+  if (!t || execPhase.value !== "running") return;
+  nudge.value = false;
+  requestAnimationFrame(() => (nudge.value = true));
+  clearTimeout(nudgeT);
+  nudgeT = setTimeout(() => (nudge.value = false), 3600);
+});
+onBeforeUnmount(() => clearTimeout(nudgeT));
+
+// ───────────────────────── 完成 / 已停止 ─────────────────────────
+const res = computed(() => execResult.value);
+const doneStash = computed(() => driveOf(res.value?.strategy_label) ?? stashDriveName.value);
+const rows = computed(() => (res.value ? doneRows(res.value, doneStash.value) : []));
+const doneSkips = computed(() => skipRows(res.value?.skipped_by_reason));
+/** 「没成功 N 个」悬停：失败原因（去重，最多 6 条） */
+const failTip = computed(() => {
+  const why = new Set<string>();
+  for (const it of res.value?.items ?? []) for (const d of it.details) if (d.result === "failed" && d.reason) why.add(d.reason);
+  return [...why].slice(0, 6).join("\n");
+});
+/** 后端的补充说明（例如 Windows 直接删了某个本该进回收站的文件）：一个小标记，悬停看原文 */
+const doneNotes = computed(() => (res.value?.notes ?? []).join("\n"));
+
+function goQuarantine() {
+  finishExec();
+  page.value = "quarantine";
 }
 
 function close() {
-  if (phase.value === "running") return;
-  emit("close");
+  if (execPhase.value === "running") return;
+  if (execPhase.value === "done") finishExec();
+  else closeReport();
 }
-function goQuarantine() {
-  emit("close");
-  page.value = "quarantine";
-}
-const pct = computed(() => {
-  const p = progress.value;
-  return p && p.total ? Math.min(100, (p.done * 100) / p.total) : 0;
-});
 </script>
 
 <template>
   <div class="scrim" @click.self="close">
-    <div class="modal" role="dialog" aria-modal="true" :aria-label="phase === 'done' ? '清理完成' : '确认清理'">
-      <!-- ───── 完成 ───── -->
-      <template v-if="phase === 'done' && outcome">
+    <div
+      ref="modalEl"
+      class="modal"
+      tabindex="-1"
+      role="dialog"
+      aria-modal="true"
+      :aria-label="execPhase === 'done' ? (res?.cancelled ? '已停止' : '清理完成') : execPhase === 'running' ? '正在清理' : '确认清理'"
+    >
+      <!-- ───── 完成 / 已停止 ───── -->
+      <template v-if="execPhase === 'done' && res">
         <div class="m-top">
-          <h2>清理完成</h2>
+          <h2>{{ res.cancelled ? "已停止" : "清理完成" }}</h2>
           <button class="x" aria-label="关闭" @click="close"><svg class="i" viewBox="0 0 24 24"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
         </div>
         <div class="m-total">
-          <span class="v num">{{ gbNum(outcome.report.ok_bytes) }}<small>GB</small></span>
-          <span class="after">{{ isRecycle ? "已进回收站" : "已隔离" }}</span>
+          <span class="v num" title="按清理前后剩余空间实测">{{ gbNum(res.freed_bytes ?? 0) }}<small>GB</small></span>
+          <span class="after"><b>{{ dname }} 多出</b></span>
         </div>
-        <div class="m-list">
-          <div class="m-row"><span class="n">成功</span><span class="s num">{{ outcome.report.ok.toLocaleString("zh-CN") }}</span></div>
-          <div class="m-row"><span class="n">跳过</span><span class="s num">{{ outcome.report.skipped.toLocaleString("zh-CN") }}</span></div>
-          <div v-if="outcome.report.failed" class="m-row"><span class="n">失败</span><span class="s num">{{ outcome.report.failed }}</span></div>
-          <div v-if="isRecycle" class="m-skip">清空回收站后才腾出 C 盘空间</div>
-          <div v-else class="m-skip"><button class="quiet" @click="goQuarantine">隔离区<svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" /></svg></button></div>
+        <div class="m-list done">
+          <template v-for="r in rows" :key="r.key">
+            <button v-if="r.key === 'skipped' && doneSkips.length" class="m-row" :aria-expanded="doneSkipOpen" @click="doneSkipOpen = !doneSkipOpen">
+              <span class="n">{{ r.label }}</span><span class="s num">{{ r.value }}</span>
+              <span class="chev"><svg class="i" viewBox="0 0 24 24"><path :d="doneSkipOpen ? 'm6 9 6 6 6-6' : 'm9 18 6-6-6-6'" /></svg></span>
+            </button>
+            <button v-else-if="r.key === 'quarantine'" class="m-row" title="去暂存区" @click="goQuarantine">
+              <span class="dot q"></span><span class="n">{{ r.label }}</span><span class="s num">{{ r.value }}</span>
+              <span class="chev"><svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" /></svg></span>
+            </button>
+            <div v-else class="m-row" :class="r.key" :title="r.key === 'failed' && failTip ? failTip : undefined">
+              <span v-if="r.key === 'permanent'" class="dot safe"></span>
+              <span v-else-if="r.key === 'recycle' || r.key === 'nuked'" class="dot bin"></span>
+              <span class="n">{{ r.label }}</span>
+              <span v-if="r.note" class="c">{{ r.note }}</span>
+              <span class="s num">{{ r.value }}</span>
+            </div>
+            <div v-if="r.key === 'skipped' && doneSkipOpen" class="m-sub reasons">
+              <span v-for="s in doneSkips" :key="s.code" :title="s.tip">
+                <i>{{ s.label }}</i><em class="num">{{ n(s.count) }} 个</em><b class="num">{{ s.bytes ? size(s.bytes) : "" }}</b>
+              </span>
+            </div>
+          </template>
+          <div v-if="!rows.length" class="m-row"><span class="n">没有动任何文件</span></div>
         </div>
+        <div v-if="doneNotes" class="note" :title="doneNotes">注意 {{ res.notes.length }} 条</div>
         <button class="btn" @click="close">完成</button>
       </template>
 
       <!-- ───── 执行中 ───── -->
-      <template v-else-if="phase === 'running'">
+      <template v-else-if="execPhase === 'running'">
         <div class="m-top"><h2>正在清理</h2></div>
         <div class="m-total">
-          <span class="v num">{{ gbNum(progress?.bytes_done ?? 0) }}<small>GB</small></span>
-          <span class="after num">{{ (progress?.done ?? 0).toLocaleString("zh-CN") }} / {{ (progress?.total ?? 0).toLocaleString("zh-CN") }}</span>
+          <span class="v num">{{ gbNum(execProg?.bytes_done ?? 0) }}<small>GB</small></span>
+          <span v-if="execProg?.total_bytes" class="after num">共 <b>{{ gbNum(execProg.total_bytes) }} GB</b></span>
         </div>
-        <div class="prog"><i :style="{ width: pct + '%' }"></i></div>
-        <div class="cur mono">{{ progress?.current ? shortPath(progress.current) : "" }}</div>
+        <div class="prog" role="progressbar" :aria-valuenow="Math.round(pct)" aria-valuemin="0" aria-valuemax="100">
+          <i :style="{ width: pct + '%' }"></i>
+        </div>
+        <div class="run-line">
+          <template v-if="execStopping">
+            <span class="spin" aria-hidden="true"></span><span class="stopping">正在停止</span>
+            <span v-if="nudge" class="hint" role="status">稍等再关</span>
+          </template>
+          <template v-else>
+            <span v-if="remain" class="remain num">{{ remain }}</span>
+            <i v-if="remain" class="sep">·</i>
+            <button class="stop" :class="{ nudge }" @click="stopExec">停止</button>
+            <span v-if="nudge" class="hint" role="status">先停止再关</span>
+          </template>
+        </div>
+        <div class="cur mono">{{ execProg?.current ? shortPath(execProg.current) : "" }}</div>
       </template>
 
       <!-- ───── 确认 ───── -->
@@ -210,9 +425,10 @@ const pct = computed(() => {
           <button class="x" aria-label="取消" @click="close"><svg class="i" viewBox="0 0 24 24"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
         </div>
         <div class="m-total">
-          <span class="v num" :class="{ est: pending }">{{ gbNum(report.total_bytes) }}<small>GB</small></span>
+          <span class="v num" :class="{ est: pending }">{{ gbNum(R.total_bytes) }}<small>GB</small></span>
           <span class="after">
-            <em v-if="isRecycle">清空回收站后</em>C 盘剩余 <b class="num">{{ gbNum(free) }} → {{ gbNum(free + report.total_bytes) }} GB</b>
+            {{ dname }}剩余
+            <b class="num">{{ gbNum(free) }}<template v-if="freesBytes > 0"> → {{ gbNum(free + freesBytes) }}</template> GB</b>
           </span>
         </div>
 
@@ -220,20 +436,48 @@ const pct = computed(() => {
           <div class="m-lh">
             <span>清单</span>
             <span class="dest">
-              <button class="quiet" :aria-expanded="destOpen" aria-label="删到哪里" @click="destOpen = !destOpen">
-                {{ destLabel }}<svg class="i" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+              <button class="dline" :aria-expanded="destOpen" aria-haspopup="menu" aria-label="删到哪里" @click="destOpen = !destOpen">
+                <template v-for="(p, i) in destParts" :key="p.tier">
+                  <i v-if="i" class="sep">·</i>
+                  <span class="dp"><span class="dot" :class="p.tier"></span>{{ p.label }} <b>{{ p.dest }}</b></span>
+                </template>
+                <svg class="i" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
               </button>
-              <span v-if="destOpen" class="menu">
-                <button :class="{ on: isRecycle }" @click="changeDest('recycle')">回收站</button>
-                <button
-                  v-for="d in otherDrives"
-                  :key="d.root"
-                  :class="{ on: !isRecycle && report.strategy.kind === 'quarantine' && report.strategy.dest_root === d.root }"
-                  @click="changeDest('quarantine', d.root)"
-                >
-                  隔离到 {{ d.root }}<i class="num">{{ gbNum(d.free_bytes) }} GB</i>
+              <!-- 只有可放心清理的：去向只有「直接删」和「回收站」两种，暂存区对它们不起作用 -->
+              <span v-if="destOpen && !hasReview" class="menu" role="menu">
+                <button role="menuitemradio" :aria-checked="!safeToBin" :class="{ on: !safeToBin }" @click="pick('permanent')">
+                  <span>直接删除</span><i>真腾空间</i>
                 </button>
-                <button @click="pickDest">其他文件夹…</button>
+                <button role="menuitemradio" :aria-checked="safeToBin" :class="{ on: safeToBin }" title="回收站满了，Windows 会清掉最早的" @click="pick('recycle')">
+                  <span>回收站</span><i>不腾空间</i>
+                </button>
+              </span>
+              <span v-else-if="destOpen" class="menu" role="menu">
+                <button
+                  v-for="d in stashDrives"
+                  :key="d.root"
+                  role="menuitemradio"
+                  :aria-checked="isStash && dest.drive === d.root"
+                  :class="{ on: isStash && dest.drive === d.root }"
+                  @click="pick('stash', d.root)"
+                >
+                  <span>{{ driveName(d.root) }}暂存区</span><i class="num">剩 {{ gbNum(d.free_bytes) }} GB</i>
+                </button>
+                <button
+                  role="menuitemradio"
+                  :aria-checked="dest.mode === 'recycle'"
+                  :class="{ on: dest.mode === 'recycle' }"
+                  title="回收站满了，Windows 会清掉最早的"
+                  @click="pick('recycle')"
+                >
+                  <span>回收站</span><i>不腾空间</i>
+                </button>
+                <button role="menuitemradio" :aria-checked="dest.mode === 'permanent'" :class="{ on: dest.mode === 'permanent' }" @click="pick('permanent')">
+                  <span>直接删除</span><i>找不回</i>
+                </button>
+                <button role="menuitemradio" :aria-checked="dest.mode === 'folder'" :class="{ on: dest.mode === 'folder' }" @click="pickDest">
+                  <span>其他文件夹…</span><i v-if="folderShort" class="mono" :title="dest.dest">{{ folderShort }}</i>
+                </button>
               </span>
             </span>
             <button class="quiet" :aria-expanded="listOpen" @click="listOpen = !listOpen">
@@ -244,16 +488,16 @@ const pct = computed(() => {
             <div v-for="r in reviewRows" :key="r.key" class="m-row rv">
               <span class="dot review"></span><span class="n">{{ r.name }}</span>
               <span v-if="r.short" class="tag" :class="{ hard: isHardTag(r.lose) }">{{ r.short }}</span>
-              <span class="s num">{{ sizeParts(r.bytes).join(" ") }}</span>
+              <span class="s num">{{ size(r.bytes) }}</span>
             </div>
             <template v-for="c in safeCats" :key="c.cat">
               <button class="m-row" :aria-expanded="openCat === c.cat" @click="openCat = openCat === c.cat ? null : c.cat">
                 <span class="dot safe"></span><span class="n">{{ CLEAN_CAT_NAME[c.cat] }}</span><span class="c num">{{ c.items.length }} 项</span>
-                <span class="s num">{{ sizeParts(c.bytes).join(" ") }}</span>
+                <span class="s num">{{ size(c.bytes) }}</span>
                 <span class="chev"><svg class="i" viewBox="0 0 24 24"><path :d="openCat === c.cat ? 'm6 9 6 6 6-6' : 'm9 18 6-6-6-6'" /></svg></span>
               </button>
               <div v-if="openCat === c.cat" class="m-sub">
-                <span v-for="it in c.items" :key="it.key"><i>{{ it.name }}</i><b class="num">{{ sizeParts(it.bytes).join(" ") }}</b></span>
+                <span v-for="it in c.items" :key="it.key"><i>{{ it.name }}</i><b class="num">{{ size(it.bytes) }}</b></span>
               </div>
             </template>
           </div>
@@ -261,35 +505,59 @@ const pct = computed(() => {
             <span class="spin" aria-hidden="true"></span><span class="num">{{ check.text }}</span>
             <span class="cbar"><i :style="{ width: check.pct + '%' }"></i></span>
           </div>
-          <button v-else-if="skipCount" class="m-skip" :aria-expanded="skipOpen" @click="skipOpen = !skipOpen">
-            <b>跳过 <span class="num">{{ skipCount.toLocaleString("zh-CN") }}</span> 个</b>{{ skipReason }}
+          <button v-else-if="skipText" class="m-skip" :aria-expanded="skipOpen" @click="skipOpen = !skipOpen">
+            <b class="num">{{ skipText }}</b>
             <svg class="i" viewBox="0 0 24 24"><path :d="skipOpen ? 'm6 9 6 6 6-6' : 'm9 18 6-6-6-6'" /></svg>
           </button>
-          <div v-if="skipOpen" class="m-sub skips">
-            <span v-for="it in blocked" :key="it.path"><i>{{ nameOf(it.path) }}</i><em>{{ it.blocked }}</em></span>
-            <span v-for="it in live.filter((x) => x.skipped_count > 0)" :key="'s' + it.path"><i>{{ nameOf(it.path) }}</i><em>{{ skipText(it) }}</em></span>
-            <span v-if="report.locked_processes.length" class="procs"><i>占用的程序</i><em>{{ report.locked_processes.map((p) => p.name).join("、") }}</em></span>
+          <div v-if="skipOpen && !pending" class="m-sub reasons">
+            <span v-for="s in skip.rows" :key="s.code" :title="s.tip">
+              <i>{{ s.label }}</i><em class="num">{{ s.count ? n(s.count) + (s.code === "blocked" ? " 项" : " 个") : "" }}</em><b class="num">{{ s.bytes ? size(s.bytes) : "" }}</b>
+            </span>
+            <div v-if="R.locked_processes.length || blocked.length || skipItems.length" class="details">
+              <span v-if="R.locked_processes.length" class="procs"><i>占用的程序</i><em>{{ [...new Set(R.locked_processes.map((p) => p.name))].join("、") }}</em></span>
+              <span v-for="it in blocked" :key="it.path" class="item"><i>{{ nameOf(it.path) }}</i><em :title="it.blocked ?? ''">被拦下</em></span>
+              <span v-for="it in skipItems" :key="'s' + it.name" class="item"><i>{{ it.name }}</i><em>{{ it.text }}</em></span>
+            </div>
           </div>
         </div>
 
-        <div v-if="lowSpace && otherDrives.length" class="low">
-          <span>回收站在 C 盘，不腾空间</span>
-          <button v-for="d in otherDrives.slice(0, 2)" :key="d.root" class="chip" @click="changeDest('quarantine', d.root)">改放 {{ d.root }}</button>
+        <!-- 暂存区要授权 / 建不了 / 正在准备 -->
+        <div v-if="isStash && hasReview && dest.status === 'needs_elevation'" class="act-row">
+          <span>{{ stashDriveName }}暂存区要授权</span>
+          <button class="chip" :disabled="elevating" @click="authorizeStash">{{ elevating ? "等你确认" : "授权" }}</button>
         </div>
-        <div v-for="w in notes" :key="w.code + w.message" class="note">{{ w.message }}</div>
-        <div v-for="w in blocking" :key="w.code + w.message" class="warn">{{ w.message }}</div>
-        <div v-if="error" class="warn">{{ error }}</div>
+        <div v-else-if="isStash && hasReview && dest.status === 'failed'" class="act-row" :title="dest.failMsg">
+          <span>{{ stashDriveName }}建不了暂存区</span>
+          <button class="chip" @click="pickDest">选文件夹…</button>
+        </div>
+        <div v-else-if="isStash && dest.status === 'pending'" class="act-row quiet-row">
+          <span class="spin" aria-hidden="true"></span><span>正在准备 {{ stashDriveName }}暂存区</span>
+        </div>
+        <!-- 回收站在所扫的盘上、这个盘又快满了：「改放 D 盘」只对需你判断的有意义（可放心清理不进暂存区） -->
+        <div v-if="lowSpace && !isStash && (hasReview || safeToBin)" class="act-row" :title="lowSpace.message">
+          <span>回收站不腾空间</span>
+          <button v-if="hasReview && stashDrives.length" class="chip" @click="pick('stash', stashDrives[0].root)">改放 {{ driveName(stashDrives[0].root) }}</button>
+        </div>
+        <div v-for="w in notes" :key="w.key" class="note" :title="w.tip">{{ w.text }}</div>
+        <div v-for="w in blocking" :key="w.key" class="act-row warn-row" :title="w.tip">
+          <span>{{ w.text }}</span>
+          <button v-if="w.code.startsWith('quarantine_')" class="chip" @click="pickDest">换个文件夹</button>
+        </div>
+        <div v-if="execError" class="warn">{{ execError }}</div>
 
-        <label v-if="hasReview" class="m-ack">
-          <button class="cb" :class="{ on: ack }" role="checkbox" :aria-checked="ack" aria-label="我知道这些删了的后果" @click="ack = !ack">
+        <!-- 整行可点，只在这一层切换一次（原来是 <label>：点文字时 label 又替里面的按钮点一次，等于没点） -->
+        <div v-if="hasReview" class="m-ack" @click="ack = !ack">
+          <button class="cb" :class="{ on: ack }" role="checkbox" :aria-checked="ack" aria-label="我知道这些删了的后果">
             <svg v-if="ack" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
           </button>
-          <span @click="ack = !ack">我知道这些删了的后果</span>
+          <span>我知道这些删了的后果</span>
           <span class="c"><span class="num">{{ reviewRows.length }}</span> 项需你判断</span>
-        </label>
-        <button class="btn" :disabled="!canRun" :aria-busy="pending" @click="run">
+        </div>
+        <button class="btn go" :disabled="!canRun" :aria-busy="pending" @click="run">
           <template v-if="pending">正在检查…</template>
-          <template v-else>清理 <span class="num">{{ gbNum(report.total_bytes) }} GB</span></template>
+          <template v-else>
+            清理 <span class="num">{{ gbNum(R.total_bytes) }} GB</span><span v-if="est" class="est-t">{{ est }}</span>
+          </template>
         </button>
       </template>
     </div>
@@ -297,9 +565,10 @@ const pct = computed(() => {
 </template>
 
 <style scoped>
+/* 从标题栏下面开始：清理很久时还能最小化 / 拖动窗口（标题栏左边在弹层开着时是 inert 的） */
 .scrim {
   position: absolute;
-  inset: 0;
+  inset: var(--titlebar) 0 0 0;
   background: var(--overlay);
   z-index: 80;
   display: grid;
@@ -315,7 +584,8 @@ const pct = computed(() => {
   }
 }
 .modal {
-  width: 540px;
+  outline: none;
+  width: min(540px, calc(100vw - 32px));
   max-height: calc(100% - 80px);
   overflow-y: auto;
   background: var(--surface);
@@ -342,6 +612,7 @@ const pct = computed(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  min-height: 28px;
 }
 .m-top h2 {
   font-family: var(--heading);
@@ -396,22 +667,22 @@ const pct = computed(() => {
   color: var(--ink3);
   margin-left: auto;
   text-align: right;
-}
-.m-total .after em {
-  font-style: normal;
-  display: block;
-  font-size: var(--fs-meta);
+  white-space: nowrap;
 }
 .m-total .after b {
   color: var(--ink);
   font-weight: var(--w-semi);
+  margin-left: 4px;
+}
+.m-total .v[title] {
+  cursor: help;
 }
 .m-list {
   margin-top: 20px;
   border-top: 1px solid var(--line);
 }
 .m-lh {
-  height: 38px;
+  height: 40px;
   display: flex;
   align-items: center;
   gap: 14px;
@@ -422,9 +693,11 @@ const pct = computed(() => {
 .m-lh .dest {
   margin-left: auto;
   position: relative;
+  min-width: 0;
 }
 .m-lh .quiet {
   font-size: var(--fs-meta);
+  flex: none;
 }
 .m-lh .quiet .i,
 .m-skip .i,
@@ -432,46 +705,139 @@ const pct = computed(() => {
   width: 14px;
   height: 14px;
 }
+/* 去向一行：两段短字，整行是下拉 */
+.dline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 6px 0 10px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  font-size: var(--fs-meta);
+  letter-spacing: 0;
+  color: var(--ink3);
+  white-space: nowrap;
+  transition:
+    border-color var(--dur-1) var(--ease),
+    background-color var(--dur-1) var(--ease);
+}
+.dline:hover,
+.dline[aria-expanded="true"] {
+  border-color: var(--line2);
+  background: var(--hover);
+}
+.dline b {
+  color: var(--ink);
+  font-weight: var(--w-semi);
+}
+.dline .dp {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.dline .dp .dot {
+  width: 7px;
+  height: 7px;
+}
+.dline .sep,
+.run-line .sep {
+  font-style: normal;
+  color: var(--line2);
+}
+.dline .i {
+  width: 14px;
+  height: 14px;
+  color: var(--ink3);
+}
+[data-theme="C"] .dline {
+  border: 2px solid #141412;
+  background: #fff;
+  box-shadow: 2px 2px 0 #141412;
+}
+[data-theme="C"] .dline:hover,
+[data-theme="C"] .dline[aria-expanded="true"] {
+  background: var(--accent);
+}
+[data-theme="C"] .dline .i {
+  color: #141412;
+}
+/* C 主题：下拉展开 / 悬停时底色是亮黄绿，和“可放心清理”的点同色——给点描一圈黑边 */
+[data-theme="C"] .dline .dp .dot {
+  box-shadow: 0 0 0 1.5px #141412;
+}
+[data-theme="C"] .dline .sep {
+  color: rgba(20, 20, 18, 0.35);
+}
 .menu {
   position: absolute;
   right: 0;
-  top: 26px;
+  top: 34px;
   z-index: 5;
-  min-width: 180px;
+  min-width: 220px;
   display: flex;
   flex-direction: column;
   padding: 4px;
   background: var(--surface);
   border-radius: var(--r);
   box-shadow: var(--shadow-pop);
+  animation: menu-in var(--dur-2) var(--ease);
+}
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
 }
 [data-theme="B"] .menu {
   background: #26211b;
 }
 [data-theme="C"] .menu {
   border: 2px solid #141412;
-  box-shadow: var(--shadow);
+  box-shadow: 4px 4px 0 #141412;
 }
 .menu button {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
-  padding: 7px 10px;
+  align-items: center;
+  gap: 16px;
+  height: 36px;
+  padding: 0 10px;
   border-radius: 4px;
   font-size: var(--fs-sub);
   color: var(--ink2);
+  letter-spacing: 0;
 }
 .menu button i {
   font-style: normal;
+  font-size: var(--fs-meta);
   color: var(--ink3);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .menu button:hover {
   background: var(--hover);
   color: var(--ink);
 }
+[data-theme="C"] .menu button:hover {
+  background: var(--accent);
+}
 .menu button.on {
   color: var(--ink);
   font-weight: var(--w-semi);
+}
+.menu button.on span::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink);
+  margin: 0 8px 2px -2px;
+  vertical-align: middle;
 }
 .m-rows {
   max-height: 280px;
@@ -501,6 +867,7 @@ const pct = computed(() => {
 .m-row .c {
   color: var(--ink3);
   font-size: var(--fs-sub);
+  white-space: nowrap;
 }
 .m-row .s {
   margin-left: auto;
@@ -532,6 +899,23 @@ const pct = computed(() => {
   border: 2px solid #141412;
   border-radius: 10px;
 }
+.dot.q {
+  background: var(--ink2);
+}
+.dot.bin {
+  background: transparent;
+  border: 1.5px solid var(--ink3);
+}
+[data-theme="C"] .dot.q {
+  background: #141412;
+}
+/* 完成页：回收站那一行“还没腾出”带点警示色 */
+.m-row.recycle .c {
+  color: var(--review-label);
+}
+.m-list.done .m-row:first-child {
+  border-top: 0;
+}
 .m-sub {
   display: flex;
   flex-direction: column;
@@ -562,9 +946,41 @@ const pct = computed(() => {
   text-align: right;
   max-width: 70%;
 }
-.m-sub.skips {
-  max-height: 140px;
+/* 跳过原因：名字 | 个数 | 字节 三列对齐 */
+.m-sub.reasons {
+  max-height: 180px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  padding-top: 4px;
+}
+.m-sub.reasons span:not(.item):not(.procs) {
+  display: grid;
+  grid-template-columns: 1fr 90px 76px;
+  gap: 12px;
+  line-height: 22px;
+}
+.m-sub.reasons span[title] {
+  cursor: help;
+}
+.m-sub.reasons span:not(.item):not(.procs) b {
+  text-align: right;
+}
+.m-sub.reasons .procs,
+.m-sub.reasons .item {
+  line-height: 20px;
+  color: var(--ink3);
+}
+.m-sub.reasons .details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.m-sub.reasons .procs i,
+.m-sub.reasons .item i {
+  color: var(--ink3);
 }
 .m-skip {
   width: 100%;
@@ -579,6 +995,9 @@ const pct = computed(() => {
 .m-skip b {
   color: var(--ink2);
   font-weight: var(--w-med);
+}
+.m-skip:not(.checking):hover b {
+  color: var(--ink);
 }
 .m-skip.checking {
   cursor: default;
@@ -600,10 +1019,15 @@ const pct = computed(() => {
 .spin {
   width: 12px;
   height: 12px;
+  flex: none;
   border-radius: 50%;
   border: 2px solid var(--line2);
   border-top-color: var(--ink2);
   animation: spin 0.9s linear infinite;
+}
+[data-theme="C"] .spin {
+  border-color: rgba(20, 20, 18, 0.2);
+  border-top-color: #141412;
 }
 @keyframes spin {
   to {
@@ -614,28 +1038,49 @@ const pct = computed(() => {
   opacity: 0.55;
   transition: opacity var(--dur-2) var(--ease);
 }
-.low {
+/* 一行短字 + 一个小动作（授权 / 选文件夹… / 改放 D 盘） */
+.act-row {
   margin-top: 12px;
+  min-height: 30px;
   display: flex;
   align-items: center;
   gap: 10px;
   font-size: var(--fs-sub);
   color: var(--review-label);
 }
-.low span {
+.act-row > span:first-child {
   margin-right: auto;
+}
+.act-row.quiet-row {
+  color: var(--ink3);
+}
+.act-row.quiet-row > span:first-child {
+  margin-right: 0;
 }
 .chip {
   height: 28px;
-  padding: 0 12px;
+  padding: 0 14px;
   border-radius: var(--r-pill);
   border: var(--bw) solid var(--line2);
+  font-family: var(--ui);
   font-size: var(--fs-sub);
-  font-weight: var(--w-med);
+  font-weight: var(--w-semi);
   color: var(--ink);
+  flex: none;
 }
-.chip:hover {
+.chip:hover:not(:disabled) {
   background: var(--hover);
+}
+.chip:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+[data-theme="C"] .chip {
+  background: #fff;
+  box-shadow: 2px 2px 0 #141412;
+}
+[data-theme="C"] .chip:hover:not(:disabled) {
+  background: var(--accent);
 }
 .note {
   margin-top: 12px;
@@ -643,6 +1088,13 @@ const pct = computed(() => {
   color: var(--review-label);
   line-height: 1.5;
   user-select: text;
+}
+.note[title] {
+  cursor: help;
+}
+.act-row.warn-row {
+  color: var(--danger);
+  cursor: help;
 }
 .warn {
   margin-top: 12px;
@@ -672,10 +1124,28 @@ const pct = computed(() => {
   width: 100%;
   height: 50px;
 }
+/* 主按钮旁的预计时间：同一颗按钮里的浅色小字 */
+.btn .est-t {
+  font-family: var(--ui);
+  font-size: var(--fs-sub);
+  font-weight: var(--w-med);
+  opacity: 0.66;
+  margin-left: 14px;
+  padding-left: 14px;
+  border-left: 1px solid currentColor;
+  line-height: 1;
+  letter-spacing: 0;
+}
+[data-theme="C"] .btn .est-t {
+  opacity: 0.8;
+  border-left-color: rgba(212, 242, 76, 0.45);
+}
+
+/* ── 执行中 ── */
 .prog {
-  margin-top: 20px;
-  height: 4px;
-  border-radius: 2px;
+  margin-top: 22px;
+  height: 6px;
+  border-radius: 3px;
   background: var(--sunk);
   overflow: hidden;
 }
@@ -683,19 +1153,113 @@ const pct = computed(() => {
   display: block;
   height: 100%;
   background: var(--safe);
-  transition: width var(--dur-2) linear;
+  border-radius: inherit;
+  transition: width 220ms linear;
 }
 [data-theme="C"] .prog {
-  height: 10px;
+  height: 14px;
   border: 2px solid #141412;
-  border-radius: 6px;
+  border-radius: 8px;
   background: #fff;
 }
+[data-theme="C"] .prog i {
+  border-radius: 0;
+  background: repeating-linear-gradient(-45deg, #d4f24c 0 8px, #c3e335 8px 16px);
+  border-right: 2px solid #141412;
+}
+.run-line {
+  margin-top: 14px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--fs-body);
+  color: var(--ink2);
+}
+.run-line .remain {
+  color: var(--ink);
+  font-weight: var(--w-med);
+}
+.run-line .stopping {
+  color: var(--ink2);
+}
+.stop {
+  height: 30px;
+  padding: 0 14px;
+  margin-left: -4px;
+  border-radius: var(--r-pill);
+  border: var(--bw) solid var(--line2);
+  font-family: var(--ui);
+  font-size: var(--fs-sub);
+  font-weight: var(--w-semi);
+  color: var(--ink);
+  transition:
+    background-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease);
+}
+.stop:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+[data-theme="C"] .stop {
+  background: #fff;
+  box-shadow: 2px 2px 0 #141412;
+}
+[data-theme="C"] .stop:hover {
+  background: var(--review);
+  color: #141412;
+  border-color: #141412;
+}
+/* 关窗被拦下：停止按钮闪三下 */
+.stop.nudge {
+  animation: nudge 0.5s var(--ease) 3;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+[data-theme="C"] .stop.nudge {
+  background: var(--review);
+  color: #141412;
+  border-color: #141412;
+}
+@keyframes nudge {
+  0%,
+  100% {
+    transform: none;
+    box-shadow: 0 0 0 0 transparent;
+  }
+  40% {
+    transform: scale(1.08);
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--danger) 22%, transparent);
+  }
+}
+.hint {
+  font-size: var(--fs-sub);
+  color: var(--danger);
+  font-weight: var(--w-med);
+  animation: fade var(--dur-2) var(--ease);
+}
+[data-theme="C"] .hint {
+  color: #141412;
+  background: var(--review-soft);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
 .cur {
-  margin-top: 10px;
+  margin-top: 8px;
   height: 18px;
+  font-size: var(--fn-path);
+  color: var(--ink3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+@media (max-width: 600px) {
+  .modal {
+    padding: 22px 18px 20px;
+  }
+  .m-total .v {
+    font-size: 52px;
+  }
 }
 </style>

@@ -8,7 +8,9 @@
 //! delete_disposition / remove_directory …）。
 //!
 //! 阶段 J：写入走 64 KB 缓冲（执行时每 200 ms 由计时线程 `flush` 一次，`start` / `heartbeat` / `summary`
-//! 之后立刻 flush，析构时也 flush）；打开时文件超过 50 MB 就改名为 `actions.1.log`（只留一份旧的）。
+//! 之后立刻 flush，析构时也 flush）；打开时文件超过 50 MB 就改名为 `actions.<UTC 时间>.log`，旧日志留最近
+//! [`ROTATE_KEEP`] 份（阶段 J 复核：原来只留一份 `actions.1.log`，连着两次轮转就把出事那次的日志冲掉了）。
+//! 更早的 `actions.1.log`（旧版本留下的）不动。
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -57,8 +59,10 @@ impl LogRecord {
     }
 }
 
-/// 打开时超过这个大小就轮转（改名为 `actions.1.log`，只留一份旧的）。
+/// 打开时超过这个大小就轮转（改名为 `actions.<UTC 时间>.log`）。
 pub const ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+/// 轮转出来的旧日志最多留几份（更早的删掉；只删本程序轮转出来、名字是 `actions.<时间>.log` 的）。
+pub const ROTATE_KEEP: usize = 5;
 
 /// 追加写日志（多线程共用，缓冲写，见模块说明）。
 pub struct ActionLog {
@@ -84,10 +88,14 @@ impl ActionLog {
             let _ = std::fs::create_dir_all(dir);
         }
         if std::fs::metadata(path).map(|m| m.len() > max_bytes).unwrap_or(false) {
-            let old = rotated_path(path);
-            // 只保留一份旧日志：先把更早的那份去掉（这是本程序自己的日志文件）
-            let _ = std::fs::remove_file(&old);
-            let _ = std::fs::rename(path, &old);
+            // 不覆盖任何旧日志：名字里带时间，同一秒里再轮转就加序号
+            let ts = crate::explain::now_unix();
+            let old = (0..1000).map(|n| rotated_path_at(path, ts, n)).find(|p| !p.exists());
+            if let Some(old) = old {
+                if std::fs::rename(path, &old).is_ok() {
+                    prune_rotated(path, ROTATE_KEEP);
+                }
+            }
         }
         let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(|f| std::io::BufWriter::with_capacity(64 * 1024, f));
         ActionLog { path: path.to_path_buf(), file: Mutex::new(f), failures: Default::default() }
@@ -139,9 +147,62 @@ impl Drop for ActionLog {
     }
 }
 
-/// `actions.log` → `actions.1.log`。
-pub fn rotated_path(path: &Path) -> PathBuf {
+fn stem_ext(path: &Path) -> (String, String) {
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "actions".into());
     let ext = path.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+    (stem, ext)
+}
+
+/// `actions.log` → `actions.1.log`（旧版本的轮转名；现在只用来认它，不再写）。
+pub fn rotated_path(path: &Path) -> PathBuf {
+    let (stem, ext) = stem_ext(path);
     path.with_file_name(format!("{stem}.1{ext}"))
+}
+
+/// `actions.log` → `actions.20261006-121947.log`（UTC；`n > 0` 时 `actions.20261006-121947-n.log`）。
+pub fn rotated_path_at(path: &Path, unix: i64, n: usize) -> PathBuf {
+    let (stem, ext) = stem_ext(path);
+    let iso = super::fmt_iso(unix); // 2026-10-06T12:19:47Z
+    let t: String = iso.chars().filter(|c| c.is_ascii_digit() || *c == 'T').collect::<String>().replace('T', "-");
+    if n == 0 {
+        path.with_file_name(format!("{stem}.{t}{ext}"))
+    } else {
+        path.with_file_name(format!("{stem}.{t}-{n}{ext}"))
+    }
+}
+
+/// 轮转出来的旧日志（`actions.<8 位日期>-<6 位时间>[-n].log`），按名字排序（= 按时间）。
+pub fn rotated_logs(path: &Path) -> Vec<PathBuf> {
+    let (stem, ext) = stem_ext(path);
+    let Some(dir) = path.parent() else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut v: Vec<PathBuf> = rd
+        .flatten()
+        .map(|d| d.path())
+        .filter(|p| {
+            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let Some(mid) = name.strip_prefix(&format!("{stem}.")).and_then(|r| r.strip_suffix(ext.as_str())) else { return false };
+            let b = mid.as_bytes();
+            b.len() >= 15 && b[8] == b'-' && b[..8].iter().all(u8::is_ascii_digit) && b[9..15].iter().all(u8::is_ascii_digit)
+        })
+        .collect();
+    // 按 (时间, 序号) 排：同一秒里的 `-n` 排在不带序号的那份后面
+    let key = |p: &PathBuf| {
+        let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let mid = name[stem.len() + 1..name.len() - ext.len()].to_string();
+        let n: usize = mid.get(16..).and_then(|x| x.parse().ok()).unwrap_or(0);
+        (mid[..15].to_string(), n)
+    };
+    v.sort_by_key(key);
+    v
+}
+
+/// 只留最新的 `keep` 份轮转出来的旧日志。
+fn prune_rotated(path: &Path, keep: usize) {
+    let v = rotated_logs(path);
+    if v.len() > keep {
+        for p in &v[..v.len() - keep] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }

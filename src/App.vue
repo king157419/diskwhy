@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, watch } from "vue";
+import { computed, onMounted, watch } from "vue";
 import TitleBar from "./components/TitleBar.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import HomePage from "./pages/HomePage.vue";
@@ -7,7 +7,7 @@ import CleanupPage from "./pages/CleanupPage.vue";
 import ExplorePage from "./pages/ExplorePage.vue";
 import QuarantinePage from "./pages/QuarantinePage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
-import { closeReport, init, message, notice, page, report } from "./store";
+import { dialogSeq, execPhase, init, message, notice, page, report } from "./store";
 
 const pages = {
   home: HomePage,
@@ -19,6 +19,9 @@ const pages = {
 
 onMounted(() => void init());
 
+/** 确认 / 清理中 / 完成弹层开着：后面的页面不能点、不能用 Tab 走到（inert） */
+const modal = computed(() => !!report.value || execPhase.value !== "idle");
+
 // 普通提示 8 秒后自动收起；错误提示要手动关
 let t: ReturnType<typeof setTimeout> | undefined;
 watch(notice, (v) => {
@@ -29,8 +32,8 @@ watch(notice, (v) => {
 
 <template>
   <div class="app">
-    <TitleBar />
-    <component :is="pages[page]" :key="page" class="page" />
+    <TitleBar :modal="modal" />
+    <component :is="pages[page]" :key="page" class="page" :inert="modal" />
 
     <div class="banners" aria-live="polite">
       <div v-if="message" class="banner err" role="alert">
@@ -47,7 +50,8 @@ watch(notice, (v) => {
       </div>
     </div>
 
-    <ConfirmDialog v-if="report" :key="report.plan_id" :report="report" @close="closeReport" />
+    <!-- 确认 → 执行中 → 完成都在这个弹层里；界面重载后重新附着到正在进行的清理时没有预检报告 -->
+    <ConfirmDialog v-if="modal" :key="dialogSeq" :report="report" />
   </div>
 </template>
 

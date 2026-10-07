@@ -161,10 +161,11 @@ fn parse_pca_time(s: &str) -> Option<i64> {
     Some(crate::crash::unix_from_civil(y, mo as u32, da as u32, h, mi, se))
 }
 
-/// 用户看过提示了：改成 `dismissed`。
+/// 用户看过提示了：改成 `dismissed`。只改**别的进程**留下的 running——这个进程自己正在执行的那次不能被改掉
+/// （提示是启动时读的；用户可能已经开始了新的一次清理，再点“知道了”不能把新的这次标成已看过）。
 pub fn dismiss(path: &Path) -> Result<(), String> {
     match RunState::load(path) {
-        Some(mut s) if s.status == "running" => {
+        Some(mut s) if s.status == "running" && s.pid != std::process::id() => {
             s.status = "dismissed".into();
             s.updated = crate::explain::now_unix();
             s.save(path)
@@ -225,6 +226,9 @@ mod tests {
         let mut s = RunState { batch: "b1".into(), status: "running".into(), pid: std::process::id(), started: 1, updated: 1, total: 10, processed: 4, processed_bytes: 400, ..Default::default() };
         s.save(&p).unwrap();
         assert!(interrupted(&p).is_none());
+        // 当前进程正在执行的这次：“知道了”不能把它标成已看过（被结束时下次启动还要提示）
+        dismiss(&p).unwrap();
+        assert_eq!(RunState::load(&p).unwrap().status, "running");
         // 一个不存在的进程号
         s.pid = 0xFFFF_FFF0;
         s.save(&p).unwrap();

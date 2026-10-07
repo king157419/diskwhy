@@ -84,21 +84,69 @@ impl Manifest {
         }
     }
 
+    /// 整份写入（临时文件再改名）。写好之后旁边的 [`JOURNAL`] 就多余了（它的条目都已经在这份里），删掉。
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let tmp = path.with_extension("json.tmp");
-        // 阶段 J：紧凑格式（20 万条时带缩进的要 80 MB 左右，执行中每 10 秒存一次）
+        // 阶段 J：紧凑格式（20 万条时带缩进的要 80 MB 左右）
         let s = serde_json::to_vec(self).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, s).map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("写 {} 失败：{e}", path.display()))
+        std::fs::rename(&tmp, path).map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
+        let _ = std::fs::remove_file(journal_path(path));
+        Ok(())
     }
 
+    /// 读 manifest.json，再把旁边 [`JOURNAL`] 里还没进 manifest 的条目补上（执行中途程序被结束时，
+    /// 移进来的文件只记在日志式的 journal 里）。
     pub fn load(path: &Path) -> Result<Self, String> {
         let s = std::fs::read(path).map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
-        let m: Manifest = serde_json::from_slice(&s).map_err(|e| format!("{} 不是有效的隔离区清单：{e}", path.display()))?;
+        let mut m: Manifest = serde_json::from_slice(&s).map_err(|e| format!("{} 不是有效的暂存区清单：{e}", path.display()))?;
         if m.format != FORMAT {
-            return Err(format!("{} 不是 DiskWhy 的隔离区清单", path.display()));
+            return Err(format!("{} 不是 DiskWhy 的暂存区清单", path.display()));
+        }
+        if let Ok(j) = std::fs::read(journal_path(path)) {
+            let have: std::collections::HashSet<(String, Option<String>)> = m.entries.iter().map(|e| (e.original.to_lowercase(), e.stored.clone())).collect();
+            // 最后一行可能只写了一半（被结束的那一刻）：解析不了的行跳过
+            for line in j.split(|&b| b == b'\n') {
+                if let Ok(e) = serde_json::from_slice::<ManifestEntry>(line) {
+                    if !have.contains(&(e.original.to_lowercase(), e.stored.clone())) {
+                        m.entries.push(e);
+                    }
+                }
+            }
         }
         Ok(m)
+    }
+}
+
+/// manifest.json 旁边的追加式记录：执行中每移进来一个就写一行（ManifestEntry 的 JSON），不缓冲——程序在执行中途
+/// 被结束时，已经移进来的文件都还能从这里找回来（[`Manifest::load`] 会合并）。manifest.json 整份写好后删掉。
+pub const JOURNAL: &str = "manifest.journal";
+
+pub fn journal_path(manifest: &Path) -> PathBuf {
+    manifest.with_file_name(JOURNAL)
+}
+
+/// 往 [`JOURNAL`] 里追加（每条一次 WriteFile，不缓冲）。
+pub struct Journal(std::sync::Mutex<Option<std::fs::File>>);
+
+impl Journal {
+    pub fn open(manifest: &Path) -> Self {
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(journal_path(manifest)).ok();
+        Journal(std::sync::Mutex::new(f))
+    }
+
+    /// 写一条；写不进去返回 false。
+    pub fn append(&self, e: &ManifestEntry) -> bool {
+        use std::io::Write;
+        let Ok(mut line) = serde_json::to_vec(e) else { return false };
+        line.push(b'\n');
+        let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        g.as_mut().is_some_and(|f| f.write_all(&line).is_ok())
+    }
+
+    /// 关掉文件（之后才能删它 / 删批次文件夹）。
+    pub fn close(&self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
@@ -593,13 +641,19 @@ pub fn mkdir_params(drive_root: &str, sid: &str) -> String {
     format!("{MKDIR_FLAG} \"{drive_root}\\\" {SID_FLAG} {sid}")
 }
 
-fn valid_sid(s: &str) -> bool {
-    s.starts_with("S-1-") && s.len() < 200 && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == 'S')
+/// 只接受**个人账户**的 SID：本机 / 域账户 `S-1-5-21-…`，Microsoft Entra（Azure AD）账户 `S-1-12-1-…`。
+/// Everyone（S-1-1-0）、Users（S-1-5-32-545）、Authenticated Users（S-1-5-11）这类组一律拒绝。
+pub fn valid_sid(s: &str) -> bool {
+    (s.starts_with("S-1-5-21-") || s.starts_with("S-1-12-1-"))
+        && s.len() < 200
+        && s[2..].chars().all(|c| c.is_ascii_digit() || c == '-')
+        && !s.ends_with('-')
+        && !s.contains("--")
 }
 
 /// 程序一启动就调用（在建任何窗口之前）：命令行是 `--mkdir-quarantine X:\ --grant-sid <SID>` 时，
-/// 建 `X:\DiskWhy暂存区`、用 icacls 给这个 SID 加“修改”权限（`(OI)(CI)M`，子文件夹 / 文件继承），返回退出码；
-/// 不是这个模式返回 None。只接受固定盘的盘根和形如 `S-1-…` 的 SID；文件夹已存在但是链接 / 联接时拒绝。
+/// 建 `X:\DiskWhy暂存区`、在它的句柄上给这个 SID 加“修改”权限（`(OI)(CI)M`，子文件夹 / 文件继承），返回退出码；
+/// 不是这个模式返回 None。只接受固定盘的盘根和个人账户的 SID（见 [`valid_sid`]）；文件夹已存在但是链接 / 联接时拒绝。
 pub fn elevated_mkdir_from_args(args: &[String]) -> Option<i32> {
     let i = args.iter().position(|a| a == MKDIR_FLAG)?;
     let root = args.get(i + 1).map(|s| {
@@ -622,18 +676,11 @@ pub fn elevated_mkdir_from_args(args: &[String]) -> Option<i32> {
     } else if std::fs::create_dir(winops_long(&q)).is_err() {
         return Some(mkdir_exit::MKDIR_FAILED);
     }
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let icacls = format!(r"{sysroot}\System32\icacls.exe");
-    let mut cmd = std::process::Command::new(icacls);
-    cmd.arg(&q).arg("/grant").arg(format!("*{sid}:(OI)(CI)M"));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    match cmd.output() {
-        Ok(o) if o.status.success() => Some(mkdir_exit::OK),
-        _ => Some(mkdir_exit::ICACLS_FAILED),
+    // 在同一个句柄上确认是普通文件夹再改权限（不用 icacls：它跟随联接，检查和使用之间可以被换掉）
+    match winops::grant_modify_plain_dir(&q, &sid) {
+        Ok(()) => Some(mkdir_exit::OK),
+        Err(336) => Some(mkdir_exit::NOT_PLAIN_DIR),
+        Err(_) => Some(mkdir_exit::ICACLS_FAILED),
     }
 }
 

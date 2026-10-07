@@ -24,9 +24,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_MORE_DATA, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, DeleteFileW, FileCompressionInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    CreateFileW, DeleteFileW, FileCompressionInfo, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
     GetFinalPathNameByHandleW, GetLongPathNameW, MoveFileExW, RemoveDirectoryW, BY_HANDLE_FILE_INFORMATION,
-    DELETE, FILE_COMPRESSION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+    DELETE, FILE_COMPRESSION_INFO, FILE_STANDARD_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
     VOLUME_NAME_DOS,
 };
@@ -51,6 +51,11 @@ pub struct Fingerprint {
     pub links: u32,
     /// 磁盘实际占用（FileCompressionInfo.CompressedFileSize，未按簇取整）。
     pub on_disk: u64,
+    /// FileStandardInfo.AllocationSize：只对 4 KB 以下的普通文件取（其余为 0 = 没取）。NTFS 上数据放在文件记录（MFT）
+    /// 里的小文件这里是按 8 字节取整的大小、不是整簇——删掉它不腾出任何簇（阶段 J 复核：60 字节的缓存文件按 4 KB 算，
+    /// 预计腾出的空间比实测多 10 倍以上）。
+    #[serde(default)]
+    pub alloc: u64,
 }
 
 impl Fingerprint {
@@ -119,7 +124,16 @@ unsafe fn fingerprint_of(h: HANDLE, always_compression: bool) -> Result<Fingerpr
         } else {
             size
         };
+        // 小文件：问一次真实分配大小（常驻 MFT 的文件不占簇）
+        let mut alloc = 0u64;
+        if !special && size > 0 && size < 4096 {
+            let mut si: FILE_STANDARD_INFO = zeroed();
+            if GetFileInformationByHandleEx(h, FileStandardInfo, &mut si as *mut FILE_STANDARD_INFO as *mut c_void, size_of::<FILE_STANDARD_INFO>() as u32) != 0 {
+                alloc = si.AllocationSize.max(0) as u64;
+            }
+        }
         Ok(Fingerprint {
+            alloc,
             volume: key.volume,
             id: key.id,
             size,
@@ -669,6 +683,15 @@ impl RecycleBinInfo {
         RecycleBinInfo { max_bytes, nuke }
     }
 
+    /// 这个路径、这么大的东西送进这个盘的回收站会不会被 Windows 直接删掉：会 → Some(原因)。
+    /// 先看路径长度（见 [`too_long_for_bin`]），再看 [`RecycleBinInfo::refuse`]。
+    pub fn refuse_path(&self, path: &str, size: u64) -> Option<String> {
+        if too_long_for_bin(path) {
+            return Some(format!("路径太长（{} 个字符），进不了回收站，没动它", path.encode_utf16().count()));
+        }
+        self.refuse(size)
+    }
+
     /// 这么大的东西送进这个盘的回收站会不会被 Windows 直接删掉：会 → Some(原因)。
     pub fn refuse(&self, size: u64) -> Option<String> {
         if self.nuke {
@@ -681,6 +704,20 @@ impl RecycleBinInfo {
         }
     }
 }
+
+/// 回收站收得下的最长路径（UTF-16 字符数，不含结尾 0）。实测（阶段 J 复核）：`IFileOperation` + FOFX_RECYCLEONDELETE
+/// 对 259 个字符的路径照常回收，260 个及以上的**直接永久删除**、不报错（回收站的 `$I` 记录只放得下 MAX_PATH）。
+/// 留 1 个字符余量：≥ 259 一律不送。
+pub const BIN_MAX_PATH: usize = 258;
+
+/// 这个路径送进回收站会不会因为太长被 Windows 直接删掉。
+pub fn too_long_for_bin(path: &str) -> bool {
+    path.encode_utf16().count() > BIN_MAX_PATH
+}
+
+/// 整夹回收时，文件夹在回收站里变成 `X:\$Recycle.Bin\<SID>\$Rxxxxxx[.扩展名]`，里面的东西路径前缀换成这个；
+/// 按最长的 SID 和较长的扩展名留出来的余量（字符数）。
+pub const BIN_DIR_PREFIX: usize = 100;
 
 /// 读一个 REG_DWORD（`machine` = HKLM，否则 HKCU）。
 fn reg_dword(machine: bool, key: &str, val: &str) -> Option<u32> {
@@ -979,4 +1016,79 @@ pub fn run_elevated_wait(exe: &str, params: &str) -> Result<u32, Option<String>>
             Err(Some("读不到提权进程的退出码".into()))
         }
     }
+}
+
+/// 给 `dir` 加一条可继承的“修改”权限（等同 `icacls dir /grant *SID:(OI)(CI)M`），但**在同一个句柄上**做：
+/// 不跟随链接打开（FILE_FLAG_OPEN_REPARSE_POINT）→ 确认它是普通文件夹（不是联接 / 符号链接）→ 在这个句柄上
+/// 改 DACL。检查和修改之间路径被换成联接也没用：改的是已经打开的那个对象（阶段 J 复核：icacls 会跟随联接）。
+/// 错误：`Err(Win32 错误码)`；不是普通文件夹 → `Err(ERROR_DIRECTORY_NOT_SUPPORTED 336)`；SID 写错 → `Err(1337)`。
+pub fn grant_modify_plain_dir(dir: &str, sid: &str) -> Result<(), u32> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE,
+        SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT};
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+    /// icacls 的 “M”（修改）= FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE。
+    const MODIFY: u32 = 0x0013_01BF;
+    let h = open(dir, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)?;
+    let r = unsafe {
+        let mut bh: BY_HANDLE_FILE_INFORMATION = zeroed();
+        // FILE_ATTRIBUTE_DIRECTORY 0x10，REPARSE_POINT 0x400
+        if GetFileInformationByHandle(h, &mut bh) == 0 {
+            Err(GetLastError())
+        } else if bh.dwFileAttributes & 0x10 == 0 || bh.dwFileAttributes & 0x400 != 0 {
+            Err(336)
+        } else {
+            let ws = wide(sid);
+            let mut psid: PSID = null_mut();
+            if ConvertStringSidToSidW(ws.as_ptr(), &mut psid) == 0 {
+                Err(1337)
+            } else {
+                let mut old: *mut ACL = null_mut();
+                let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+                let e = GetSecurityInfo(h, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, null_mut(), null_mut(), &mut old, null_mut(), &mut sd);
+                let res = if e != 0 {
+                    Err(e)
+                } else {
+                    let ea = EXPLICIT_ACCESS_W {
+                        grfAccessPermissions: MODIFY,
+                        grfAccessMode: GRANT_ACCESS,
+                        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+                        Trustee: TRUSTEE_W {
+                            pMultipleTrustee: null_mut(),
+                            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                            TrusteeForm: TRUSTEE_IS_SID,
+                            TrusteeType: TRUSTEE_IS_USER,
+                            ptstrName: psid as *mut u16,
+                        },
+                    };
+                    let mut new: *mut ACL = null_mut();
+                    let e = SetEntriesInAclW(1, &ea, old, &mut new);
+                    let res = if e != 0 {
+                        Err(e)
+                    } else {
+                        let e = SetSecurityInfo(h, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, null_mut(), null_mut(), new, null());
+                        if e != 0 {
+                            Err(e)
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    if !new.is_null() {
+                        LocalFree(new as _);
+                    }
+                    res
+                };
+                if !sd.is_null() {
+                    LocalFree(sd as _);
+                }
+                LocalFree(psid as _);
+                res
+            }
+        }
+    };
+    unsafe { CloseHandle(h) };
+    r
 }

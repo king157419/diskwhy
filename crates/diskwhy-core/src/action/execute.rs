@@ -8,7 +8,7 @@
 //! - 回收站：工作线程进入 STA，用 `IFileOperation` 成批送进回收站（每批最多 256 个），之后逐个确认原路径已经
 //!   不在了才算成功；整个子文件夹满足严格条件时整夹回收（见 [`DIR_RECYCLE`]），日志仍逐个文件记；
 //! - 暂存区：`MoveFileExW` 同卷改名，跨卷 `CopyFileExW`（停止时能中断大文件）→ 逐字节校验 → 删除；
-//!   跨卷时链接数 > 1 的文件跳过（硬链接，删了不腾空间）；写 `manifest.json`（每 10 秒落盘一次）；
+//!   跨卷时链接数 > 1 的文件跳过（硬链接，删了不腾空间）；每移进来一个就往 `manifest.journal` 追加一行（不缓冲），结束时整份写 `manifest.json`；
 //! - 链接：同卷暂存时把链接自身改名进暂存区；否则 `RemoveDirectoryW` / `DeleteFileW` 只删链接本身；
 //! - 所有清单项的条目切成 256 条一块，放进**同一个队列**（各项交错），`clamp(CPU 数, 4, 16)` 个线程取块；
 //!   每项有剩余块计数，做完最后一块的线程删这一项变空的子文件夹（最深的先删）并保存 manifest；
@@ -29,7 +29,7 @@ use super::{
     PREVIEW_LIMIT,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -37,10 +37,14 @@ use std::time::{Duration, Instant};
 
 /// 回收站模式下整夹回收（默认开）。条件（全部满足才整夹，否则逐个文件）：
 /// 子树里每一条都是普通文件、预检决定都是“删”、执行前逐条重新校验都通过；没有链接 / 云目录 / 列不出的子目录；
-/// 回收前重新列一遍，文件和文件夹的名字集合和清单完全一样；子树逻辑大小 ≤ 1 GB；至少 16 个文件。
+/// 回收前重新列一遍，文件和文件夹的名字集合（以及每个文件的大小 / 修改时间）和清单完全一样；子树逻辑大小 ≤ 1 GB；
+/// 16 ~ 2000 个文件；子树里没有太长的路径（[`winops::BIN_MAX_PATH`]，太长的会被 Windows 连整个文件夹直接删掉）。
 pub const DIR_RECYCLE: bool = true;
 pub const DIR_RECYCLE_MAX_BYTES: u64 = 1 << 30;
 pub const DIR_RECYCLE_MIN_FILES: usize = 16;
+/// 整夹回收的子树最多这么多个文件：逐条重新校验到真正送进回收站之间的时间要短（护栏 4、9 的空档），
+/// 更大的子树挑它下面的子文件夹。
+pub const DIR_RECYCLE_MAX_FILES: usize = 2000;
 
 /// 执行选项。
 pub struct ExecOptions<'a> {
@@ -63,7 +67,7 @@ pub struct ExecOptions<'a> {
     pub progress_ms: u64,
     /// `heartbeat` 日志 / 状态文件更新间隔（秒）。
     pub heartbeat_secs: u64,
-    /// manifest 落盘间隔（秒）。
+    /// 已不用（阶段 J 复核起暂存记录改为逐条追加到 `manifest.journal`）；保留字段免得调用方改。
     pub manifest_flush_secs: u64,
 }
 
@@ -103,6 +107,9 @@ pub struct ExecProgress {
     /// 已经收到停止，正在收尾。
     #[serde(default)]
     pub cancelling: bool,
+    /// 执行已经结束、报告已经可以取了（Tauri 层在重扫受影响的子树之前发这一条，界面马上显示完成页）。
+    #[serde(default)]
+    pub finished: bool,
 }
 
 /// 一条的结果。
@@ -239,6 +246,8 @@ struct Shared<'a> {
     manifest: Mutex<Option<Manifest>>,
     manifest_path: Option<PathBuf>,
     manifest_io: Mutex<()>,
+    /// manifest.json 旁边的追加式记录：每移进来一个写一行（见 [`quarantine::JOURNAL`]）。
+    journal: Option<quarantine::Journal>,
     protector: &'a Protector,
     opts: &'a ExecOptions<'a>,
     done: AtomicUsize,
@@ -258,13 +267,25 @@ struct Shared<'a> {
     /// 已经开始的块数（`batch_begin` 日志用）。
     units_started: AtomicUsize,
     units_total: usize,
+    /// 执行开始时 Restart Manager 查到正在被某个程序用着的 Chromium 缓存文件夹（小写，带结尾 `\`）：
+    /// 里面的一律跳过（预检之后才打开的浏览器，见 [`super::preflight::live_chromium_cache_dirs`]）。
+    live_caches: Vec<String>,
 }
 
 impl Shared<'_> {
     /// 这么大的条目送进它所在盘的回收站会不会被直接删掉：会 → Some(原因)。
     fn bin_refuse(&self, path: &str, size: u64) -> Option<String> {
         let v = crate::scan::volume_root_of(path)?.to_lowercase();
-        self.bins.iter().find(|(r, _)| *r == v).and_then(|(_, b)| b.refuse(size))
+        self.bins.iter().find(|(r, _)| *r == v).and_then(|(_, b)| b.refuse_path(path, size))
+    }
+
+    /// 在执行开始时查到的“正在用”的 Chromium 缓存文件夹里？
+    fn in_live_cache(&self, path: &str) -> bool {
+        if self.live_caches.is_empty() {
+            return false;
+        }
+        let l = path.to_lowercase();
+        self.live_caches.iter().any(|d| l.starts_with(d.as_str()))
     }
 
     fn cancelled(&self) -> bool {
@@ -292,6 +313,7 @@ impl Shared<'_> {
             elapsed_ms: t0.elapsed().as_millis() as u64,
             current: self.current.lock().map(|g| g.clone()).unwrap_or_default(),
             cancelling: self.opts.cancel.is_some_and(|c| c.load(Ordering::Relaxed)),
+            finished: false,
         }
     }
 
@@ -306,9 +328,10 @@ impl Shared<'_> {
 
     fn save_manifest(&self) -> Result<(), String> {
         let Some(mp) = &self.manifest_path else { return Ok(()) };
+        // 先拿写文件的锁再取快照：两次保存按顺序来，旧快照不会盖掉新的
+        let _io = self.manifest_io.lock();
         let snap = self.manifest.lock().map(|g| g.clone()).unwrap_or(None);
         let Some(m) = snap else { return Ok(()) };
-        let _io = self.manifest_io.lock();
         m.save(mp)
     }
 
@@ -323,7 +346,7 @@ impl Shared<'_> {
             total_bytes: self.total_bytes,
             processed: self.done.load(Ordering::Relaxed),
             processed_bytes: self.bytes_done.load(Ordering::Relaxed),
-            strategy: self.plan.strategy.label(),
+            strategy: self.plan.method_label(),
             exe: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
         }
     }
@@ -366,13 +389,17 @@ where
         .any(|(ii, it)| active(ii) && it.will_delete().any(|(e, _)| plan.entry_dest(it, e) == Dest::Quarantine));
     let needs_sta = plan.items.iter().enumerate().any(|(ii, it)| active(ii) && plan.dest_for(it) == Dest::Recycle && it.entry_count() > 0);
 
+    // 预检之后才打开的浏览器 / Electron 程序：它们的磁盘缓存用“全共享（含删除）”打开，直接删会删在它们脚下
+    // （PHASE_J_CRASH.md 隐患 5）。执行开始时再问一次 Restart Manager；问不出来按“正在用”处理。
+    let live_caches: Vec<String> = super::preflight::live_chromium_cache_dirs(plan).into_iter().map(|(d, _)| format!("{d}\\")).collect();
+
     let (batch_dir, manifest, manifest_path) = match (plan.quarantine_root(), needs_q) {
         (Some(dest_root), true) => {
             if let Some(why) = super::preflight::quarantine_dest_problem(dest_root, plan) {
                 return Err(why);
             }
             let dir = quarantine::batch_dir(dest_root, &batch_id);
-            std::fs::create_dir_all(crate::win::long_path(&dir)).map_err(|e| format!("建不了隔离区文件夹 {dir}：{e}"))?;
+            std::fs::create_dir_all(crate::win::long_path(&dir)).map_err(|e| format!("建不了暂存区文件夹 {dir}：{e}"))?;
             let mp = PathBuf::from(&dir).join(quarantine::MANIFEST);
             let m = Manifest::new(&batch_id, dest_root, &dir);
             m.save(&mp)?;
@@ -445,6 +472,7 @@ where
         batch_id: batch_id.clone(),
         batch_dir,
         manifest: Mutex::new(manifest),
+        journal: manifest_path.as_deref().map(quarantine::Journal::open),
         manifest_path: manifest_path.clone(),
         manifest_io: Mutex::new(()),
         protector,
@@ -461,6 +489,7 @@ where
         nuked: AtomicUsize::new(0),
         units_started: AtomicUsize::new(0),
         units_total: units.len(),
+        live_caches,
     };
     shared.cost_total = plan
         .items
@@ -475,7 +504,7 @@ where
     // 取证：start 记录 + 状态文件
     let mut st = LogRecord::new(&batch_id, "start", &plan.id);
     st.bytes = total_bytes;
-    st.method = plan.strategy.label();
+    st.method = plan.method_label();
     st.reason = format!(
         "计划 {total} 个，{} 块，{workers} 个线程，safe 直接删 = {}，进程 {}，父进程 {}，程序 {}",
         units.len(),
@@ -491,19 +520,23 @@ where
 
     let sh = &shared;
     let parts: Vec<Mutex<Option<Part>>> = units.iter().map(|_| Mutex::new(None)).collect();
+    // 每块是否被某个线程取走了（取走了却没有结果 = 那个线程 panic 了）
+    let taken: Vec<AtomicBool> = units.iter().map(|_| AtomicBool::new(false)).collect();
+    // 每项是否开始处理过（停止时没开始的项一点都不动，连空文件夹也不删）
+    let item_started: Vec<AtomicBool> = plan.items.iter().map(|_| AtomicBool::new(false)).collect();
     let finalized: Vec<AtomicBool> = plan.items.iter().map(|_| AtomicBool::new(false)).collect();
     let dirs_removed: Vec<AtomicUsize> = plan.items.iter().map(|_| AtomicUsize::new(0)).collect();
     let measured: Mutex<Measured> = Mutex::new(Measured::default());
     let next = AtomicUsize::new(0);
     let all_done = AtomicBool::new(false);
-    let (units_r, parts_r, remaining_r, finalized_r, dirs_removed_r, measured_r, next_r, all_done_r, progress_r) =
-        (&units, &parts, &remaining, &finalized, &dirs_removed, &measured, &next, &all_done, &progress);
-    std::thread::scope(|s| {
-        // 计时线程：进度 / 日志 flush / heartbeat / manifest 落盘 / 停止信号转给 CopyFileExW
+    let (units_r, parts_r, taken_r, started_r, remaining_r, finalized_r, dirs_removed_r, measured_r, next_r, all_done_r, progress_r) =
+        (&units, &parts, &taken, &item_started, &remaining, &finalized, &dirs_removed, &measured, &next, &all_done, &progress);
+    let (spawn_err, panicked) = std::thread::scope(|s| {
+        // 计时线程：进度 / 日志 flush / 状态文件 / heartbeat / 停止信号转给 CopyFileExW
         s.spawn(move || {
             let mut last_prog = Instant::now();
             let mut last_hb = Instant::now();
-            let mut last_mf = Instant::now();
+            let mut last_rs = Instant::now();
             while !all_done_r.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(20));
                 sh.cancelled();
@@ -512,23 +545,24 @@ where
                     progress_r(&sh.snapshot(t0));
                     sh.opts.log.flush();
                 }
+                // last-run.json 很小（临时文件再改名）：每 2 秒更新一次，程序被结束时“已处理 N 个”最多差 2 秒
+                if last_rs.elapsed() >= Duration::from_secs(2) {
+                    last_rs = Instant::now();
+                    if let Some(p) = &sh.opts.run_state_path {
+                        let _ = sh.run_state("running", started_at).save(p);
+                    }
+                }
                 if last_hb.elapsed() >= Duration::from_secs(sh.opts.heartbeat_secs) {
                     last_hb = Instant::now();
                     let mut hb = LogRecord::new(&sh.batch_id, "heartbeat", &sh.plan.id);
                     hb.bytes = sh.bytes_done.load(Ordering::Relaxed);
                     hb.reason = format!("已处理 {}/{}，{} 毫秒", sh.done.load(Ordering::Relaxed), sh.total, t0.elapsed().as_millis());
                     sh.opts.log.write(&hb);
-                    if let Some(p) = &sh.opts.run_state_path {
-                        let _ = sh.run_state("running", started_at).save(p);
-                    }
-                }
-                if sh.manifest_path.is_some() && last_mf.elapsed() >= Duration::from_secs(sh.opts.manifest_flush_secs) {
-                    last_mf = Instant::now();
-                    let _ = sh.save_manifest();
                 }
             }
         });
         let mut handles = Vec::new();
+        let mut spawn_err = None;
         for k in 0..workers {
             // 8 MB 栈（shell32 + 外壳扩展在默认 2 MB 上偏薄，PHASE_J_CRASH.md 隐患 6）；起名字，panic 记录里能看出是谁
             let h = std::thread::Builder::new().name(format!("exec-{k}")).stack_size(8 << 20).spawn_scoped(s, move || {
@@ -543,45 +577,72 @@ where
                         break;
                     }
                     let unit = &units_r[u];
+                    taken_r[u].store(true, Ordering::SeqCst);
+                    started_r[unit.item].store(true, Ordering::SeqCst);
                     let part = run_unit(unit, sh, &mut meas);
-                    *parts_r[u].lock().unwrap() = Some(part);
+                    *parts_r[u].lock().unwrap_or_else(|p| p.into_inner()) = Some(part);
                     if remaining_r[unit.item].fetch_sub(1, Ordering::SeqCst) == 1 && !finalized_r[unit.item].swap(true, Ordering::SeqCst) {
                         let n = finalize_item(&sh.plan.items[unit.item], sh, &mut meas);
                         dirs_removed_r[unit.item].store(n, Ordering::SeqCst);
                     }
                 }
-                measured_r.lock().unwrap().merge(&meas);
+                measured_r.lock().unwrap_or_else(|p| p.into_inner()).merge(&meas);
             });
             match h {
                 Ok(h) => handles.push(h),
                 Err(_) if !handles.is_empty() => break, // 起不了更多线程就用已有的
-                Err(e) => panic!("起不了工作线程：{e}"),
+                Err(e) => {
+                    spawn_err = Some(format!("起不了工作线程：{e}"));
+                    break;
+                }
             }
         }
-        for h in handles {
-            let _ = h.join();
-        }
+        // 某个工作线程 panic 了（panic hook 已经记进 crash.log）：不能当作“没处理”，下面单独记账
+        let panicked = handles.into_iter().map(|h| h.join()).filter(|r| r.is_err()).count();
+        // 一个工作线程都没起来时也要让计时线程停下，否则 scope 永远等它
         all_done_r.store(true, Ordering::SeqCst);
+        (spawn_err, panicked)
     });
+    if let Some(e) = spawn_err {
+        // 一个文件都还没动
+        let mut r = LogRecord::new(&batch_id, "summary", &plan.id);
+        r.result = "failed".into();
+        r.reason = e.clone();
+        opts.log.write(&r);
+        if let Some(p) = &opts.run_state_path {
+            let _ = shared.run_state("failed", started_at).save(p);
+        }
+        return Err(e);
+    }
 
-    // 停止时没取到的块：预检就跳过的照常记账，要删的记为“没处理”（原样没动）
+    // 没有结果的块：没取到的（停止）——预检就跳过的照常记账，要删的记为“没处理”（原样没动）；
+    // 取到了却没有结果的（线程 panic）——结果不确定，记成失败，不说“原样没动”
+    let cancel_flag = opts.cancel.is_some_and(|c| c.load(Ordering::SeqCst));
     let mut main_meas = Measured::default();
+    let mut uncertain = 0usize;
     for (u, unit) in units.iter().enumerate() {
-        let mut g = parts[u].lock().unwrap();
+        let mut g = parts[u].lock().unwrap_or_else(|p| p.into_inner());
         if g.is_none() {
             let mut p = Part::default();
-            account_untouched(&plan.items[unit.item], unit.indices(), &shared, &mut p);
+            if taken[u].load(Ordering::SeqCst) {
+                uncertain += account_uncertain(&plan.items[unit.item], unit.indices(), &shared, &mut p);
+            } else {
+                account_untouched(&plan.items[unit.item], unit.indices(), &shared, &mut p);
+            }
             *g = Some(p);
         }
     }
-    // 还没收尾的项（停止 / 没有条目的项）：只删真正空了的子文件夹
+    // 还没收尾的项（停止 / 没有条目的项 / 线程出错）：只删真正空了的子文件夹。
+    // 停止时一块都没开始的项原样不动（连原来就空着的子文件夹也不删）
     for (ii, item) in plan.items.iter().enumerate() {
-        if active(ii) && !finalized[ii].swap(true, Ordering::SeqCst) {
+        if !active(ii) || (cancel_flag && !item_started[ii].load(Ordering::SeqCst)) {
+            continue;
+        }
+        if !finalized[ii].swap(true, Ordering::SeqCst) {
             let n = finalize_item(item, &shared, &mut main_meas);
             dirs_removed[ii].store(n, Ordering::SeqCst);
         }
     }
-    let cancelled = opts.cancel.is_some_and(|c| c.load(Ordering::SeqCst));
 
     // 合并
     let mut items: Vec<ItemResult> = plan
@@ -593,7 +654,7 @@ where
     let mut ok_details = vec![0usize; plan.items.len()];
     let mut skipped_by_reason: BTreeMap<String, CountBytes> = BTreeMap::new();
     for (u, unit) in units.iter().enumerate() {
-        let p = parts[u].lock().unwrap().take().unwrap_or_default();
+        let p = parts[u].lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
         for (k, v) in &p.skipped_by_reason {
             skipped_by_reason.entry(k.clone()).or_default().merge(v);
         }
@@ -609,11 +670,15 @@ where
         });
     }
 
-    // 文件已经动过了：这里保存失败也不能返回 Err（否则界面会以为什么都没做），记进报告
+    // 文件已经动过了：这里保存失败也不能返回 Err（否则界面会以为什么都没做），记进报告。
+    // 先关掉 journal（保存成功后它就多余了，Manifest::save 会删掉它）
+    if let Some(j) = &shared.journal {
+        j.close();
+    }
     let manifest_error = shared
         .save_manifest()
         .err()
-        .map(|e| format!("隔离区清单保存失败：{e}。已移走的文件仍在批次文件夹里，按原路径映射可以手动放回。"));
+        .map(|e| format!("暂存区清单保存失败：{e}。移走的文件还在批次文件夹里（另有 {} 记着），可以在暂存区里还原。", quarantine::JOURNAL));
     let freed_bytes: u64 = src_vols
         .iter()
         .zip(&free_before)
@@ -629,6 +694,8 @@ where
         not_processed.count += r.not_processed;
         not_processed.bytes += r.not_processed_bytes;
     }
+    // 按了停止、但最后一个文件已经做完（什么都没剩下）：不算“已停止”
+    let cancelled = cancel_flag && not_processed.count > 0;
     let mut rep = ExecReport {
         batch_id: batch_id.clone(),
         strategy_label: plan.strategy.label(),
@@ -685,30 +752,23 @@ where
             }
         }
     }
+    // 补充说明只写真正出了问题的（完成页上是一个橙色的“注意 N 条”）；直接删 / 回收站 / 暂存这些正常去向
+    // 已经在完成页的小字里分行写了，不再重复
     if let Some(e) = manifest_error {
         rep.notes.push(e);
     }
-    if cancelled {
-        rep.notes.push(format!("已停止：还有 {} 个没处理，原样没动。", rep.not_processed.count));
-    }
-    if by_dest.permanent.count > 0 && plan.safe_direct {
-        rep.notes.push("可放心清理的缓存已直接删除（会自动重建），没有进回收站。".into());
-    }
     let nuked = shared.nuked.load(Ordering::Relaxed);
     if nuked > 0 {
-        rep.notes.push(format!("有 {nuked} 个文件回收站没收（太大或回收站已关），Windows 直接删除了，回收站里找不回。"));
+        rep.notes.push(format!("有 {nuked} 个文件回收站没收，Windows 直接删除了，回收站里找不回。"));
     }
-    if by_dest.recycle.count > 0 {
-        rep.notes.push("文件在回收站里，右键回收站 → 还原，就能放回原处；清空回收站之后才会真正腾出空间。".into());
-    }
-    if by_dest.quarantine.count > 0 {
-        rep.notes.push(format!("隔离区保留 {} 天（不会自动删），可以在“隔离区”里整批还原或彻底清空。", quarantine::KEEP_DAYS));
+    if uncertain > 0 || panicked > 0 {
+        rep.notes.push(format!("程序内部出错，有 {uncertain} 个文件的结果不确定（可能已经处理了），详情见动作日志。"));
     }
     let wall_ms = t0.elapsed().as_millis() as u64;
     rep.duration_ms = wall_ms;
     let mut sum = LogRecord::new(&batch_id, "summary", &plan.id);
     sum.bytes = rep.ok_bytes;
-    sum.method = plan.strategy.label();
+    sum.method = plan.method_label();
     sum.result = if rep.failed == 0 { "ok".into() } else { "failed".into() };
     sum.reason = format!(
         "成功 {}，跳过 {}，失败 {}{}；直接删除 {} / 回收站 {} / 暂存 {}；实测腾出 {} 字节，用时 {} 毫秒",
@@ -729,7 +789,8 @@ where
     let mut m = measured.into_inner().unwrap_or_default();
     m.merge(&main_meas);
     rep.measured = m;
-    if let Some(p) = &opts.perf_path {
+    // 停止 / 出错的那次不学：墙钟时间里有一大段没做的活，会把预计时间带偏
+    if let (Some(p), false) = (&opts.perf_path, cancel_flag || uncertain > 0) {
         let mut model = PerfModel::load(p);
         model.learn(&rep.measured, wall_ms as f64, workers);
         let _ = model.save(p);
@@ -765,7 +826,17 @@ fn dir_units(item: &PlanItem, protector: &Protector) -> Vec<(String, Vec<usize>,
         }
         let lo = lp.partition_point(|x| x.as_str() < pre.as_str());
         let hi = lo + lp[lo..].partition_point(|x| x.starts_with(pre.as_str()));
-        if hi - lo < DIR_RECYCLE_MIN_FILES {
+        if hi - lo < DIR_RECYCLE_MIN_FILES || hi - lo > DIR_RECYCLE_MAX_FILES {
+            continue;
+        }
+        // 路径长度：子树里任何一条（原路径，或进了回收站之后 `$Recycle.Bin\<SID>\$Rxxxxxx\…` 下的新路径）
+        // 超过回收站收得下的长度，Windows 会把**整个文件夹**直接永久删除（阶段 J 复核实测）
+        let base = item.dirs[di].encode_utf16().count() + 1;
+        let fits = |p: &str| {
+            let n = p.encode_utf16().count();
+            n <= winops::BIN_MAX_PATH && n.saturating_sub(base) + winops::BIN_DIR_PREFIX <= winops::BIN_MAX_PATH
+        };
+        if !(lo..hi).all(|i| fits(&item.entries[i].path)) || !item.dirs.iter().zip(&ldirs).filter(|(_, l)| l.starts_with(pre.as_str())).all(|(d, _)| fits(d)) {
             continue;
         }
         let mut size = 0u64;
@@ -924,6 +995,9 @@ fn reverify(e: &Entry, sh: &Shared) -> Result<Fingerprint, SkipReason> {
     if let Some(why) = sh.protector.entry_blocked(&e.path) {
         return Err(SkipReason::Protected { why });
     }
+    if sh.in_live_cache(&e.path) {
+        return Err(SkipReason::Locked { processes: vec![] });
+    }
     let Some(old) = e.fp else {
         return Err(SkipReason::Changed { what: "生成清单时没取到文件信息".into() });
     };
@@ -947,6 +1021,9 @@ enum PermFail {
 fn permanent(e: &Entry, sh: &Shared) -> Result<(), PermFail> {
     if let Some(why) = sh.protector.entry_blocked(&e.path) {
         return Err(PermFail::Skip(SkipReason::Protected { why }));
+    }
+    if sh.in_live_cache(&e.path) {
+        return Err(PermFail::Skip(SkipReason::Locked { processes: vec![] }));
     }
     let Some(old) = e.fp else {
         return Err(PermFail::Skip(SkipReason::Changed { what: "生成清单时没取到文件信息".into() }));
@@ -985,6 +1062,33 @@ fn account_untouched(item: &PlanItem, idx: &[usize], sh: &Shared, part: &mut Par
         r.reason = format!("已停止：{} 个没处理，原样没动", n.count);
         sh.opts.log.write(&r);
     }
+}
+
+/// 线程出错（panic）的块：这块里的文件可能已经处理了一部分，结果不确定——要删的记成失败（不说“原样没动”），
+/// 预检就跳过的照常记账。返回不确定的个数。
+fn account_uncertain(item: &PlanItem, idx: &[usize], sh: &Shared, part: &mut Part) -> usize {
+    const WHY: &str = "程序内部出错，这一块的结果不确定（可能已经处理了）";
+    let mut n = CountBytes::default();
+    for &i in idx {
+        let (e, d) = (&item.entries[i], &item.decisions[i]);
+        match d {
+            Decision::Skip { reason } => log_preflight_skip(item, e, reason, sh, part),
+            Decision::Delete | Decision::RemoveLink => {
+                n.add(e.bytes);
+                push(part, er(e, "failed", WHY.into(), None, None, e.bytes), None);
+            }
+            Decision::Pending => {}
+        }
+    }
+    if n.count > 0 {
+        let mut r = LogRecord::new(&sh.batch_id, "unit_panic", &item.path);
+        r.item = item.path.clone();
+        r.bytes = n.bytes;
+        r.result = "failed".into();
+        r.reason = format!("{WHY}：{} 个", n.count);
+        sh.opts.log.write(&r);
+    }
+    n.count
 }
 
 fn log_preflight_skip(item: &PlanItem, e: &Entry, reason: &SkipReason, sh: &Shared, part: &mut Part) {
@@ -1094,6 +1198,7 @@ fn run_files(item: &PlanItem, idx: &[usize], sh: &Shared, part: &mut Part, meas:
             }
             Dest::Quarantine => {
                 let xvol = sh.plan.crosses_volume(&e.path);
+                let mut copied = false;
                 match reverify(e, sh) {
                     Err(reason) => skip_entry(item, e, "quarantine", reason, sh, part, cost),
                     Ok(now) if xvol && now.links > 1 => skip_entry(item, e, "quarantine", SkipReason::Hardlink { links: now.links }, sh, part, cost),
@@ -1107,6 +1212,7 @@ fn run_files(item: &PlanItem, idx: &[usize], sh: &Shared, part: &mut Part, meas:
                         match quarantine::move_file_with(&e.path, &dst, Some(&sh.cancel_i32), ready) {
                             Ok(method) => {
                                 last_parent = parent;
+                                copied = method == "copy_verify_delete";
                                 r.method = method.into();
                                 add_manifest(sh, item, e, Some(dst.clone()), method, "");
                                 sh.opts.log.write(&r);
@@ -1134,7 +1240,10 @@ fn run_files(item: &PlanItem, idx: &[usize], sh: &Shared, part: &mut Part, meas:
                 if xvol {
                     meas.xvol.0 += 1;
                     meas.xvol.1 += ms(t);
-                    meas.xvol.2 += e.size;
+                    // 只按真拷过去的字节学吞吐（跳过 / 失败 / 停止中断的不算）
+                    if copied {
+                        meas.xvol.2 += e.size;
+                    }
                 } else {
                     meas.rename.0 += 1;
                     meas.rename.1 += ms(t);
@@ -1177,7 +1286,8 @@ fn flush_recycle(batch: &mut Vec<(&Entry, f64)>, item: &PlanItem, sh: &Shared, p
                 rec.method = "ifileoperation_nuked".into();
                 rec.dest = None;
                 rec.reason = NUKED_TEXT.into();
-                push(part, er(e, "ok", NUKED_TEXT.into(), None, Some(Dest::Permanent), e.bytes), None);
+                push(part, er(e, "ok", NUKED_TEXT.into(), None, None, e.bytes), None);
+                part.by_dest.nuked.add(e.bytes);
                 sh.tick(e.bytes, *cost);
             }
             winops::RecycleOutcome::Failed { msg, .. } => {
@@ -1211,24 +1321,27 @@ fn flush_recycle(batch: &mut Vec<(&Entry, f64)>, item: &PlanItem, sh: &Shared, p
 }
 
 /// 回收站没收、被 Windows 直接删掉时的说明。
-const NUKED_TEXT: &str = "回收站没收（太大或回收站已关），Windows 直接删除了";
+const NUKED_TEXT: &str = "回收站没收，Windows 直接删除了";
 
-/// 递归列目录，收集相对路径（小写）。遇到链接 / 云文件 / 列不出 → false。
-fn list_tree(dir: &str, rel: &str, found: &mut HashSet<String>) -> bool {
+/// 递归列目录，收集 相对路径（小写）→ (是不是文件夹, 大小, 修改时间 Unix 秒)。遇到链接 / 云文件 / 列不出 → false。
+fn list_tree(dir: &str, rel: &str, found: &mut HashMap<String, (bool, u64, i64)>) -> bool {
     use crate::fs::attrs;
     let Ok(list) = winops::list_dir(dir) else { return false };
     for r in list {
         if r.attrs & attrs::REPARSE_POINT != 0 || r.attrs & attrs::CLOUD_PLACEHOLDER_MASK != 0 {
             return false;
         }
-        let relp = if rel.is_empty() { r.name.clone() } else { format!("{rel}\\{}", r.name) };
-        found.insert(relp.to_lowercase());
-        if r.attrs & attrs::DIRECTORY != 0 && !list_tree(&crate::fs::join(dir, &r.name), &relp, found) {
+        let relp = if rel.is_empty() { r.name.clone() } else { format!("{rel}{SEP}{}", r.name) };
+        let is_dir = r.attrs & attrs::DIRECTORY != 0;
+        found.insert(relp.to_lowercase(), (is_dir, r.size, r.mtime));
+        if is_dir && !list_tree(&crate::fs::join(dir, &r.name), &relp, found) {
             return false;
         }
     }
     true
 }
+
+const SEP: char = std::path::MAIN_SEPARATOR;
 
 /// 整夹回收（见 [`DIR_RECYCLE`]）。条件不满足返回 false（什么都没动，调用方逐个文件处理）。
 fn try_recycle_dir(item: &PlanItem, dir: &str, idx: &[usize], subdirs: &[String], sh: &Shared, part: &mut Part, meas: &mut Measured) -> bool {
@@ -1236,30 +1349,36 @@ fn try_recycle_dir(item: &PlanItem, dir: &str, idx: &[usize], subdirs: &[String]
     if sh.protector.entry_blocked(dir).is_some() {
         return false;
     }
-    // 逐条重新校验（护栏 9）：任何一条不过就整个退回逐个文件
+    // 逐条重新校验（护栏 9）：任何一条不过就整个退回逐个文件；停止了也马上退回（逐个文件那边会把剩下的记成“没处理”）
+    let pre = dir.len() + 1;
+    let mut expected: HashMap<String, (bool, u64, i64)> = HashMap::with_capacity(idx.len() + subdirs.len());
     for &i in idx {
-        if reverify(&item.entries[i], sh).is_err() {
+        if sh.cancelled() {
             return false;
         }
-    }
-    // 重新列一遍：名字集合必须和清单完全一样（多一个少一个都不行）
-    let pre = dir.len() + 1;
-    let mut expected: HashSet<String> = HashSet::with_capacity(idx.len() + subdirs.len());
-    for &i in idx {
-        match item.entries[i].path.get(pre..) {
-            Some(r) => expected.insert(r.to_lowercase()),
-            None => return false,
-        };
+        let e = &item.entries[i];
+        let Ok(fp) = reverify(e, sh) else { return false };
+        let Some(r) = e.path.get(pre..) else { return false };
+        expected.insert(r.to_lowercase(), (false, fp.size, winops::ft_to_unix(fp.mtime_ft)));
     }
     for s in subdirs {
         match s.get(pre..) {
-            Some(r) => expected.insert(r.to_lowercase()),
+            Some(r) => expected.insert(r.to_lowercase(), (true, 0, 0)),
             None => return false,
         };
     }
-    let mut found = HashSet::with_capacity(expected.len());
-    if !list_tree(dir, "", &mut found) || found != expected {
+    // 重新列一遍：名字集合必须和清单完全一样（多一个少一个都不行），每个文件的大小 / 修改时间也要和刚才校验时一样
+    // （校验完到送进回收站之间又被写过的文件——护栏 4——不能跟着整夹走）
+    let mut found = HashMap::with_capacity(expected.len());
+    if !list_tree(dir, "", &mut found) || found.len() != expected.len() {
         return false;
+    }
+    for (k, (is_dir, size, mtime)) in &found {
+        match expected.get(k) {
+            Some((true, _, _)) if *is_dir => {}
+            Some((false, s, m)) if !*is_dir && s == size && m == mtime => {}
+            _ => return false,
+        }
     }
     // 整个文件夹比回收站上限还大 / 回收站关了：不整夹送（逐个文件时每个再单独判断）
     let size: u64 = idx.iter().map(|&i| item.entries[i].size).sum();
@@ -1286,7 +1405,8 @@ fn try_recycle_dir(item: &PlanItem, dir: &str, idx: &[usize], subdirs: &[String]
         if nuked {
             rec.method = "ifileoperation_dir_nuked".into();
             rec.reason = NUKED_TEXT.into();
-            push(part, er(e, "ok", NUKED_TEXT.into(), None, Some(Dest::Permanent), e.bytes), None);
+            push(part, er(e, "ok", NUKED_TEXT.into(), None, None, e.bytes), None);
+            part.by_dest.nuked.add(e.bytes);
         } else {
             rec.method = "ifileoperation_dir".into();
             rec.dest = Some("回收站".into());
@@ -1340,7 +1460,6 @@ fn finalize_item(item: &PlanItem, sh: &Shared, meas: &mut Measured) -> usize {
         meas.rmdir.0 += 1;
         meas.rmdir.1 += ms(t);
     }
-    let _ = sh.save_manifest();
     n
 }
 
@@ -1353,8 +1472,8 @@ fn do_link(e: &Entry, item: &PlanItem, dest: Dest, sh: &Shared) -> (String, Stri
             let _ = std::fs::create_dir_all(crate::win::long_path(parent));
         }
         if winops::rename(&e.path, &dst).is_ok() {
-            add_manifest(sh, item, e, Some(dst.clone()), "rename", "链接自身被移进隔离区，指向的内容没动");
-            return ("ok".into(), "链接自身移进隔离区，指向的内容没动".into(), Some(dst), "rename_link", Dest::Quarantine);
+            add_manifest(sh, item, e, Some(dst.clone()), "rename", "链接自身被移进暂存区，指向的内容没动");
+            return ("ok".into(), "链接自身移进暂存区，指向的内容没动".into(), Some(dst), "rename_link", Dest::Quarantine);
         }
     }
     let r = if e.link_is_dir { winops::remove_dir(&e.path) } else { winops::delete_file(&e.path) };
@@ -1365,7 +1484,7 @@ fn do_link(e: &Entry, item: &PlanItem, dest: Dest, sh: &Shared) -> (String, Stri
             }
             (
                 "ok".into(),
-                "只删了链接本身（链接不占空间，直接删除，不进回收站或隔离区），它指向的内容没动".into(),
+                "只删了链接本身（链接不占空间，直接删除，不进回收站或暂存区），它指向的内容没动".into(),
                 None,
                 if e.link_is_dir { "remove_directory_link" } else { "delete_file_link" },
                 Dest::Permanent,
@@ -1378,7 +1497,7 @@ fn do_link(e: &Entry, item: &PlanItem, dest: Dest, sh: &Shared) -> (String, Stri
 fn add_manifest(sh: &Shared, item: &PlanItem, e: &Entry, stored: Option<String>, method: &str, note: &str) {
     if let Ok(mut g) = sh.manifest.lock() {
         if let Some(m) = g.as_mut() {
-            m.entries.push(ManifestEntry {
+            let me = ManifestEntry {
                 original: e.path.clone(),
                 stored,
                 kind: e.kind,
@@ -1392,7 +1511,12 @@ fn add_manifest(sh: &Shared, item: &PlanItem, e: &Entry, stored: Option<String>,
                 method: method.into(),
                 status: "stored".into(),
                 note: note.into(),
-            });
+            };
+            // 先写 journal（不缓冲，程序随时被结束也不丢），再进内存里的 manifest（结束时整份写一次）
+            if let Some(j) = &sh.journal {
+                j.append(&me);
+            }
+            m.entries.push(me);
         }
     }
 }

@@ -1,4 +1,4 @@
-// 全局界面状态 + 动作（阶段 F：首页 / 清理 / 看看都是什么 / 确认弹层 / 隔离区 / 设置）。
+// 全局界面状态 + 动作（阶段 F：首页 / 清理 / 看看都是什么 / 确认弹层 / 暂存区 / 设置）。
 // 只调用 api.ts 里的后端命令；清理候选由后端算好（ScanSummary.candidates），这里只管勾选和预检。
 import { computed, ref, watch } from "vue";
 import {
@@ -12,6 +12,20 @@ import {
   previewPlan,
   cancelPreview,
   PREVIEW_CANCELLED,
+  actionStatus,
+  cancelExecute,
+  CLOSE_BLOCKED_EVENT,
+  dismissInterrupted,
+  elevateQuarantine,
+  executePlan,
+  execProgress,
+  lastExecReport,
+  lastInterrupted,
+  prepareQuarantine,
+  type DestStatus,
+  type ExecProgress,
+  type ExecReport,
+  type Interrupted,
   relaunchAsAdmin,
   saveSnapshot,
   startScan,
@@ -120,21 +134,135 @@ export const safeByCat = computed(() => {
 export const actEnv = ref<ActionEnv | null>(null);
 export const previewBusy = ref(false);
 export const report = ref<PreflightReport | null>(null);
-/** 删到哪里：回收站（默认）/ 隔离到其他盘 */
-export const cleanupMode = ref<"recycle" | "quarantine">("recycle");
-export const qDest = ref("");
+/** 确认弹层这一次打开的序号（App 用它当 key：换去向重新预检时弹层不重建） */
+export const dialogSeq = ref(0);
 
 export async function refreshActionEnv() {
   try {
     actEnv.value = await actionEnv();
   } catch (e) {
-    message.value = `读取隔离区信息失败：${e}`;
+    message.value = `读取暂存区信息失败：${e}`;
   }
 }
 
-export function currentStrategy(): Strategy {
-  if (cleanupMode.value === "quarantine" && qDest.value) return { kind: "quarantine", dest_root: qDest.value };
-  return { kind: "recycle_bin" };
+// ── 删到哪里（阶段 J §3.1 / §3.2）：可放心清理默认直接删；下拉只管「需你判断」的去向 ──
+export type DestMode = "stash" | "recycle" | "permanent" | "folder";
+export interface DestState {
+  mode: DestMode;
+  /** stash：哪个盘（"D:\\"） */
+  drive: string;
+  /** stash / folder：能用的暂存区位置（Strategy.quarantine.dest_root）；stash 还没解析时为 "" */
+  dest: string;
+  /** stash 的解析状态：ok / 要授权 / 建不了 / 正在问后端；"" = 还没解析（清单里没有需你判断的，不用解析） */
+  status: "" | "ok" | "needs_elevation" | "failed" | "pending";
+  failMsg: string;
+  /** 用户在下拉里自己选的（明确选「回收站」时可放心清理的也进回收站） */
+  explicit: boolean;
+}
+export const dest = ref<DestState>({ mode: "recycle", drive: "", dest: "", status: "", failMsg: "", explicit: false });
+/** 正在等 UAC 授权 */
+export const elevating = ref(false);
+
+/** 暂存区要在目的盘上留的余量 */
+const STASH_SLACK = 64 * 1024 ** 2;
+
+/** 要清理的东西所在的盘（"C:\\"） */
+function sourceDrive(): string {
+  const m = /^([A-Za-z]):/.exec(summary.value?.root ?? scanRoot.value);
+  return m ? `${m[1].toUpperCase()}:\\` : "";
+}
+
+/** 可以当暂存区的盘：源盘以外的固定盘，剩余多的在前 */
+export const stashDrives = computed(() => {
+  const src = sourceDrive().toUpperCase();
+  return (actEnv.value?.drives ?? drives.value).filter((d) => d.root.toUpperCase() !== src).sort((a, b) => b.free_bytes - a.free_bytes);
+});
+
+/** 勾选里有没有需你判断的、需你判断的有多大（决定要不要解析暂存区、空间够不够） */
+function reviewNeed(): { has: boolean; bytes: number } {
+  const g = checkedGroups.value.filter((x) => x.tier === "review");
+  return { has: g.length > 0, bytes: g.reduce((a, x) => a + x.deletable_bytes, 0) };
+}
+
+/** 问后端某个盘上的暂存区能不能用（①已有 ②试建 ③以前用过的位置）；结果写进 dest */
+async function resolveStash(drive: string): Promise<DestState["status"]> {
+  dest.value = { ...dest.value, mode: "stash", drive, dest: "", status: "pending", failMsg: "" };
+  let st: DestStatus;
+  try {
+    st = await prepareQuarantine(drive);
+  } catch (e) {
+    st = { status: "failed", message: String(e) };
+  }
+  if (dest.value.mode !== "stash" || dest.value.drive !== drive) return dest.value.status;
+  if (st.status === "ok") dest.value = { ...dest.value, dest: st.dest_root, status: "ok" };
+  else if (st.status === "needs_elevation") dest.value = { ...dest.value, status: "needs_elevation" };
+  else dest.value = { ...dest.value, status: "failed", failMsg: st.message };
+  return dest.value.status;
+}
+
+/**
+ * 能当**默认**暂存区的盘：不放 Windows 所在的盘（扫的是 D 盘时，不能把东西默认挪去通常最满的
+ * C 盘）；这些盘仍在下拉里，用户可以自己选。
+ */
+export function defaultStashDrives(needBytes: number) {
+  const sys = (env.value?.system_drive || "C:\\").toUpperCase();
+  return stashDrives.value.filter(
+    (d) => d.root.toUpperCase() !== sys && d.free_bytes > needBytes + STASH_SLACK,
+  );
+}
+
+/** 清理页底栏「剩余 x → y」：按默认去向真能腾出的（可放心清理直接删；需你判断只有默认去别的盘暂存时才算） */
+export const freesByDefault = computed(() => {
+  let safe = 0;
+  let review = 0;
+  for (const g of checkedGroups.value) {
+    if (g.tier === "review") review += g.deletable_bytes;
+    else safe += g.deletable_bytes;
+  }
+  return safe + (review > 0 && defaultStashDrives(review).length ? review : 0);
+});
+
+/**
+ * 默认去向（§3.1）：有别的固定盘、空间够、暂存区能用或能授权 → 「D 盘暂存区」；否则 → 「回收站」。
+ * 清单里没有需你判断的时不去解析（不在 D:\ 白建文件夹），去向只影响需你判断的那部分。
+ */
+async function pickDefaultDest() {
+  const need = reviewNeed();
+  const cands = defaultStashDrives(need.bytes);
+  const recycle: DestState = { mode: "recycle", drive: "", dest: "", status: "", failMsg: "", explicit: false };
+  if (!cands.length) {
+    dest.value = recycle;
+    return;
+  }
+  if (!need.has) {
+    dest.value = { mode: "stash", drive: cands[0].root, dest: "", status: "", failMsg: "", explicit: false };
+    return;
+  }
+  for (const d of cands) {
+    dest.value = { ...recycle, mode: "stash", drive: d.root };
+    const st = await resolveStash(d.root);
+    if (st === "ok" || st === "needs_elevation") return;
+  }
+  dest.value = recycle;
+}
+
+/** 当前去向 → 预检用的 strategy + safeDirect */
+export function currentPlanArgs(): { strategy: Strategy; safeDirect: boolean } {
+  const d = dest.value;
+  switch (d.mode) {
+    case "permanent":
+      return { strategy: { kind: "permanent" }, safeDirect: true };
+    case "folder":
+      return { strategy: { kind: "quarantine", dest_root: d.dest }, safeDirect: true };
+    case "recycle":
+      return { strategy: { kind: "recycle_bin" }, safeDirect: !d.explicit };
+    case "stash":
+      if (d.status === "ok") return { strategy: { kind: "quarantine", dest_root: d.dest }, safeDirect: true };
+      // 要授权 / 建不了：照样按这个盘预检（数字、预计时间都对），主按钮由弹层拦住，先授权或选文件夹
+      if (d.status === "needs_elevation" || d.status === "failed") return { strategy: { kind: "quarantine", dest_root: d.drive }, safeDirect: true };
+      // 还没解析（清单里没有需你判断的）：可放心清理照样直接删；万一后端判成需你判断的，也只会进回收站
+      return { strategy: { kind: "recycle_bin" }, safeDirect: true };
+  }
 }
 
 /** 后台逐个文件检查的进度（弹层里显示）；检查做完为 null */
@@ -142,26 +270,48 @@ export const checkProgress = ref<PreviewProgress | null>(null);
 /** 当前这次预检的序号：关掉弹层 / 换了删到哪里之后，旧的结果回来也不用 */
 let previewSeq = 0;
 
+/** 清理页「清理」：每次打开弹层都重新挑默认去向，然后预检 */
+export async function doPreview() {
+  // 清理进行中 / 完成页还开着：不再开新的预检（后端也会拒绝）
+  if (!checkedGroups.value.length || execPhase.value !== "idle") return;
+  dialogSeq.value++;
+  previewBusy.value = true;
+  try {
+    await pickDefaultDest();
+  } finally {
+    previewBusy.value = false;
+  }
+  await runPreview();
+}
+
 /**
  * 预检：把勾选组里能直接删的路径交给后端（带着规则 id，后端会核对说明有没有变）。
  * 阶段 G：后端先发 quote（按扫描时的大小），弹层立刻出现、按钮处于“正在检查”；
  * 逐个文件的检查在后台进行（progress），做完 promise 返回完整报告，按钮才可用。
  */
-export async function doPreview(strategy: Strategy = currentStrategy()) {
+export async function runPreview() {
   const items = checkedGroups.value.flatMap((g) => g.paths.filter((p) => p.deletable).map((p) => ({ path: p.path, expect_rule: g.rule_id })));
   if (!items.length) return;
   const seq = ++previewSeq;
+  const { strategy, safeDirect } = currentPlanArgs();
   previewBusy.value = true;
   message.value = "";
+  // 换去向重新预检：旧的报告先留着（弹层不闪），但标成“正在检查”，主按钮不可用
+  if (report.value) report.value = { ...report.value, pending: true, est_secs: 0 };
   checkProgress.value = { phase: "plan", dirs: 0, entries: 0, checked: 0, to_check: 0, locked: 0, rm_done: 0, rm_total: 0 };
   try {
-    const final = await previewPlan(items, strategy, (e) => {
-      if (seq !== previewSeq) return;
-      if (e.kind === "quote") {
-        report.value = e.report;
-        previewBusy.value = false;
-      } else checkProgress.value = e.progress;
-    });
+    const final = await previewPlan(
+      items,
+      strategy,
+      (e) => {
+        if (seq !== previewSeq) return;
+        if (e.kind === "quote") {
+          report.value = e.report;
+          previewBusy.value = false;
+        } else checkProgress.value = e.progress;
+      },
+      safeDirect,
+    );
     if (seq !== previewSeq) return;
     report.value = final;
   } catch (e) {
@@ -188,13 +338,170 @@ export function closeReport() {
   if (checking) void cancelPreview().catch(() => {});
 }
 
-/** 改删到哪里（回收站 ↔ 隔离到某个盘）：重新预检 */
-export async function requote(s: Strategy) {
-  if (s.kind === "quarantine") {
-    cleanupMode.value = "quarantine";
-    qDest.value = s.dest_root;
-  } else cleanupMode.value = "recycle";
-  await doPreview(s);
+/** 弹层下拉里选了去向：暂存区（某个盘）/ 回收站 / 直接删除 / 其他文件夹（已选好的路径）→ 重新预检 */
+export async function chooseDest(mode: DestMode, arg?: string) {
+  if (mode === "stash") {
+    dest.value = { mode, drive: arg ?? "", dest: "", status: "pending", failMsg: "", explicit: true };
+    if (report.value) report.value = { ...report.value, pending: true, est_secs: 0 };
+    await resolveStash(arg ?? "");
+  } else if (mode === "folder") {
+    if (!arg) return;
+    dest.value = { mode, drive: "", dest: arg, status: "ok", failMsg: "", explicit: true };
+  } else {
+    dest.value = { mode, drive: "", dest: "", status: "", failMsg: "", explicit: true };
+  }
+  if (report.value) await runPreview();
+}
+
+/** 「授权」：UAC 一次，提权建 X:\DiskWhy暂存区；成功就重新预检，失败 / 取消 → 请用户选文件夹 */
+export async function authorizeStash() {
+  const d = dest.value;
+  if (d.mode !== "stash" || !d.drive || elevating.value) return;
+  elevating.value = true;
+  let st: DestStatus;
+  try {
+    st = await elevateQuarantine(d.drive);
+  } catch (e) {
+    st = { status: "failed", message: String(e) };
+  } finally {
+    elevating.value = false;
+  }
+  if (dest.value.mode !== "stash" || dest.value.drive !== d.drive) return;
+  if (st.status === "ok") {
+    dest.value = { ...dest.value, dest: st.dest_root, status: "ok", failMsg: "" };
+    if (report.value) await runPreview();
+  } else if (st.status === "failed") dest.value = { ...dest.value, status: "failed", failMsg: st.message };
+}
+
+// ── 执行（阶段 J §3.4 / §3.5）：状态放在这里，界面重载后也能重新附着 ──
+export type ExecPhase = "idle" | "running" | "done";
+export const execPhase = ref<ExecPhase>("idle");
+export const execProg = ref<ExecProgress | null>(null);
+export const execResult = ref<ExecReport | null>(null);
+export const execStopping = ref(false);
+export const execError = ref("");
+/** 最近一次被拦下关窗的时间（ms）；弹层据此闪一下「停止」 */
+export const closeBlockedAt = ref(0);
+
+/** 开始执行（确认弹层主按钮）。失败（动任何文件之前）回到确认状态并显示原因 */
+export async function runExec(rep: PreflightReport) {
+  if (execPhase.value === "running") return;
+  execPhase.value = "running";
+  execError.value = "";
+  execStopping.value = false;
+  execResult.value = null;
+  execProg.value = {
+    done: 0,
+    total: rep.total_entries,
+    bytes_done: 0,
+    total_bytes: rep.total_bytes,
+    cost_done: 0,
+    cost_total: 0,
+    elapsed_ms: 0,
+    current: "",
+    cancelling: false,
+  };
+  try {
+    let shownEarly = false;
+    const o = await executePlan(rep.plan_id, rep.locked_count > 0, (p) => {
+      if (p.finished) {
+        // 后端做完了、正在重扫受影响的文件夹（大盘要几秒）：先把完成页亮出来
+        shownEarly = true;
+        void showFinished();
+        return;
+      }
+      execProg.value = p;
+      if (p.cancelling) execStopping.value = true;
+    });
+    // 完成页已经提前亮出、用户也已经点了「完成」：不要再弹回来
+    if (!shownEarly || (execPhase.value as ExecPhase) !== "idle") {
+      execResult.value = o.report;
+      execPhase.value = "done";
+    }
+    await onExecuted(o);
+  } catch (e) {
+    execError.value = String(e);
+    execPhase.value = "idle";
+  } finally {
+    execStopping.value = false;
+  }
+}
+
+async function showFinished() {
+  const r = await lastExecReport().catch(() => null);
+  if (r && execPhase.value === "running") {
+    execResult.value = r;
+    execPhase.value = "done";
+    execStopping.value = false;
+  }
+}
+
+/** 「停止」：已处理的照常记账，剩下的原样不动 */
+export async function stopExec() {
+  if (execPhase.value !== "running" || execStopping.value) return;
+  execStopping.value = true;
+  try {
+    const ok = await cancelExecute();
+    if (!ok && execPhase.value !== "running") execStopping.value = false;
+  } catch (e) {
+    execStopping.value = false;
+    message.value = `停止失败：${e}`;
+  }
+}
+
+/** 完成页「完成」 */
+export function finishExec() {
+  execPhase.value = "idle";
+  execResult.value = null;
+  execProg.value = null;
+  closeReport();
+}
+
+/** 执行中关窗被拦下（后端事件 close-blocked，或标题栏 ✕） */
+export function onCloseBlocked() {
+  if (execPhase.value === "running") closeBlockedAt.value = Date.now();
+  else notice.value = "正在处理，稍后再关";
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 界面重载 / 窗口重建后重新附着到正在进行的执行（§3 决定 0 / 崩溃文档 3）：轮询 exec_progress 直到结束，
+ * 然后显示 last_exec_report。正在进行的是还原 / 清空（没有执行进度）时只等它结束。
+ */
+export async function attachExec() {
+  let seen = false;
+  const t0 = Date.now();
+  for (;;) {
+    // 2 秒还没有执行进度：在跑的是还原 / 清空（或者后端卡在“执行中”），不再等它，照常往下走
+    if (!seen && Date.now() - t0 > 2000) return;
+    const p = await execProgress().catch(() => null);
+    if (p) {
+      seen = true;
+      execProg.value = p;
+      if (execPhase.value === "idle") execPhase.value = "running";
+      if (p.cancelling) execStopping.value = true;
+    }
+    if (!(await actionStatus().catch(() => false))) break;
+    await sleep(300);
+  }
+  if (!seen) return;
+  const r = await lastExecReport().catch(() => null);
+  execStopping.value = false;
+  if (r) {
+    execResult.value = r;
+    execPhase.value = "done";
+  } else execPhase.value = "idle";
+}
+
+// ── 上次清理被打断（§3 决定 0）──
+export const interrupted = ref<Interrupted | null>(null);
+export async function loadInterrupted() {
+  interrupted.value = await lastInterrupted().catch(() => null);
+}
+export async function doDismissInterrupted() {
+  interrupted.value = null;
+  await dismissInterrupted().catch(() => {});
 }
 
 export async function onExecuted(o: ExecOutcome) {
@@ -216,6 +523,18 @@ export async function onQuarantineChanged(s: ScanSummary | null) {
 }
 
 // ───── 扫描 ─────
+let closeListening = false;
+async function listenCloseBlocked() {
+  if (closeListening) return;
+  closeListening = true;
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen(CLOSE_BLOCKED_EVENT, () => onCloseBlocked());
+  } catch {
+    closeListening = false;
+  }
+}
+
 export async function init() {
   try {
     env.value = await getEnv();
@@ -223,6 +542,10 @@ export async function init() {
     const c = drives.value.find((d) => d.root.toUpperCase() === "C:\\");
     scanRoot.value = (c ?? drives.value[0])?.root ?? "C:\\";
     void refreshActionEnv();
+    void listenCloseBlocked();
+    // 界面重载 / 窗口重建时清理还在跑：先重新附着、等它做完再扫（不和清理抢盘）
+    if (await actionStatus().catch(() => false)) await attachExec();
+    void loadInterrupted();
     // 用快照启动（diskwhy.exe x.dwsnap）或 --scan <文件夹> 时按参数来；否则一打开就扫 C 盘
     const snap = await startupSnapshot();
     if (snap) {
@@ -414,9 +737,9 @@ export async function doSaveSnapshot() {
   snapBusy.value = true;
   try {
     const p = await saveSnapshot();
-    if (p) notice.value = `快照已保存：${p}`;
+    if (p) notice.value = "已保存";
   } catch (e) {
-    message.value = `保存快照失败：${e}`;
+    message.value = `没保存上：${e}`;
   } finally {
     snapBusy.value = false;
   }
@@ -435,10 +758,10 @@ export async function doOpenSnapshot(path?: string) {
     listing.value = null;
     focus.value = null;
     resetSelection();
-    if (s.snapshot) notice.value = `正在查看快照：${s.snapshot.path}`;
+    if (s.snapshot) notice.value = "在看保存的扫描结果";
     page.value = "home";
   } catch (e) {
-    message.value = `打开快照失败：${e}`;
+    message.value = `打不开：${e}`;
   } finally {
     snapBusy.value = false;
   }

@@ -2,16 +2,22 @@
 // 自绘标题栏（窗口无系统边框）：首页是品牌，其他页是「‹ 页名」；右边设置 + 最小化 / 最大化 / 关闭。
 // 整条可拖动（data-tauri-drag-region 只对直接标了的元素生效，所以空白处单独标）。
 import { computed } from "vue";
-import { page, type Page } from "../store";
+import { kaiSafe } from "../labels";
+import { execPhase, execStopping, onCloseBlocked, page, type Page } from "../store";
+
+/** 确认弹层开着：左边（返回 / 设置）不可用，右边的窗口按钮照常可用 */
+defineProps<{ modal?: boolean }>();
 
 const TITLES: Record<Page, string> = {
   home: "",
   cleanup: "清理",
   explore: "空间分析",
-  quarantine: "隔离区",
+  quarantine: "暂存区",
   settings: "设置",
 };
 const title = computed(() => TITLES[page.value]);
+/** C 主题的标题字体缺“暂”等字：这种页名整个用界面字体，不在一个词里混两种字体 */
+const uiFont = computed(() => !kaiSafe(title.value));
 
 async function win(action: "min" | "max" | "close") {
   try {
@@ -19,6 +25,9 @@ async function win(action: "min" | "max" | "close") {
     const w = getCurrentWindow();
     if (action === "min") await w.minimize();
     else if (action === "max") await w.toggleMaximize();
+    // 清理中还没按停止：直接提示“先停止再关”。按了停止之后照样发关窗请求，由后端决定：还在收尾就拦下并提示，
+    // 停了 20 秒还停不下来（某个系统调用卡住）就放行（安全阀）
+    else if (execPhase.value === "running" && !execStopping.value) onCloseBlocked();
     else await w.close();
   } catch {
     /* 浏览器预览里没有窗口 API */
@@ -29,11 +38,11 @@ async function win(action: "min" | "max" | "close") {
 <template>
   <header class="titlebar" data-tauri-drag-region>
     <div v-if="page === 'home'" class="brand" data-tauri-drag-region><span class="mark"></span>DiskWhy</div>
-    <button v-else class="back" aria-label="返回首页" @click="page = 'home'">
+    <button v-else class="back" :class="{ 'ui-font': uiFont }" aria-label="返回首页" :inert="modal" @click="page = 'home'">
       <svg class="i" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></svg>{{ title }}
     </button>
     <div class="tb-spacer" data-tauri-drag-region></div>
-    <button v-if="page === 'home'" class="tb-btn" title="设置" aria-label="设置" @click="page = 'settings'">
+    <button v-if="page === 'home'" class="tb-btn" title="设置" aria-label="设置" :inert="modal" @click="page = 'settings'">
       <svg class="i" viewBox="0 0 24 24"><path d="M20 7h-9" /><path d="M14 17H5" /><circle cx="17" cy="17" r="3" /><circle cx="7" cy="7" r="3" /></svg>
     </button>
     <div class="win">
@@ -110,6 +119,10 @@ async function win(action: "min" | "max" | "close") {
   font-family: var(--heading);
   font-weight: 700;
   font-size: 16px;
+}
+[data-theme="C"] .back.ui-font {
+  font-family: var(--ui);
+  font-size: 15px;
 }
 .tb-spacer {
   flex: 1;

@@ -167,6 +167,8 @@ struct EnvInfo {
     rule_warnings: Vec<String>,
     registry_apps: usize,
     llm_ready: bool,
+    /// Windows 所在的盘（`C:\`）：默认暂存区不放这里（它通常就是最满的那个盘）。
+    system_drive: String,
 }
 
 /// 快照来源信息（给界面显示）。
@@ -246,6 +248,7 @@ fn get_env(state: State<'_, AppState>) -> EnvInfo {
         rule_warnings: state.warnings(),
         registry_apps: ctx.registry.apps.len(),
         llm_ready: ctx.settings.usable(),
+        system_drive: std::env::var("SystemDrive").map(|d| format!("{}{}", d.trim_end_matches(std::path::MAIN_SEPARATOR), std::path::MAIN_SEPARATOR)).unwrap_or_default(),
     }
 }
 
@@ -352,9 +355,9 @@ async fn save_snapshot(app: AppHandle, state: State<'_, AppState>) -> Result<Opt
         let Some(fp) = app
             .dialog()
             .file()
-            .set_title("保存扫描快照")
+            .set_title("保存扫描结果")
             .set_file_name(default_name)
-            .add_filter("DiskWhy 快照", &["dwsnap"])
+            .add_filter("DiskWhy 扫描结果", &["dwsnap"])
             .blocking_save_file()
         else {
             return Ok(None);
@@ -381,8 +384,8 @@ async fn open_snapshot(path: Option<String>, app: AppHandle, state: State<'_, Ap
                 let Some(fp) = app
                     .dialog()
                     .file()
-                    .set_title("打开扫描快照")
-                    .add_filter("DiskWhy 快照 / CLI JSON", &["dwsnap", "json"])
+                    .set_title("打开扫描结果")
+                    .add_filter("DiskWhy 扫描结果 / CLI JSON", &["dwsnap", "json"])
                     .blocking_pick_file()
                 else {
                     return Ok(None);
@@ -571,6 +574,10 @@ async fn preview_plan(
     if state.scanning.load(Ordering::SeqCst) {
         return Err("正在扫描，先等扫描结束".into());
     }
+    // 清理 / 还原 / 清空进行中不许再预检（会作废计划、和执行抢盘；阶段 J 复核：弹层后面的按钮能被键盘按到）
+    if state.acting.load(Ordering::SeqCst) {
+        return Err("正在清理，先等它做完".into());
+    }
     if items.is_empty() {
         return Err("清理清单是空的".into());
     }
@@ -715,6 +722,7 @@ async fn execute_plan(
     *state.exec_progress.lock().unwrap() = None;
     *state.last_report.lock().unwrap() = None;
     let app2 = app.clone();
+    let done_ch = on_progress.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
         let r = (|| {
             let log_path = ActionLog::default_path().ok_or("找不到 %LOCALAPPDATA%")?;
@@ -745,6 +753,8 @@ async fn execute_plan(
     .map_err(|e| format!("执行线程异常：{e}"));
     *state.exec_cancel.lock().unwrap() = None;
     *state.cancel_at.lock().unwrap() = None;
+    // 执行结束：之后 `exec_progress` 不再报这次的进度（还原 / 清空进行中界面重载时不会当成还在清理）
+    let last_prog = state.exec_progress.lock().unwrap().take();
     let report = match res {
         Ok((_, Ok(r))) => r,
         Ok((plan, Err(e))) => {
@@ -759,6 +769,11 @@ async fn execute_plan(
         }
     };
     *state.last_report.lock().unwrap() = Some(report.clone());
+    // 先告诉界面“做完了”（它马上用 last_exec_report 显示完成页），再重扫受影响的子树（大盘要几秒）
+    let mut fin = last_prog.unwrap_or_default();
+    fin.finished = true;
+    fin.cancelling = false;
+    let _ = done_ch.send(fin);
     let ctx = state.ctx();
     let dirs = report.affected_dirs.clone();
     let (refresh, summary) = refresh_after(st, &ctx, &dirs);
@@ -835,10 +850,11 @@ fn dismiss_interrupted() -> Result<(), String> {
     }
 }
 
-/// 某个盘（`X:\`）上能用的暂存区位置（§3.2 的 ①②③，不提权；② 会真的建 `X:\DiskWhy暂存区`）。
+/// 某个盘（`X:\`）上能用的暂存区位置（§3.2 的 ①②③，不提权；② 只试一下能不能建，不留文件夹）。
 #[tauri::command]
 async fn prepare_quarantine(drive_root: String) -> Result<DestStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || quarantine::prepare_dest(&drive_root, true))
+    // 只试能不能建（建了马上删）：打开弹层不在盘根留下空文件夹；真正执行时才建
+    tauri::async_runtime::spawn_blocking(move || quarantine::prepare_dest(&drive_root, false))
         .await
         .map_err(|e| format!("线程异常：{e}"))
 }
@@ -1177,6 +1193,11 @@ pub fn run() {
                 // 拦下并通知前端闪一下“停止”。按了停止 20 秒还没停下来就不再拦（安全阀）。
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     if close_should_block(&st) {
+                        // 没有“停止”可按的（还原 / 清空 / 清理做完后的重扫）：第一次关窗就开始算安全阀的 20 秒，
+                        // 免得卡住时窗口永远关不掉
+                        if st.exec_cancel.lock().unwrap().is_none() {
+                            st.cancel_at.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+                        }
                         api.prevent_close();
                         diskwhy_core::crash::note("close-blocked", "执行中，拦下了关窗");
                         let _ = window.emit("close-blocked", ());

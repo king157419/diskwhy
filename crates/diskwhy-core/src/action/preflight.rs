@@ -9,7 +9,7 @@
 //! | 5 | 云占位 / 云文件：跳过并说明（不打开） | [`preflight`] | 跳过该条 |
 //! | 6 | reparse point：不跟随，只删链接自身，预览里标出 | [`preflight`] | `RemoveLink` |
 //! | 7 | 占用检测：DELETE 权限探测 + Restart Manager 报告进程名和 PID，只报告不关进程 | [`preflight`] | 跳过该条（用户可选“跳过被占用的”继续，或取消） |
-//! | 8 | 空间提示：有东西要进回收站且所在卷可用空间 < 10%（阶段 J：另查回收站上限 MaxCapacity） | [`preflight`] | 警告 + 可切换到隔离区 |
+//! | 8 | 空间提示：有东西要进回收站且所在卷可用空间 < 10%（阶段 J：另查回收站上限 MaxCapacity） | [`preflight`] | 警告 + 可切换到暂存区 |
 //! | 9 | 重新校验：执行前每条再取一次文件 ID / 大小 / 修改时间 | [`super::execute`] | 对不上的跳过 |
 
 use super::protect::{ParentCache, Protector};
@@ -197,11 +197,11 @@ pub struct Warning {
     /// `recycle_low_space` / `quarantine_same_volume` / `quarantine_no_space` / `locked` / `hot` …
     pub code: String,
     pub message: String,
-    /// 这个警告是否阻止执行（例如隔离区空间不够）。
+    /// 这个警告是否阻止执行（例如暂存区空间不够）。
     pub blocking: bool,
 }
 
-/// 可以作为隔离区的盘。
+/// 可以作为暂存区的盘。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriveChoice {
     pub root: String,
@@ -234,7 +234,7 @@ pub struct PreflightReport {
     pub review_items: Vec<ReviewNote>,
     /// 至少有一条能删、并且没有阻止执行的警告。
     pub can_execute: bool,
-    /// 可选的隔离区盘（源所在盘以外的固定盘）。
+    /// 可选的暂存区盘（源所在盘以外的固定盘）。
     pub quarantine_choices: Vec<DriveChoice>,
     /// 阶段 G：true = 这只是弹层先用的估算（扫描时的大小），逐个文件的检查还在后台进行，不能执行。
     #[serde(default)]
@@ -275,7 +275,7 @@ pub fn preflight(plan: &mut Plan, protector: &Protector, opts: &PreflightOptions
 }
 
 /// 确认弹层先用的估算（阶段 G）：只用快速计划（[`super::plan::build_plan_quick`]）的结果，每项按扫描时的大小算，
-/// 被拦下的项照常列出、空间提示 / 隔离区检查照常给出；`pending = true`、`can_execute = false`。
+/// 被拦下的项照常列出、空间提示 / 暂存区检查照常给出；`pending = true`、`can_execute = false`。
 pub fn quote(plan: &Plan) -> PreflightReport {
     report_impl(plan, Vec::new(), true, &PerfModel::load_default())
 }
@@ -470,7 +470,7 @@ pub fn skip_unrecyclable(plan: &mut Plan) {
                     }
                 };
                 let size = e.fp.map(|f| f.size).unwrap_or(e.size);
-                info.refuse(size).map(|why| (i, why))
+                info.refuse_path(&e.path, size).map(|why| (i, why))
             })
             .collect();
         for (i, why) in hits {
@@ -521,38 +521,10 @@ pub fn chromium_cache_dirs(plan: &Plan) -> BTreeMap<String, Vec<String>> {
 /// 先把所有缓存文件放进**一个** Restart Manager 会话问一次（通常没有程序在跑，一次就完）；有进程在用时再按文件夹
 /// 分别问（最多 `rm_sessions` 个会话并发、最多 400 个文件夹），找出是哪些文件夹。只报告，不关进程。
 pub fn skip_live_chromium_caches(plan: &mut Plan, opts: &PreflightOptions) -> Vec<LockingProcess> {
-    let dirs = chromium_cache_dirs(plan);
-    if dirs.is_empty() {
-        return Vec::new();
-    }
-    let all: Vec<String> = dirs.values().flatten().cloned().collect();
-    // RmRegisterResources 一次注册几千个文件没问题；太多时只看 index（每个文件夹一个）
-    let first: Vec<String> = if all.len() <= 4000 { all } else { dirs.values().filter_map(|v| v.first().cloned()).collect() };
-    match winops::rm_locking_processes(&first) {
-        Ok(p) if p.is_empty() => return Vec::new(),
-        Ok(_) => {}
-        Err(_) => return Vec::new(),
-    }
-    let list: Vec<(&String, &Vec<String>)> = dirs.iter().take(400).collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let found: std::sync::Mutex<Vec<(String, Vec<LockingProcess>)>> = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for _ in 0..opts.rm_sessions.clamp(1, 8) {
-            s.spawn(|| loop {
-                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some((d, files)) = list.get(k) else { break };
-                if let Ok(p) = winops::rm_locking_processes(files) {
-                    if !p.is_empty() {
-                        found.lock().unwrap().push(((*d).clone(), p));
-                    }
-                }
-            });
-        }
-    });
-    let found = found.into_inner().unwrap_or_default();
+    let found = live_chromium_cache_dirs_with(plan, opts.rm_sessions);
     let mut procs = Vec::new();
     for (d, p) in &found {
-        let pre = format!("{d}\\");
+        let pre = format!("{d}{}", std::path::MAIN_SEPARATOR);
         for item in plan.items.iter_mut().filter(|i| i.blocked.is_none()) {
             for (e, dec) in item.entries.iter().zip(item.decisions.iter_mut()) {
                 if matches!(dec, Decision::Delete) && e.path.to_lowercase().starts_with(&pre) {
@@ -563,6 +535,49 @@ pub fn skip_live_chromium_caches(plan: &mut Plan, opts: &PreflightOptions) -> Ve
         procs.extend(p.iter().cloned());
     }
     procs
+}
+
+/// 清单里正在被某个程序用着的 Chromium 缓存文件夹（小写）+ 用它的进程。预检时用一次，执行开始时（[`super::execute`]）
+/// 再用一次——预检之后才打开的浏览器。**查不出来就当它在用**（Restart Manager 出错、文件夹太多没逐个问的）：
+/// 宁可这次不删，也不在运行中的程序脚下删缓存。
+pub fn live_chromium_cache_dirs(plan: &Plan) -> Vec<(String, Vec<LockingProcess>)> {
+    live_chromium_cache_dirs_with(plan, PreflightOptions::default().rm_sessions)
+}
+
+fn live_chromium_cache_dirs_with(plan: &Plan, rm_sessions: usize) -> Vec<(String, Vec<LockingProcess>)> {
+    const MAX_DIRS: usize = 400;
+    let dirs = chromium_cache_dirs(plan);
+    if dirs.is_empty() {
+        return Vec::new();
+    }
+    let all: Vec<String> = dirs.values().flatten().cloned().collect();
+    // RmRegisterResources 一次注册几千个文件没问题；太多时只看 index（每个文件夹一个）
+    let first: Vec<String> = if all.len() <= 4000 { all } else { dirs.values().filter_map(|v| v.first().cloned()).collect() };
+    match winops::rm_locking_processes(&first) {
+        Ok(p) if p.is_empty() => return Vec::new(),
+        Ok(_) => {}
+        Err(_) => return dirs.into_keys().map(|d| (d, Vec::new())).collect(),
+    }
+    let list: Vec<(&String, &Vec<String>)> = dirs.iter().take(MAX_DIRS).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let found: std::sync::Mutex<Vec<(String, Vec<LockingProcess>)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..rm_sessions.clamp(1, 8) {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((d, files)) = list.get(k) else { break };
+                match winops::rm_locking_processes(files) {
+                    Ok(p) if p.is_empty() => {}
+                    Ok(p) => found.lock().unwrap_or_else(|e| e.into_inner()).push(((*d).clone(), p)),
+                    Err(_) => found.lock().unwrap_or_else(|e| e.into_inner()).push(((*d).clone(), Vec::new())),
+                }
+            });
+        }
+    });
+    let mut found = found.into_inner().unwrap_or_default();
+    // 没逐个问到的（超过 MAX_DIRS 个文件夹）：有程序在用其中某些，又说不清是哪些 → 都当在用
+    found.extend(dirs.keys().skip(MAX_DIRS).map(|d| (d.clone(), Vec::new())));
+    found
 }
 
 /// 收被占用的文件、按清单项分组交给 Restart Manager（最多 `rm_sessions` 个会话并发），和探测同时进行。
@@ -654,7 +669,10 @@ fn decide(e: &super::Entry, protector: &Protector, cache: &ParentCache, opts: &P
         Err(2) | Err(3) => return (Decision::Skip { reason: SkipReason::Missing }, None, e.bytes),
         Err(c) => return (Decision::Skip { reason: SkipReason::Unreadable { code: c } }, None, e.bytes),
     };
-    let bytes = if fp.links > 1 { 0 } else { crate::fs::round_up(fp.on_disk, cluster) };
+    // 能腾出的字节：硬链接 0（别的名字还指着数据）；数据放在 MFT 文件记录里的小文件（真实分配 < 1 簇）也是 0——
+    // 删掉它不释放任何簇；其余按簇取整
+    let resident = fp.alloc > 0 && fp.alloc < cluster;
+    let bytes = if fp.links > 1 || resident { 0 } else { crate::fs::round_up(fp.on_disk, cluster) };
     // 护栏 4：热文件（按刚取到的指纹里的修改时间）
     let age = opts.now - winops::ft_to_unix(fp.mtime_ft);
     if age < opts.hot_window_secs {
@@ -669,25 +687,25 @@ fn decide(e: &super::Entry, protector: &Protector, cache: &ParentCache, opts: &P
     (d, Some(fp), bytes)
 }
 
-/// 隔离区位置的检查：完整路径、不在任何清单项里面、不在 Windows / Program Files 里、能写。
+/// 暂存区位置的检查：完整路径、不在任何清单项里面、不在 Windows / Program Files 里、能写。
 ///
 /// 能不能写是实际试出来的：建一次 `<dest>\DiskWhy-Quarantine`，原来没有就马上删掉（空文件夹）。
 /// 例如很多机器上普通用户不能在 `D:\` 根目录建文件夹（ACL 只给 Everyone 读），这时要换成盘上的某个文件夹。
 pub fn quarantine_dest_problem(dest_root: &str, plan: &Plan) -> Option<String> {
     let n = match super::protect::normalize(dest_root) {
         Ok(n) => n,
-        Err(e) => return Some(format!("隔离区位置不对：{e}")),
+        Err(e) => return Some(format!("暂存区位置不对：{e}")),
     };
     for it in plan.items.iter().filter(|i| i.blocked.is_none()) {
         let a = it.path.to_lowercase();
         let d = n.path.to_lowercase();
         if d == a || d.starts_with(&format!("{}\\", a.trim_end_matches('\\'))) {
-            return Some(format!("隔离区位置 {} 在要清理的「{}」里面，换一个位置", n.path, it.path));
+            return Some(format!("暂存区位置 {} 在要清理的「{}」里面，换一个位置", n.path, it.path));
         }
     }
     let s = &n.segs;
     if s.len() >= 2 && (s[1] == "windows" || s[1].starts_with("program files")) {
-        return Some("隔离区不能放在 Windows 或 Program Files 里".into());
+        return Some("暂存区不能放在 Windows 或 Program Files 里".into());
     }
     let q = crate::fs::join(&n.path, super::quarantine::DIR_NAME);
     let ql = crate::win::long_path(&q);
@@ -700,7 +718,7 @@ pub fn quarantine_dest_problem(dest_root: &str, plan: &Plan) -> Option<String> {
             None
         }
         Err(e) => Some(format!(
-            "在 {} 里建不了隔离区文件夹（{e}）。普通用户常常不能在盘的根目录（如 D:\\）建文件夹，请在“删到哪里”里选“其他文件夹…”，换成这个盘上你能写的文件夹。",
+            "在 {} 里建不了暂存区文件夹（{e}）。普通用户常常不能在盘的根目录（如 D:\\）建文件夹，请在“删到哪里”里选“其他文件夹…”，换成这个盘上你能写的文件夹。",
             n.path
         )),
     }
@@ -887,7 +905,7 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
                 warnings.push(Warning {
                     code: "recycle_low_space".into(),
                     message: format!(
-                        "{v} 只剩 {}（不到 10%）。回收站就在同一个盘上：删除后空间不会立刻腾出来，要等你清空回收站才行。想马上腾出空间，可以改成“隔离到其他盘”。",
+                        "{v} 只剩 {}（不到 10%）。回收站就在同一个盘上：删除后空间不会立刻腾出来，要等你清空回收站才行。想马上腾出空间，可以改放到其他盘的暂存区。",
                         crate::view::human_bytes(sp.free_bytes)
                     ),
                     blocking: false,
@@ -921,7 +939,7 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
         if src_vols.iter().any(|v| v.eq_ignore_ascii_case(&dest_vol)) {
             warnings.push(Warning {
                 code: "quarantine_same_volume".into(),
-                message: format!("隔离区在 {dest_vol}，和要清理的东西在同一个盘上：只是挪了位置，这个盘不会腾出空间。"),
+                message: format!("暂存区在 {dest_vol}，和要清理的东西在同一个盘上：只是挪了位置，这个盘不会腾出空间。"),
                 blocking: false,
             });
         }
@@ -929,13 +947,13 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
             Ok(sp) if xvol_need > 0 && sp.free_bytes < xvol_need.saturating_add(64 * 1024 * 1024) => warnings.push(Warning {
                 code: "quarantine_no_space".into(),
                 message: format!(
-                    "隔离区所在的 {dest_vol} 只剩 {}，放不下这次要隔离的 {}（另留 64 MB 余量）。请换一个盘或改用回收站。",
+                    "暂存区所在的 {dest_vol} 只剩 {}，放不下这次要暂存的 {}（另留 64 MB 余量）。请换一个盘或改用回收站。",
                     crate::view::human_bytes(sp.free_bytes),
                     crate::view::human_bytes(xvol_need)
                 ),
                 blocking: true,
             }),
-            Err(e) => warnings.push(Warning { code: "quarantine_bad_dest".into(), message: format!("隔离区位置不可用：{e}"), blocking: true }),
+            Err(e) => warnings.push(Warning { code: "quarantine_bad_dest".into(), message: format!("暂存区位置不可用：{e}"), blocking: true }),
             _ => {}
         }
     }

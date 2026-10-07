@@ -162,6 +162,11 @@ pub const SYSTEM_PROMPT: &str = "你是 Windows 磁盘清理助手。用户会�
 4) 只输出一个 JSON 对象，不要任何多余文字，格式：{\"what\":\"这是什么\",\"owner\":\"可能属于哪个软件，不知道就写空字符串\",\"why\":\"为什么会有\",\"lose\":\"删了会失去什么、会不会丢数据\",\"confidence\":0到1之间的小数}";
 
 /// 请求体（OpenAI 兼容 chat/completions）。
+///
+/// **不发 `temperature` / `top_p` / `max_tokens`**：Kimi K2.6 及以后的模型把 temperature、top_p 固定死，
+/// 文档说传其他值会报错、不要显式传（<https://platform.kimi.ai/docs/api/models-overview>）；
+/// OpenAI 的 GPT-5 系推理模型也只接受默认 temperature、且不认 `max_tokens`。各家默认值都能用，
+/// 所以干脆一个采样参数都不发。万一将来有人加回来，[`chat`] 遇到点名这些参数的 400 会去掉再试一次。
 pub fn build_request_body(model: &str, input: &LlmInput) -> serde_json::Value {
     let user = format!(
         "请推断下面这个{}是什么（这是推断，不是确认）：\n{}",
@@ -170,7 +175,6 @@ pub fn build_request_body(model: &str, input: &LlmInput) -> serde_json::Value {
     );
     serde_json::json!({
         "model": model,
-        "temperature": 0.2,
         "stream": false,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -200,19 +204,102 @@ pub struct LlmAnswer {
     pub confidence: f32,
 }
 
-/// 从模型返回的文本里抠出 JSON（有的模型会包一层 ```json ... ``` 或多说几句）。
+/// 去掉推理模型的思考段：`<think>…</think>`（本机 Ollama 的 qwen3 / deepseek-r1 会放在 content 里）。
+/// 没闭合的 `<think>`（回复被截断）就整段丢掉。
+fn strip_think(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let Some(i) = rest.find("<think>") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..i]);
+        match rest[i..].find("</think>") {
+            Some(j) => rest = &rest[i + j + "</think>".len()..],
+            None => break,
+        }
+    }
+    out
+}
+
+/// 数字或字符串（"0.7"、"70%"）都认；0–100 的百分数也认；认不出就 0。
+fn lenient_confidence(v: Option<&serde_json::Value>) -> f32 {
+    let x = match v {
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(serde_json::Value::String(t)) => {
+            let t = t.trim();
+            match t.strip_suffix('%') {
+                Some(p) => p.trim().parse::<f64>().map(|x| x / 100.0).unwrap_or(0.0),
+                None => t.parse::<f64>().unwrap_or(0.0),
+            }
+        }
+        _ => 0.0,
+    };
+    let x = if x > 1.0 && x <= 100.0 { x / 100.0 } else { x };
+    if x.is_finite() {
+        x.clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    }
+}
+
+fn lenient_str(o: &serde_json::Map<String, serde_json::Value>, k: &str) -> String {
+    match o.get(k) {
+        Some(serde_json::Value::String(t)) => t.clone(),
+        Some(serde_json::Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// 一个 JSON 对象 → 回答；必须有非空的 `what`。
+fn answer_from_value(v: &serde_json::Value) -> Option<LlmAnswer> {
+    let o = v.as_object()?;
+    let what = lenient_str(o, "what");
+    if what.trim().is_empty() {
+        return None;
+    }
+    Some(LlmAnswer {
+        what,
+        owner: lenient_str(o, "owner"),
+        why: lenient_str(o, "why"),
+        lose: lenient_str(o, "lose"),
+        confidence: lenient_confidence(o.get("confidence")),
+    })
+}
+
+/// 从模型返回的文本里抠出 JSON 回答。模型常见的“不听话”都要能吃下：
+/// - 包一层 ```` ```json … ``` ````；
+/// - JSON 前面先说一段推理（推理里可能也有 `{`、`}`），或后面再补几句；
+/// - `<think>…</think>` 思考段；
+/// - confidence 写成字符串 / 百分数，owner 写成 null。
+///
+/// 做法：去掉思考段后，从每个 `{` 处试着用 serde 读出**一个完整的** JSON 值（后面多余的文字不管），
+/// 取最后一个带非空 `what` 的对象（推理里举的例子在前，正式答案在后）。
 pub fn parse_answer(content: &str) -> Result<LlmAnswer, String> {
-    let start = content.find('{').ok_or("AI 的回复里没有 JSON")?;
-    let end = content.rfind('}').ok_or("AI 的回复里没有 JSON")?;
-    if end <= start {
-        return Err("AI 的回复里没有完整的 JSON".into());
+    let text = strip_think(content);
+    let mut found: Option<LlmAnswer> = None;
+    let mut saw_json = false;
+    let mut i = 0;
+    while let Some(off) = text[i..].find('{') {
+        let at = i + off;
+        let mut it = serde_json::Deserializer::from_str(&text[at..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(v)) = it.next() {
+            saw_json = true;
+            if let Some(a) = answer_from_value(&v) {
+                found = Some(a);
+                // 跳过整个对象，里面嵌套的 `{` 不再单独试
+                i = at + it.byte_offset().max(1);
+                continue;
+            }
+        }
+        i = at + 1;
     }
-    let mut a: LlmAnswer = serde_json::from_str(&content[start..=end]).map_err(|e| format!("AI 回复的 JSON 解析失败：{e}"))?;
-    if a.what.trim().is_empty() {
-        return Err("AI 没有给出“这是什么”".into());
+    match found {
+        Some(a) => Ok(a),
+        None if saw_json => Err("AI 没有给出“这是什么”".into()),
+        None => Err("AI 的回复里没有 JSON".into()),
     }
-    a.confidence = if a.confidence.is_finite() { a.confidence.clamp(0.0, 1.0) } else { 0.0 };
-    Ok(a)
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {
@@ -225,28 +312,70 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .new_agent()
 }
 
-/// 发一次 chat 请求，返回 assistant 的文本。所有错误都转成中文字符串，不 panic。
-fn chat(settings: &LlmSettings, body: &serde_json::Value, timeout: Duration) -> Result<String, String> {
-    let url = chat_url(&settings.base_url);
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("地址要以 http:// 或 https:// 开头".into());
+/// 可以不发的采样参数。服务器 400 并点名其中某个时，去掉它重试一次。
+const OPTIONAL_PARAMS: [&str; 6] = ["temperature", "top_p", "max_tokens", "presence_penalty", "frequency_penalty", "response_format"];
+
+/// 400 的报错里点名了请求体里的哪些可选参数（全部要去掉）。
+pub fn params_to_drop(body: &serde_json::Value, status: u16, err_text: &str) -> Vec<&'static str> {
+    if status != 400 {
+        return Vec::new();
     }
-    let mut req = agent(timeout).post(&url).header("Content-Type", "application/json");
+    let low = err_text.to_ascii_lowercase();
+    OPTIONAL_PARAMS.iter().copied().filter(|k| body.get(*k).is_some() && low.contains(k)).collect()
+}
+
+/// `choices[0].message.content`：字符串，或（少数兼容实现）`[{type:"text",text:"…"}]` 数组。
+fn extract_content(v: &serde_json::Value) -> Option<String> {
+    match v.pointer("/choices/0/message/content")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let s: String = parts.iter().filter_map(|p| p.get("text").and_then(|t| t.as_str())).collect();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 发一次 HTTP，返回 (状态码, 回复文本)。
+fn post_once(settings: &LlmSettings, url: &str, body: &serde_json::Value, timeout: Duration) -> Result<(u16, String), String> {
+    let mut req = agent(timeout).post(url).header("Content-Type", "application/json");
     if !settings.api_key.trim().is_empty() {
         req = req.header("Authorization", &format!("Bearer {}", settings.api_key.trim()));
     }
     let mut resp = req.send(body.to_string()).map_err(|e| format!("连不上 {url}：{e}"))?;
     let status = resp.status().as_u16();
     let text = resp.body_mut().read_to_string().map_err(|e| format!("读取回复失败：{e}"))?;
+    Ok((status, text))
+}
+
+/// 发 chat 请求，返回 assistant 的文本。所有错误都转成中文字符串，不 panic。
+/// 服务器回 400 且点名了请求里的某个可选采样参数（如 Kimi 的 “invalid temperature”）时，去掉它重试一次。
+fn chat(settings: &LlmSettings, body: &serde_json::Value, timeout: Duration) -> Result<String, String> {
+    let url = chat_url(&settings.base_url);
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("地址要以 http:// 或 https:// 开头".into());
+    }
+    let (mut status, mut text) = post_once(settings, &url, body, timeout)?;
+    let drop = params_to_drop(body, status, &text);
+    if !drop.is_empty() {
+        let mut b = body.clone();
+        if let Some(o) = b.as_object_mut() {
+            for k in &drop {
+                o.remove(*k);
+            }
+        }
+        (status, text) = post_once(settings, &url, &b, timeout)?;
+    }
     if !(200..300).contains(&status) {
         let snippet: String = text.chars().take(300).collect();
         return Err(format!("服务返回 HTTP {status}：{snippet}"));
     }
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("回复不是 JSON：{e}"))?;
-    v.pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "回复里没有 choices[0].message.content，确认这是 OpenAI 兼容接口".into())
+    extract_content(&v).ok_or_else(|| "回复里没有 choices[0].message.content，确认这是 OpenAI 兼容接口".into())
 }
 
 /// 测试连接：发一句很短的话，返回耗时和回复开头。
@@ -254,15 +383,16 @@ pub fn test_connection(settings: &LlmSettings) -> Result<String, String> {
     if settings.base_url.trim().is_empty() || settings.model.trim().is_empty() {
         return Err("请先填写地址和模型名".into());
     }
+    // 不发 max_tokens：OpenAI 推理模型不认它（要 max_completion_tokens），而且推理模型
+    // 16 个 token 可能全花在思考上、正文为空。
     let body = serde_json::json!({
         "model": settings.model.trim(),
         "stream": false,
-        "max_tokens": 16,
         "messages": [{"role": "user", "content": "只回复两个字：你好"}]
     });
     let start = std::time::Instant::now();
-    let reply = chat(settings, &body, Duration::from_secs(30))?;
-    let head: String = reply.trim().chars().take(40).collect();
+    let reply = chat(settings, &body, Duration::from_secs(60))?;
+    let head: String = strip_think(&reply).trim().chars().take(40).collect();
     Ok(format!("连接成功，用时 {:.1} 秒，模型回复：{head}", start.elapsed().as_secs_f64()))
 }
 

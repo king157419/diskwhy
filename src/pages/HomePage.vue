@@ -5,7 +5,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import CapacityColumn, { type ColSeg } from "../components/CapacityColumn.vue";
 import { gbNum } from "../capacity";
-import { CLEAN_CAT_NAME, driveName } from "../labels";
+import { CLEAN_CAT_NAME, driveName, interruptedCause, interruptedLine, whenText } from "../labels";
 import { NARROW_QUERY, useMedia } from "../layout";
 import type { DriveInfo } from "../api";
 import { elapsedText, filesCount, scanSegs } from "../scanview";
@@ -14,10 +14,12 @@ import {
   actEnv,
   cancelling,
   doCancel,
+  doDismissInterrupted,
   doScan,
   drive,
   drives,
   goExplore,
+  interrupted,
   message,
   page,
   phase,
@@ -44,7 +46,13 @@ function pick(d: DriveInfo) {
   menu.value = false;
   if (!isCur(d)) void switchDrive(d.root);
 }
+// ── 上次清理中断（阶段 J §3 决定 0）：一行小字，点开看时间 / 处理了多少 / 原因，「知道了」收起 ──
+const intrOpen = ref(false);
+const gbOf = (b: number) => gbNum(b) + " GB";
 function onDoc(e: Event) {
+  if (intrOpen.value && !(e instanceof MouseEvent && (e.target as Element | null)?.closest?.(".intr"))) {
+    if (!(e instanceof KeyboardEvent) || e.key === "Escape") intrOpen.value = false;
+  }
   if (!menu.value) return;
   if (e instanceof KeyboardEvent && e.key !== "Escape") return;
   if (e instanceof MouseEvent && (e.target as Element | null)?.closest?.(".drv-wrap")) return;
@@ -190,6 +198,18 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
     </section>
 
     <div class="foot">
+      <span v-if="interrupted" class="intr">
+        <button class="intr-btn" :aria-expanded="intrOpen" @click="intrOpen = !intrOpen">
+          <span class="dot review"></span>{{ interruptedLine(interrupted) }}<svg class="i" viewBox="0 0 24 24"><path :d="intrOpen ? 'm18 15-6-6-6 6' : 'm9 18 6-6-6-6'" /></svg>
+        </button>
+        <span v-if="intrOpen" class="intr-pop" role="dialog" aria-label="上次清理中断">
+          <span class="ir"><i>开始</i><b class="num">{{ whenText(interrupted.started) }}</b></span>
+          <span class="ir"><i>已处理</i><b class="num">{{ interrupted.processed.toLocaleString("zh-CN") }} / {{ interrupted.total.toLocaleString("zh-CN") }} 个 · {{ gbOf(interrupted.processed_bytes) }}</b></span>
+          <span class="ir"><i>原因</i><b :title="interrupted.exit_code ? `退出码 ${interrupted.exit_code}` : undefined">{{ interruptedCause(interrupted) }}</b></span>
+          <button class="ok" @click="intrOpen = false; void doDismissInterrupted()">知道了</button>
+        </span>
+        <i v-if="foot || scanning">/</i>
+      </span>
       <template v-if="foot">
         <span>扫描完成</span><i>/</i><span class="num">{{ foot.dur }}</span><i>/</i><span class="num">{{ foot.when }}</span>
         <template v-if="expired"><i>/</i><button class="foot-link" @click="page = 'quarantine'">暂存区 {{ expired }} 批到期</button></template>
@@ -350,6 +370,100 @@ const expired = computed(() => actEnv.value?.expired_batches ?? 0);
 .sw-C {
   background: linear-gradient(135deg, #d4f24c 50%, #141412 50%);
   border-color: #141412;
+}
+
+/* ── 上次清理中断：一行小字 + 点开的小卡片 ── */
+.intr {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+}
+.intr-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-meta);
+  color: var(--review-label);
+  font-weight: var(--w-med);
+}
+.intr-btn .dot {
+  width: 7px;
+  height: 7px;
+}
+.intr-btn .i {
+  width: 13px;
+  height: 13px;
+  opacity: 0.7;
+}
+.intr-btn:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.intr-pop {
+  position: absolute;
+  left: -14px;
+  bottom: calc(100% + 12px);
+  z-index: 30;
+  width: 300px;
+  padding: 14px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop);
+  white-space: nowrap;
+  animation: menu-in var(--dur-2) var(--ease);
+}
+[data-theme="C"] .intr-pop {
+  border: 2px solid #141412;
+  box-shadow: 4px 4px 0 #141412;
+}
+.intr-pop .ir {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: var(--fs-sub);
+}
+.intr-pop .ir i {
+  font-style: normal;
+  width: 44px;
+  flex: none;
+  color: var(--ink3);
+  font-size: var(--fs-meta);
+}
+.intr-pop .ir b {
+  font-weight: var(--w-med);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.intr-pop .ok {
+  align-self: flex-end;
+  margin-top: 6px;
+  height: 28px;
+  padding: 0 14px;
+  border-radius: var(--r-pill);
+  border: var(--bw) solid var(--line2);
+  font-size: var(--fs-sub);
+  font-weight: var(--w-semi);
+  color: var(--ink);
+}
+.intr-pop .ok:hover {
+  background: var(--hover);
+}
+[data-theme="C"] .intr-pop .ok {
+  box-shadow: 2px 2px 0 #141412;
+}
+[data-theme="C"] .intr-pop .ok:hover {
+  background: var(--accent);
+}
+[data-theme="C"] .intr-btn {
+  color: #141412;
+}
+[data-theme="C"] .intr-btn .dot {
+  border: 1.5px solid #141412;
 }
 
 /* ── 右：所扫盘的容量柱 ── */

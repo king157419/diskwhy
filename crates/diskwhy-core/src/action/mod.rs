@@ -110,6 +110,9 @@ pub struct ByDest {
     pub permanent: CountBytes,
     pub recycle: CountBytes,
     pub quarantine: CountBytes,
+    /// 本该进回收站、却被 Windows 直接删掉的（回收站没收）。不算进 `permanent`，单独报告。
+    #[serde(default)]
+    pub nuked: CountBytes,
 }
 
 impl ByDest {
@@ -124,6 +127,7 @@ impl ByDest {
         self.permanent.merge(&o.permanent);
         self.recycle.merge(&o.recycle);
         self.quarantine.merge(&o.quarantine);
+        self.nuked.merge(&o.nuked);
     }
 }
 
@@ -387,6 +391,19 @@ impl Plan {
             Strategy::RecycleBin => Dest::Recycle,
             Strategy::Quarantine { .. } => Dest::Quarantine,
             Strategy::Permanent => Dest::Permanent,
+        }
+    }
+
+    /// 这次实际用了哪些方式（写进动作日志的 `method` 和 last-run.json）：全是直接删除时写“直接删除”，
+    /// 可放心清理直接删、需你判断按策略时两段都写；否则就是策略本身。
+    pub fn method_label(&self) -> String {
+        let live = || self.items.iter().filter(|i| i.blocked.is_none() && (!self.preflight_done || i.will_delete().next().is_some()));
+        let safe_direct = live().any(|i| self.dest_for(i) == Dest::Permanent && i.tier == Tier::Safe);
+        let other = live().any(|i| self.dest_for(i) != Dest::Permanent);
+        match (safe_direct, other, &self.strategy) {
+            (true, false, _) | (_, _, Strategy::Permanent) => "直接删除".into(),
+            (true, true, s) => format!("可放心清理直接删除，需你判断{}", s.label()),
+            (false, _, s) => s.label(),
         }
     }
 

@@ -1,0 +1,548 @@
+{
+  "summary": "DiskWhy phase J: confirm-dialog/execution UI (F1) + small backend fix, real-exe verification, adversarial review, fix, re-verify, Fable sign-off",
+  "agentCount": 9,
+  "logs": [
+    "review findings: safety=7, concurrency=14, ux=12"
+  ],
+  "result": {
+    "f1": "F1 (the cleanup and execution UI) is done. `npm test` passes (72/72) and `npm run build` passes. I also ran your current backend in the existing debug exe through UI Automation, but only up to the confirm dialog: no cleanup was run, nothing was authorized and no files were touched.\n\n**Files changed**\n- `src/api.ts`: types and wrappers for every new or changed command, event and field in the backend contract, including the new skip codes.\n- `src/store.ts` (preview/execute part only; F2's navigation code is unchanged):\n  - **Choosing the default destination** (§3.1/3.2): \"D 盘暂存区\" when another fixed drive has room and its folder works or can be authorized; otherwise \"回收站\".\n  - `prepare_quarantine` is only called when 需你判断 items are checked, so `D:\\DiskWhy暂存区` isn't created for nothing.\n  - **Picking from the menu:** choosing 回收站 explicitly sends `safeDirect=false`; \"授权\" calls `elevate_quarantine`; if that fails the row offers \"选文件夹…\".\n  - **Execution state lives in the store:** run, stop, the `close-blocked` listener, and re-attach on startup. Re-attach waits for the cleanup to finish before scanning, and gives up after 2 s if no progress arrives (a restore is running, not a cleanup).\n  - **Startup:** loads `last_interrupted`. The storage error message now says 暂存区.\n- `src/components/ConfirmDialog.vue`: rewritten, with three states.\n  - **Confirm:** the destination line is itself the dropdown; the old \"改放\" chip only appears when something goes to the bin; estimated time sits inside the primary button; the width is `min(540px, 100vw - 32px)`.\n  - **Skip row** (e.g. 「跳过 539 个 · 892 MB · 正在使用 ›」): it adds up exactly to the drop from the scan total (counting blocked items). Expanded, it shows a row per reason with bytes, plus 已变小 for the rest.\n  - **Running:** big number = processed GB; the bar uses cost and never goes backwards; 「剩约 N 分 · 停止」 uses a 5-second rate window; 正在停止 while stopping; a blocked close makes 停止 pulse and shows 「先停止再关」.\n  - **Done / 已停止:** big number = `freed_bytes` labelled 「C 盘多出」 (hover shows 按清理前后剩余空间实测), then only the non-zero rows.\n- `src/labels.ts`: pure helpers for all of the above, tested in the new `src/labels.exec.test.ts` (19 tests).\n- `src/main.ts`: window `error`, `unhandledrejection` and Vue's error handler all go to `log_frontend_error`.\n- `src/App.vue`: the dialog also shows when re-attaching with no preview report.\n- `src/components/TitleBar.vue`: page name is now 暂存区; ✕ during a cleanup shows the hint instead of closing.\n- `src/pages/HomePage.vue`: the quiet 「上次清理中断 · 已处理 N 个 ›」 line. Clicking it shows the time, how much was processed and the cause; 知道了 dismisses it.\n- **Theme C font gap (item 6):** `src/pages/SettingsPage.vue` and `src/pages/QuarantinePage.vue` got CSS-only changes, which are outside your file list. All settings section headings (so they match each other) and the 暂存区 page title now use the UI font in theme C, as does the title-bar name. I checked the font file directly: the Kai subset also lacks 授准备崩溃退码, so the 授权 chip and the 退出码 text use the UI font too.\n- `src/dev/mock.ts` and `src/dev/nav.ts`: mock and URL parameters for every new state. **Note:** `/src/dev/` is in `.gitignore`, so a normal commit won't include these two files.\n\n**What I ran**\n- `npm test`: \"Test Files 6 passed (6) / Tests 72 passed (72)\". `npm run build`: \"✓ built\".\n- **Screenshots:** Playwright with installed Edge on dev port 1437. 15 states × (C 1440×900, C 864×1400, A 1440×900, B 1440×900) = 60 files, plus the 暂存区 and settings pages in C, at `docs/screenshots/phaseJ-F1-*.png`. Script check: no horizontal scroll anywhere. I looked at each state and fixed two things from the first pass: the skip details listed every folder separately (now merged per group, top 12) and process names were repeated (now deduplicated).\n- **Real exe check:** the existing `target/debug/diskwhy.exe` against a dev server on 1420, with its own WebView2 folder, driven by UI Automation and captured with PrintWindow:\n  - **Scan:** C: finished.\n  - **Confirm:** 7.2 → 6.6 GB with 「跳过 835 个 · 567 MB · 正在使用」 and 「清理 6.6 GB 几秒」.\n  - **Skip expanded:** 正在使用 448/344 MB · 刚改过 328/123 MB · 没权限 57/50.5 MB · 已变小 50.2 MB · 已不在 2/16 KB.\n  - **Picked 回收站:** the line changed to 「可放心清理 进回收站」, the button to 「约 3 分钟」, and the 「回收站在 C 盘，不腾空间 [改放 D 盘]」 row and 「回收站会超上限」 note appeared. So the new arguments reach the real backend correctly.\n  - **Shutdown:** I closed the dialog and the exe. Your DiskWhy (pid 84436) was never touched and is still running.\n  - Those three captures are saved as `phaseJ-F1-exe-*-C.png`.\n- **Cleanup:** both dev servers are stopped and `dw-test-wv2-f1` is deleted.\n\n**Not verified**\n- No real cleanup, stop, done screen, real `close-blocked` event or re-attach was exercised in the exe; those states were only checked against the mock.\n- `elevate_quarantine` (needs a UAC click).\n- `prepare_quarantine` in the exe: I avoided it because it can create `D:\\DiskWhy暂存区`.\n- `log_frontend_error` in the exe.\n\n**Worth knowing**\n- **App title in the bar:** while the confirm dialog is open its dark overlay covers the title bar, so ✕ can't be clicked then. Alt+F4 and taskbar close still go through the backend's guard.\n- **Mixed fonts in the title bar:** in theme C, 暂存区 in the title bar is now in the UI font while other page names stay in Kai. Rebuilding the font subset would remove this.\n- **Default-destination side effect:** when 需你判断 items are checked, picking the default destination may create `D:\\DiskWhy暂存区` (step ② of §3.2) even if you then cancel.",
+    "rSmall": "Kimi will no longer reject the request. The backend now sends no `temperature` at all, and `cargo test -p diskwhy-core` passes. All five presets check out against official docs today. Two are worth a second look: 通义千问's address is now the \"old\" one (it still works) and OpenAI's model is a reasoning model.\n\n**Fix choice.** I dropped `temperature`, `top_p` and `max_tokens` from every request instead of relying only on retry-on-400. Kimi's docs say outright that these values are fixed, other values return an error, and you should not send them (https://platform.kimi.ai/docs/api/models-overview). OpenAI's GPT-5-family reasoning models also accept only the default temperature. As a backup, if a server answers 400 and names an optional parameter that was in the request, `chat()` removes it and retries once. Today's requests never include those parameters, so the retry is only tested at the decision level, not end to end.\n\n**Files changed**\n- `D:\\desk\\claudex\\13\\diskwhy\\crates\\diskwhy-core\\src\\explain\\llm.rs`\n  - Request body: removed `\"temperature\": 0.2`, with a comment citing the Kimi doc.\n  - Test connection: removed `max_tokens: 16`. OpenAI reasoning models don't accept `max_tokens`, and 16 tokens can all go on thinking, leaving an empty reply. Timeout raised from 30 s to 60 s, and any `<think>` part is cut from the reply preview.\n  - Retry: new `pub fn params_to_drop(body, status, err_text)` decides what to remove before the one retry.\n  - Reply text: also accepts `content` given as an array of `{type, text}` parts.\n  - `parse_answer` rewritten:\n    - removes `<think>…</think>` blocks (an unclosed one is dropped entirely);\n    - tries to read a complete JSON value from every `{`, so a code fence, reasoning text containing braces, or text after the JSON no longer breaks it;\n    - takes the last object with a non-empty `what`;\n    - accepts `confidence` as a number, `\"0.4\"`, `\"60%\"` or 0–100, and treats `null` fields as empty.\n  - Public signatures used by `src-tauri` are unchanged.\n- `D:\\desk\\claudex\\13\\diskwhy\\crates\\diskwhy-core\\tests\\explain_tests.rs`\n  - The existing end-to-end test now also checks that the request actually sent has no `temperature`, `top_p` or `max_tokens`.\n  - New tests:\n    - `llm_request_body_sends_no_sampling_params`\n    - `llm_preset_urls_build_official_endpoints`\n    - `llm_parse_tolerates_fences_reasoning_and_think`\n    - `llm_retry_drops_only_params_the_server_named` (uses Kimi's and OpenAI's real error wording)\n    - `llm_test_connection_sends_no_max_tokens_and_strips_think` (against the local fake server)\n\n**What I ran**\n- `cargo test -p diskwhy-core --test explain_tests llm` → `test result: ok. 10 passed; 0 failed`\n- `cargo test -p diskwhy-core` (with `CARGO_INCREMENTAL=0`):\n  - lib: 20 passed\n  - action_tests: 41 passed\n  - bench_tests: 0 passed, 1 ignored\n  - crash_tests: 4 passed\n  - dedup_tests: 5 passed, 1 ignored\n  - explain_tests: 39 passed\n  - mock_tests: 8 passed\n  - real_fs_tests: 6 passed\n  - 0 failed anywhere\n- `cargo clippy -p diskwhy-core --tests` showed no warnings for llm.rs.\n- I POSTed to each real endpoint without a key, built the way `chat_url` builds it:\n  - `https://api.deepseek.com/chat/completions` → HTTP 401 \"Authentication Fails\"\n  - `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions` → 401 (no API key)\n  - `https://api.moonshot.cn/v1/chat/completions` → 401 \"Incorrect API key provided\"\n  - `https://api.openai.com/v1/chat/completions` → 401 (no API key)\n\n  A 401 rather than a 404 means each path exists. `https://ollama.com/library/qwen2.5:7b` → HTTP 200.\n\n**Preset check**\n\n| Preset | Result | Source |\n|---|---|---|\n| DeepSeek `https://api.deepseek.com` + `deepseek-flash` | Correct. The docs list `deepseek-flash` and `deepseek-v4-pro`; the endpoint is `POST /chat/completions`. | https://api-docs.deepseek.com/ and https://api-docs.deepseek.com/api/create-chat-completion |\n| Kimi `https://api.moonshot.cn/v1` + `kimi-k2.6` | Correct. The old `platform.moonshot.cn` docs link redirects to `platform.kimi.com`. | https://platform.kimi.com/docs/api/chat |\n| OpenAI `https://api.openai.com/v1` + `gpt-5.4-mini` | Correct; the model exists (snapshot `gpt-5.4-mini-2026-03-17`). It is a reasoning model, which is why `max_tokens` and `temperature` were removed. | https://developers.openai.com/api/docs/models/gpt-5.4-mini |\n| Ollama `http://localhost:11434/v1` + `qwen2.5:7b` | Correct. | https://ollama.com/library/qwen2.5:7b |\n| 通义千问 `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus` | Works today. The docs now call this an existing domain that still works but recommend the per-account Beijing address `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`. That address needs each user's own ID, so it can't be a fixed preset; I'd keep the current one. `qwen-plus` is still valid. | https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope |\n\n**Not done / uncertain**\n- I have no API keys, so no real successful call was made to any provider.\n- Kimi's fixed temperature (1.0 in thinking mode, 0.6 otherwise, other values give a 400) comes from Kimi's own docs above. The exact error wording used in my retry test comes from a GitHub issue (https://github.com/MoonshotAI/kimi-cli/issues/1924), not official docs.\n- The docs page fetch for `gpt-5.4-mini` timed out. That OpenAI reasoning models reject `max_tokens` is from general knowledge and community threads, not a docs page I read today.\n- I created no test directories, and I didn't touch the frontend or commit anything.",
+    "verify1": "**Phase J real-exe verification, round 1**\n\nMost of the user's complaints check out on the real exe. The release build, `cargo test` and `npm test` all pass. Two things are not fully right: the numbers shown before a cleanup can promise much more space than it frees, and log rotation can wipe the user's 138 MB `actions.log`, which is the evidence of the 06:19 interrupted run. One test leftover could not be removed: the empty folder `C:\\DiskWhy暂存区`. Please run `rmdir \"C:\\DiskWhy暂存区\"`.\n\n## Build and tests\n- **Release build** (`npm run tauri build -- --no-bundle`): exit 0 in 271 s. `vite ✓ built in 422ms`, `Finished release profile [optimized + debuginfo] in 4m 25s`.\n  - `D:\\desk\\claudex\\13\\diskwhy\\target\\release\\diskwhy.exe` is 14,296,064 bytes; `diskwhy.pdb` is 32,378,880 bytes.\n- **`cargo test --workspace -- --test-threads=1`** with the cross-drive test folder on D:: exit 0 in 181 s. **128 passed, 0 failed, 2 ignored.**\n  - lib 1; core unit 20; action_tests 41 (112.48 s); bench 0 passed, 1 ignored; crash 4; dedup 5 passed, 1 ignored; explain 39; mock 8; real_fs 6; zz_review_delsafety_probe 4.\n- **`npm test`**: `Test Files 6 passed (6)`, `Tests 72 passed (72)`.\n\n## Checklist (screenshots are in `docs/screenshots/phaseJ-R1-*.png`)\n| Complaint | Result | Evidence |\n|---|---|---|\n| 能选盘 | PASS | `drivemenu-{C-1440,C-864,C-720,A-1440,B-1440}`. Picking \"D 盘\" while C: was still scanning cancelled that scan and started scanning D: (`switch-D-scanning`). |\n| 预估时间 | PASS | Real C: dialog shows \"清理 6.6 GB · 几秒\". Synthetic run showed \"约 30 秒\"; it actually took 33.2 s (log `用时 33218 毫秒`, 33.5 s on screen). |\n| 进度条按耗时 | PASS | `exec-running` at 2.8 s: bar about 7% while bytes were 0.69 of 2.3 GB. Countdown went 30→25→20→15 s, then \"快好了\" at 18.4 s; finished at 33 s. I did not sample the bar's value to prove it never goes backwards. |\n| 能停止 | PASS | `exec-stopped`: \"已停止\", \"没处理 408,781 个\". Files left on disk: 408,801 = 408,781 + 20 skipped \"刚改过\" files. Backend stopped about 0.1 s after the press; the stopped screen appeared about 3 s later. |\n| 清理中拦关窗 | PASS (WM_CLOSE only) | `exec-closeblocked`: window stayed open, \"停止\" highlighted, \"先停止再关\" shown; crash.log got \"close-blocked pid=78192\". I did not try the title-bar ✕ during a run. |\n| 改放 D 盘可用 | PASS with caveat | Real C: with a 需你判断 item shows \"D 盘暂存区要授权 · 授权\" and the 清理 button is disabled, so no dead end. I did not approve UAC (per rules). The \"其他文件夹…\" route works: 2000 files staged to D:, then restored 2000 files / 307,200,000 bytes (`exec-confirm-folder`, `exec-stash`, `exec-restored`). |\n| 竖屏不变形 | PASS | All pages at 864×1400 and 720×640 (`*-C-864`, `*-C-720`). Cosmetic: at 864 the home card has a large empty top half. |\n| 分析页能选 C:\\ 根和 Users | PASS | `explore-root-*` shows \"C: 15 项 · 176 GB\"; `explore-users-*` shows \"Users 5 项 · 86.5 GB\", in all themes and sizes. |\n| 方块图图例 | PASS | `legend-C-1440`: 5 rows, theme C stripes are real stripes. |\n| 设置页改名加说明 | PASS | \"AI 识别\" with ?, \"扫描结果 保存/打开\" with ?, \"暂存区\" with ? (`settings-help*`). The AI ? text was not captured, because only one help text opens at a time. |\n| 说清了的 GB = 真腾出的空间 | PASS for the done page, FAIL for the before-run promise | See the next section. |\n| 30.1→29.3 有解释 | PASS | Real C:: home 7.2 GB → dialog 6.6 GB with \"跳过 1,012 个 · 594 MB · 正在使用\". Expanded: 316 MB in use + 181 MB recently changed + 50.5 MB no permission + 45.9 MB shrank ≈ 593 MB (`confirm-skip-C-1440`). |\n| 速度 | PASS | 408,781 direct deletes in 33.2 s, about 12.3k files/s on 16 threads, against 85–185 files/s for the old engine. |\n\nAll five pages in themes A and B at 1440 were captured and checked: home, cleanup, confirm, explore, settings and 暂存区.\n\n## Freed space: done page vs before-run promise\n| | Done page | Backend log | My measured D: change | Shown as direct delete |\n|---|---|---|---|---|\n| Run 1 (stopped) | 0.30 GB | 319,938,560 bytes | 319,668,224 bytes | 458 MB |\n| Run 2 (finished) | 0.10 GB | 108,576,768 bytes | 108,490,752 bytes | 1.56 GB |\n\n- The big number on the done page matches reality to within 0.1%.\n- Before the runs, the dialog promised \"D 盘剩余 25.7 → 27.4 GB\" and the cleanup page said \"能腾出 2.3 GB\". The two runs actually freed about 0.42 GB in total.\n- **Cause:** files under about 700 bytes live inside the disk's file table (the NTFS MFT) and take no clusters, but they are counted as 4 KB each. My 64-byte test files exaggerate this; real caches have fewer such tiny files.\n- The done page shows \"直接删除 1.56 GB\" right next to \"0.10 GB 多出\" with nothing explaining the gap.\n\n## Other problems found (source not edited)\n1. **Log rotation can wipe the user's evidence log.** Rotation keeps only one old copy and runs every time the log is opened (each cleanup and each restore).\n   - My first run moved the user's 138,623,123-byte `actions.log` (from 06:19:47) to `actions.1.log`.\n   - My two runs then grew the new log to 156 MB in one go, because size is only checked when the log is opened.\n   - The restore that followed rotated again and overwrote `actions.1.log`.\n   - So in this sandbox's view of %LOCALAPPDATA%, the user's original log is gone. I cannot tell whether the real file outside the sandbox is affected; please check `%LOCALAPPDATA%\\DiskWhy\\actions.log` on the real machine.\n2. **Opening the confirm dialog creates a folder at the drive root.** With a 需你判断 item checked, just opening the dialog created `C:\\DiskWhy暂存区`, because ordinary users can create folders at C:\\.\n   - When the scanned drive is D:, the default 暂存 target is C:, which has only about 5 GB free.\n   - The folder is empty, created 20:10:45; the harness blocked me from deleting a path at C:\\ root.\n3. **Old wording in the done-page notes.** The notes (shown on hover over \"注意 N 条\") still say \"隔离区\", and \"隔离区保留 7 天（不会自动删）\" contradicts the settings text \"删掉的先放这里 7 天\".\n4. **Wrong method label in the log.** For a run where everything was deleted directly, `actions.log` and `last-run.json` record the method as \"回收站\".\n5. **About 3 s delay** between the backend finishing and the done/stopped screen appearing, probably the rescan after a run.\n6. **Theme C dropdown:** when the 去向 pill is open its background turns yellow and the yellow \"可放心清理\" dot disappears into it.\n7. **Unexplained exit.** My first test window (PID 102336) disappeared at about 20:03 while idle on the cleanup page. There was no crash.log line, no Program Compatibility Assistant log entry and no Windows error report. Three later launches each ran normally and exited 0 when closed.\n\n## Not verified\n- The 授权 / UAC path for the D: 暂存区 (approving UAC was not allowed).\n- Title-bar ✕ during a run.\n- The \"上次清理中断\" notice: nothing showed for the user's real 06:19 run, because the old build never wrote `last-run.json`.\n- The \"改放 D 盘\" chip for a nearly full recycle bin: it never appeared, because safe items no longer go to the recycle bin.\n\n## How the run test differed from the brief\n- Because the test data sat on D:, the default 暂存 target was C:, so I switched to \"其他文件夹…\" → `D:\\desk\\claudex\\13\\dw-test-q-1` through the native folder picker.\n- I added 300,000 more tiny files (450,050 cache files in total) so the run lasted long enough to show \"剩约\" and to stop it partway.\n\n## Files and cleanup\n- **Changed:** only 68 new screenshots `docs/screenshots/phaseJ-R1-*.png`. No source edits, no git operations. Helper scripts are in the scratchpad (`dwui.py`, `r1_*.py`).\n- **Not mine:** untracked `src/labels.exec.test.ts` and `crates/diskwhy-core/tests/zz_review_delsafety_probe.rs` belong to another lane.\n- **Removed:**\n  - The test folders and test WebView2 folders on D:.\n  - The demo rule.\n  - The files the test exes created: `crash.log`, `last-run.json`, `perf.json`, `quarantine-roots.json`, and the two action logs, which by then held only test records.\n- **Left in place:**\n  - `ui.json`, unchanged (theme C).\n  - The user's DiskWhy (PID 84436), not touched.\n  - No recycle bin was used.\n  - The empty `C:\\DiskWhy暂存区` (see the top of this report).",
+    "reviews": [
+      {
+        "lens": "safety",
+        "findings": [
+          {
+            "severity": "critical",
+            "file": "crates/diskwhy-core/src/action/winops.rs",
+            "line": 422,
+            "title": "Recycle mode silently and permanently deletes a whole batch (or whole folder) when any path is 260 characters or longer",
+            "evidence": "Phase J removed FOF_WANTNUKEWARNING from RECYCLE_FLAGS. The pre-filters (RecycleBinInfo::refuse, which skip_unrecyclable at preflight.rs:450 and bin_refuse at execution both use) only check the size against MaxCapacity and the NukeOnDelete / NoRecycleFiles settings. They never check path length. I ran a temporary probe (deleted afterwards) under D:\\desk\\claudex\\13\\dw-test-delsafety, calling winops::recycle_items on single files: path lengths 240/255/258/259 gave Recycled; lengths 260/261/262 gave Deleted, with no record in D:\\$Recycle.Bin. End-to-end run of action::execute with a hand-built Review-tier PlanItem, Strategy::RecycleBin, 20 short files in sub\\, 1 file at a 290+ character path and 1 top-level short file: (a) dir_recycle=false printed `exec ok=22 ... by_dest permanent count 22, recycle 0` and `PERMANENTLY GONE (not in bin) = 22`. All 21 short-path files in the same 256-entry IFileOperation batch were nuked along with the long one. (b) dir_recycle=true printed `by_dest permanent 21, recycle 1`, `PERMANENTLY GONE = 21`, so the whole sub\\ folder was nuked by the whole-folder recycle. (c) Control without the long file: all 21 recycled, 0 gone. Restores ran and a final check printed `OURS STILL IN BIN = 0`.",
+            "failure_scenario": "The user picks 回收站 (or there is no other drive, so recycle is the default for 需你判断 items). A review item (a project folder, a downloads folder, anything holding a deep node_modules or long names) contains one file whose full path is 260 characters or longer. That file's 256-entry chunk, or the whole ≤1 GB folder chosen for whole-folder recycle, is permanently deleted with no prompt. The user believes everything is in the Recycle Bin, but the files cannot be recovered. With the old flag the worker would have hung on an invisible dialog instead; now it destroys data.",
+            "suggested_fix": "In RecycleBinInfo::refuse / skip_unrecyclable and in execute's bin_refuse, treat any path with ≥ 259 characters (MAX_PATH including the NUL) as RecycleUnavailable ('路径太长，进不了回收站'). In dir_units / try_recycle_dir, reject any subtree whose longest descendant path is ≥ 259 characters, and recheck that against the list_tree result. As defence in depth, recycle in batches of 1 when any path in the batch is near the limit, and add a regression test that mirrors the probe above (long path plus short siblings in recycle mode must give 0 permanently deleted)."
+          },
+          {
+            "severity": "medium",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 694,
+            "title": "Report misstates outcome: shell-nuked review files and removed links are reported as 'safe caches directly deleted'",
+            "evidence": "The note '可放心清理的缓存已直接删除（会自动重建），没有进回收站。' is pushed whenever `by_dest.permanent.count > 0 && plan.safe_direct`. Dest::Permanent also collects RecycleOutcome::Deleted (nuked) entries from flush_recycle and try_recycle_dir, and every link removed by do_link (entry_dest returns Permanent for links in recycle mode). In the e2e probe the plan had only Review-tier items, yet the notes were ['可放心清理的缓存已直接删除…', '有 22 个文件回收站没收（太大或回收站已关）…']. The nuke note also gives the wrong cause ('太大或回收站已关'): the real cause was the path length.",
+            "failure_scenario": "The completion page tells a non-technical user that 'auto-rebuilding caches' were directly deleted, while the user's own review files were silently destroyed. Also, any review plan containing a junction shows the safe-cache note even though no safe item existed.",
+            "suggested_fix": "Count nuked entries separately (by_dest.nuked or a reason code) instead of folding them into permanent. Gate the safe-direct note on permanent-delete successes from Tier::Safe items only. Give the nuke note a cause-neutral text, or the real cause."
+          },
+          {
+            "severity": "medium",
+            "file": "crates/diskwhy-core/src/action/preflight.rs",
+            "line": 523,
+            "title": "Live-Chromium-cache guard runs only at preflight; POSIX direct delete at execute will remove caches of a browser started after preflight",
+            "evidence": "skip_live_chromium_caches (Restart Manager query on index/data_N/the-real-index) runs once inside preflight_with. execute::permanent() opens with DELETE and full sharing, then sets FILE_DISPOSITION_FLAG_DELETE | POSIX_SEMANTICS. Chromium opens cache files with FILE_SHARE_DELETE, so the open succeeds and the name disappears immediately. There is no lock probe or Restart Manager check at execute time for the Permanent dest (the recycle path at least gets a shell failure plus delete_probe). The safe tier (Chromium caches) is exactly the tier that now goes to Permanent by default. Also, if rm_locking_processes fails, the check returns an empty list, so it fails open.",
+            "failure_scenario": "The user opens the confirm dialog (preflight finishes with Chrome / Edge / VS Code / WebView2 apps closed), then starts the browser and clicks 清理 minutes later. The safe-tier cache files of the now-running browser are POSIX-deleted from under it. This is the PHASE_J_CRASH 隐患 5 corruption the guard was meant to prevent.",
+            "suggested_fix": "Before running units, re-run skip_live_chromium_caches (or a cheap RM check of the index files) on a clone of the plan's cache directories and turn hits into Skip(Locked). Or recheck per cache-directory unit just before its first delete. Treat an RM error as 'assume live' (fail closed) for these directories."
+          },
+          {
+            "severity": "medium",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 1240,
+            "title": "Whole-folder recycle verifies each file before listing, leaving a long window in which modified files (hot-window guard) are swept",
+            "evidence": "try_recycle_dir runs reverify() on every entry of the subtree first (the subtree is ≤ 1 GB with no cap on file count; a 1 GB tree of small files can hold 100k files, which is seconds of fingerprinting), then list_tree compares only the name set, then recycle_items([dir]) runs. A file reverified early and then written to (mtime changes, so it becomes 'hot') before the folder move is not re-detected: list_tree compares names only. There is also no cancel check inside the reverify loop, which delays 停止. A file created and removed with the same name, or an empty subdirectory replaced by a same-name file, also passes the name-set equality.",
+            "failure_scenario": "In a review-tier folder being recycled, an app writes to file A after A's fingerprint was checked but before the whole-folder move. The just-modified file goes to the Recycle Bin despite guardrail 4 (skip files modified within 30 minutes). Normally it is recoverable from the bin. Combined with the path-length nuke above, it is not recoverable.",
+            "suggested_fix": "Cap whole-folder units by file count (for example ≤ 2,000), or redo a cheap pass after list_tree comparing the directory-entry mtime/size from list_dir (which list_tree already fetches) against the fingerprints, and fall back to per-file on any difference. Check sh.cancelled() inside the reverify loop."
+          },
+          {
+            "severity": "low",
+            "file": "src-tauri/src/lib.rs",
+            "line": 1242,
+            "title": "Close-guard safety valve lets the process exit mid-execution without flushing the quarantine manifest",
+            "evidence": "After 停止 plus 20 s, CloseRequested is no longer prevented, and RunEvent::ExitRequested only prevents exit while `recreating`. When acting is true it only logs. The manifest is flushed every 10 s by the timer thread and at item finalize. Nothing flushes it on exit, so up to ~10 s of add_manifest entries for files already moved into the batch folder are lost.",
+            "failure_scenario": "A cross-drive stash run is stuck (for example a large CopyFileExW, or a slow whole-folder reverify). The user presses 停止, waits 20 s and closes. Files moved in the last ≤10 s sit in D:\\DiskWhy暂存区\\<batch> but are missing from manifest.json, so 暂存区 → 还原 cannot restore them. The interrupted banner reports a stale 'processed' count (it is also updated only every 30 s, and it includes skipped entries).",
+            "suggested_fix": "In ExitRequested while acting, synchronously save the current manifest (expose a handle to Shared's manifest, or write each moved file to an append-only journal next to manifest.json). Alternatively, flush the manifest after every N moves instead of on a timer."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/quarantine.rs",
+            "line": 628,
+            "title": "Elevated helper's icacls follows reparse points and has a check-then-use race; helper accepts any SID and user-writable roots",
+            "evidence": "elevated_mkdir_from_args checks plain_dir(q) (symlink_metadata plus the REPARSE_POINT attribute) and then runs `icacls <q> /grant *SID:(OI)(CI)M` as administrator. icacls without /L acts on the target of a junction or symlink. Between the check and icacls, a same-user process that can rename X:\\DiskWhy暂存区 (for example on C:\\, where Authenticated Users can create root folders and own them) can swap in a junction to C:\\Windows\\System32. The elevated icacls then grants that user inheritable Modify there. The helper also accepts any S-1-… SID (valid_sid would accept S-1-1-0 Everyone) and any fixed drive, including roots the user can already write, where elevation is never needed.",
+            "failure_scenario": "Needs UAC consent for the DiskWhy binary, so this is local escalation only. Malware running as the user triggers or awaits 'diskwhy.exe --mkdir-quarantine C:\\ …'. If the user approves the familiar DiskWhy UAC prompt, the junction race grants rights on a system directory.",
+            "suggested_fix": "Do the ACL change in-process on a handle: CreateFileW(q, WRITE_DAC|READ_CONTROL, FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS), verify through GetFileInformationByHandle that it is a plain directory, then SetSecurityInfo on that handle. Or at least pass /L to icacls. Refuse when the non-elevated user can already create folders in the root, and refuse well-known group SIDs (only accept S-1-5-21-… user SIDs)."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 578,
+            "title": "Cancelled run still deletes the empty subfolders of unfinished items while the report says the rest was left untouched",
+            "evidence": "After the worker scope ends, every active item not yet finalized goes through finalize_item, which runs remove_dir on every empty directory in item.dirs, including items whose units never started because of cancel. The report note then says '已停止：还有 N 个没处理，原样没动。'",
+            "failure_scenario": "The user presses 停止 early. Pre-existing empty folders inside not-yet-started items are removed (logged as rmdir) even though the UI says the remaining items were left untouched. This is a minor mismatch between the on-disk state and the report.",
+            "suggested_fix": "When cancelled, only finalize items with at least one completed unit, or limit removal to directories that became empty during this run. Otherwise word the note so it covers removed empty folders."
+          }
+        ]
+      },
+      {
+        "lens": "concurrency",
+        "findings": [
+          {
+            "severity": "medium",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 525,
+            "title": "Quarantine manifest only reaches disk every 10 s; after a kill, files moved in that window are not shown and cannot be restored from the UI",
+            "evidence": "execute() saves an empty Manifest at start (line 378). After that, entries go only to the in-memory Mutex<Option<Manifest>> (add_manifest, line 1378). They are written to disk by the timer thread every manifest_flush_secs=10 (line 525), by finalize_item, and at the end (line 613). quarantine::list_batches skips any batch with no 'stored' entries (quarantine.rs:428-430). restore() only handles manifest entries; when every listed entry is back, it marks the batch restored, and the batch then disappears from list_batches.",
+            "failure_scenario": "The process is killed from outside, like the real 0x8f exit in PHASE_J_CRASH.md, during a same-volume stash running at about 5k files/s. Up to about 50k files are already renamed into <root>\\DiskWhy暂存区\\<batch>\\ but are not in manifest.json. If the kill comes before the first 10 s flush, the manifest is still empty, so list_batches hides the whole batch and every moved file is stranded. Otherwise the batch shows only the flushed part. After Restore, the batch disappears and the unrecorded files stay on that drive with nothing pointing to them. The interrupted banner does not say any files were left in the stash. The other copy of the actions.log line is also lost, because the 64 KB log buffer is flushed only every 200 ms.",
+            "suggested_fix": "Write each stored entry to an append-only journal (manifest.jsonl, opened once, appended per entry or per 256-entry chunk) and rebuild the manifest from it on load. Or flush after each chunk instead of each 10 s. Also let list_batches / restore find files under the batch dir that are not in the manifest and show them."
+          },
+          {
+            "severity": "medium",
+            "file": "src/components/TitleBar.vue",
+            "line": 25,
+            "title": "The app's own ✕ can never use the 20 s close safety valve, so a hung execution leaves the window unclosable from inside the app",
+            "evidence": "TitleBar: `else if (execPhase.value === \"running\") onCloseBlocked(); else await w.close();`. While the frontend is running, it never sends a close request, so close_should_block's CLOSE_GUARD_GIVE_UP_SECS branch (lib.rs:961-969) is reached only through Alt+F4 or the taskbar. Once stopping, ConfirmDialog shows only the '正在停止' spinner. The '先停止再关' hint and the nudged 停止 button are in the v-else branch (ConfirmDialog.vue:381-389), so a click on ✕ shows nothing. restore_batch and purge_batch hold `acting` with no cancel, so cancel_at is never set and the valve can never fire for them, not even through Alt+F4.",
+            "failure_scenario": "A worker hangs inside IFileOperation or a CopyFileExW on a dying disk. The user presses 停止 and waits more than 20 s, then clicks ✕ repeatedly. Nothing happens and nothing appears on screen. This non-technical user has no way to close the app except Task Manager, which is the same 'program vanished, no summary' situation phase J was meant to fix. A hung restore or purge cannot be closed at all.",
+            "suggested_fix": "In TitleBar, when execStopping is true (or always), call w.close() and let the backend decide: it emits close-blocked, or lets the close through after the valve. Show a stopping-state hint. Give restore and purge their own valve, or arm cancel_at when a close is blocked while acting and no exec_cancel exists."
+          },
+          {
+            "severity": "medium",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 515,
+            "title": "'上次清理中断 · 已处理 N 个' comes from last-run.json, which is updated only every 30 s, so N can be hundreds of thousands too low",
+            "evidence": "run_state('running') is saved at start with processed=0 (line 489) and then only in the heartbeat branch every heartbeat_secs=30 (lines 515-524). runstate::interrupted returns s.processed unchanged, and interruptedLine shows it. The benchmark says direct delete runs at about 16.7k files/s.",
+            "failure_scenario": "The app is killed 25 s into a direct-delete run, before the first heartbeat. Next launch shows '上次清理中断 · 已处理 0 个' even though about 400k files were deleted. Even after heartbeats, the count can be 30 s stale, up to about 500k files at direct-delete speed. This is the number phase J added to tell the user how much really happened.",
+            "suggested_fix": "Update last-run.json on the progress tick every 1–2 s (it is tiny and written atomically by tmp+rename). Or count the batch's ok and skipped lines in actions.log on next launch, which the start/batch_begin records already make possible."
+          },
+          {
+            "severity": "medium",
+            "file": "src-tauri/src/lib.rs",
+            "line": 783,
+            "title": "exec_progress / last_exec_report return an earlier execution's data during a restore or purge, so attachExec shows a fake cleaning run and an old completion page",
+            "evidence": "exec_progress returns state.exec_progress whenever `acting` is true (lines 783-788). That field is cleared only at the start of execute_plan (line 715) and never when it ends. restore_batch and purge_batch also set acting. attachExec (store.ts) treats any non-null exec_progress as a live execution: it sets execPhase='running', and when acting drops it calls lastExecReport(), which still returns the earlier report, and shows it with execPhase='done'.",
+            "failure_scenario": "In one session the user cleans, then starts a stash restore. During the restore the WebView2 browser process dies and the window is rebuilt, or the renderer reloads. init() → actionStatus() true → attachExec. The modal '正在清理' appears frozen at the old run's final bytes and percentage. When the restore finishes, it shows the old run's '清理完成 · C 盘多出 X GB' as if it had just happened.",
+            "suggested_fix": "Clear exec_progress, or tag it with the batch or an 'exec running' flag, when execute_plan finishes. Have exec_progress return None unless an execution (not a restore or purge) is in progress, for example by keeping an enum of the current action instead of a bare `acting` bool."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 527,
+            "title": "The timer thread saves the full manifest synchronously, which stalls progress, log flushing and the cancel signal; concurrent saves can also write an older snapshot over a newer one",
+            "evidence": "On the 200 ms progress thread, save_manifest clones the whole Manifest under the manifest lock (line 309), which blocks every worker's add_manifest. It then serializes and writes the full JSON (quarantine.rs:87-93; their own comment says about 80 MB at 200k entries) every 10 s and again in each finalize_item. While this runs, the thread emits no progress, does not flush the log, sends no heartbeat, and does not forward cancel to cancel_i32. save_manifest clones before taking manifest_io, so timer and finalizer can each clone, the newer one writes first, and then the older one overwrites it.",
+            "failure_scenario": "A same-volume stash of 300k files. Every 10 s the progress bar and '剩约' freeze for about 1–2 s, the rate window gets distorted, the log buffer stays unflushed longer (more is lost on a kill), and the total manifest I/O grows quadratically (GBs written). With the ordering race, a crash right after an older snapshot overwrote a newer one loses more entries than 10 s' worth.",
+            "suggested_fix": "Take manifest_io before cloning so saves are ordered, or keep a version counter and skip stale writes. Move the manifest save to its own thread, or use an append-only journal so the save is O(new entries)."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 1134,
+            "title": "Perf learning counts the full file size as copied even for skipped, failed and cancelled cross-volume entries; a cancelled run then permanently skews est_secs",
+            "evidence": "After every Quarantine entry, whatever the outcome (reverify skip, hardlink skip, copy_cancelled, failed), run_files does `meas.xvol.0 += 1; meas.xvol.1 += ms(t); meas.xvol.2 += e.size` (lines 1134-1137). execute() calls model.learn() even when cancelled (line 732). learn() derives one k = actual/pred for every op and moves xvol_mb_s by /k once xvol_bytes ≥ 64 MB (perf.rs:238-266). The post-cancel serial finalize_item list_dir sweep (line 578) adds wall time that the model does not include.",
+            "failure_scenario": "The user stops a cross-drive stash 1 s into a 4 GB file. pred ≈ 27 s, actual ≈ 1 s, so k is clamped to 0.2. xvol_mb_s goes from 150 to about 330, and every op type with ≥200 samples drops to ×0.76. The next confirm dialog's '约 N 分钟' is far too short. If the stop instead lands while finalize scans thousands of non-empty dirs, k goes up and the estimate gets inflated.",
+            "suggested_fix": "Count xvol bytes only for successful copies (and partial bytes from the CopyFileExW progress routine if wanted). Skip learn() when cancelled, or learn only from the per-op busy times in Measured instead of one wall-clock k."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 561,
+            "title": "A panic in a worker is swallowed: its unit is reported as 'not processed / 原样没动' even though files in it may already be deleted, with cancelled=false",
+            "evidence": "Worker handles are joined with `let _ = h.join();` (lines 561-563), and the panic hook only logs (crash.rs:150-169; release profile uses unwind). The panicked unit's parts[u] stays None, so the merge step runs account_untouched on it (lines 569-576). That records every Delete entry as not_processed and writes a 'cancel' log line saying '已停止：… 原样没动'. remaining[item] never reaches 0, so the main thread finalizes that item. Nothing in rep.notes mentions it.",
+            "failure_scenario": "A shell extension or a bug panics a worker halfway through a 256-entry recycle chunk after 200 files were already recycled. The done page shows '没处理 256 个', the log claims they were untouched, and the title says 清理完成, not 已停止. The user is told files are still in place when they are actually in the Recycle Bin or deleted.",
+            "suggested_fix": "Check h.join() results. On Err, add a note to the report ('一个线程出错，这一块的结果不确定，请看日志'), log a distinct op (not 'cancel'), and account that unit as 'unknown', not 'untouched'. Or wrap run_unit in catch_unwind and keep the Part built so far."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 558,
+            "title": "If the first worker cannot be spawned, execute() hangs forever because thread::scope waits on the timer thread",
+            "evidence": "Inside std::thread::scope, `Err(e) => panic!(\"起不了工作线程：{e}\")` runs when handles is empty (line 558). On a closure panic, std::thread::scope still waits for all spawned threads before propagating it. The timer thread loops `while !all_done_r.load(..)`, and all_done is set only after the joins (line 564), which this path never reaches.",
+            "failure_scenario": "Thread creation fails, for example under address-space or commit pressure on the 8 MB stack request. execute_plan never returns, `acting` stays true forever, close is blocked with no cancel_at (the cancel flag does nothing because no worker is running), and the UI sits at 0% indefinitely.",
+            "suggested_fix": "Set all_done before panicking, or return an Err instead of panicking; for example, compute the worker handles first and set all_done in a drop guard inside the scope closure."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 1272,
+            "title": "Whole-folder recycle that fails partway falls back to per-file processing, which mislabels files already in the Recycle Bin as 'skipped · 已经不在了'",
+            "evidence": "try_recycle_dir returns false on any non-Recycled/Deleted outcome (`_ => return false`, line 1276). recycle_items reports the folder as Failed if the folder path still exists (winops.rs:627-631), even if IFileOperation already moved part of the subtree. run_unit then calls run_files on the same entries (line 818). For moved files reverify gets ERROR_FILE_NOT_FOUND → SkipReason::Missing.",
+            "failure_scenario": "A whole-folder recycle where one file got locked after verification. The shell recycles some children and then stops, so the folder remains and the result is Failed. Per-file fallback counts the already-recycled files as skipped/missing. by_dest.recycle and '回收站 X GB' are too low, '跳过 · 已经不在了' is too high, and the log has no recycle record for files that really are in the bin. Unverified: depends on whether the shell recycles a folder partially or all-or-nothing.",
+            "suggested_fix": "After a failed whole-folder recycle, check which entries vanished and treat those as Recycled (the PostDeleteItem sink already reports per-item results), or log them as 'recycled (dir partial)' instead of falling through to Missing."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 578,
+            "title": "Stop still deletes pre-existing empty subfolders in items it never touched, and does it as a long serial sweep after the stop",
+            "evidence": "After the scope, every active item not yet finalized goes through finalize_item on the main thread (lines 578-583). That includes items whose units were never started because of the cancel. finalize_item list_dir's every entry in item.dirs and removes any that are empty (lines 1314-1345), including folders that were empty before the run. The real run had 23,752 rmdir records, so this sweep can be tens of thousands of list_dir calls on one thread after 停止.",
+            "failure_scenario": "The user presses 停止 early. The dialog keeps showing '正在停止' for many seconds while the main thread walks every directory of every item. The run also removes empty folders in items that '原样没动' was supposed to leave alone. dirs_removed counts them, and they are not shown as not_processed.",
+            "suggested_fix": "On cancel, finalize only items that had at least one unit run (track a per-item 'started' flag). Leave the others alone, as promised."
+          },
+          {
+            "severity": "low",
+            "file": "src-tauri/src/lib.rs",
+            "line": 746,
+            "title": "After execute returns, the post-run refresh holds `acting` with exec_cancel/cancel_at reset, so close is blocked again with no valve and 停止 is a no-op",
+            "evidence": "execute_plan sets exec_cancel=None and cancel_at=None (lines 746-747), then runs refresh_after (rescans plus a full-tree analyze) while the Acting guard is still alive. close_should_block then returns true with cancel_at=None, and cancel_execute returns false. The frontend still shows execPhase='running' with a 停止 button, and stopExec leaves execStopping=true.",
+            "failure_scenario": "After a large run, the refresh on a 1M-file C: tree takes several seconds. The user presses 停止, which shows '正在停止' and does nothing, and ✕ or Alt+F4 are blocked even if the 20 s valve had already been armed during the run. Annoying and confusing rather than harmful.",
+            "suggested_fix": "Drop `acting`, or switch to a non-blocking 'refreshing' state, before refresh_after. Or keep cancel_at armed and send a final progress event telling the UI the work is done (execPhase='done' before the refresh)."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/runstate.rs",
+            "line": 165,
+            "title": "dismiss_interrupted can mark the live run's last-run.json 'dismissed', hiding a real interruption",
+            "evidence": "dismiss() flips any status=='running' file to 'dismissed' without checking pid or batch (lines 165-174). execute() rewrites 'running' only on the next heartbeat, up to 30 s later. The command is callable while acting.",
+            "failure_scenario": "The interrupted banner was loaded at startup. The user starts a new clean, and a dismiss call (stale UI or a click that lands in the gap) flips the new run to 'dismissed'. If the app is killed before the next heartbeat, the next launch reports nothing.",
+            "suggested_fix": "Have dismiss take the batch id from the Interrupted it is dismissing and only flip that batch. Or refuse when s.pid is a live DiskWhy, or while acting."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 617,
+            "title": "freed_bytes ('C 盘多出') picks up other activity on the volume, including Windows purging old Recycle Bin items",
+            "evidence": "freed_bytes = Σ max(0, free_after − free_before) over the source volumes (lines 617-624), measured across the whole run (27 min in the real incident). Preflight lets recycle runs go ahead over MaxCapacity with only a warning (preflight.rs:899-912). When the bin goes over its limit, Windows silently deletes the oldest items, which frees space the run did not delete.",
+            "failure_scenario": "A recycle run over the bin limit. Windows purges 3 GB of the user's old deleted files, so the done page says 'C 盘多出 3.0 GB' next to '回收站 5 GB · 还没腾出'. That reads as a contradiction and hides that old items were permanently removed. Long runs also absorb browser cache or Windows Update writes, so the big number can be well below what was deleted.",
+            "suggested_fix": "By design (§3.5), but clamp or annotate it: if freed_bytes > by_dest.permanent + cross-volume quarantine bytes + a slack, add a note ('回收站超上限，Windows 清掉了更早的东西'). If freed is much smaller than the expected bytes, show the expected value on hover."
+          },
+          {
+            "severity": "low",
+            "file": "crates/diskwhy-core/src/action/execute.rs",
+            "line": 584,
+            "title": "Pressing 停止 after the last file finishes still reports '已停止' with 0 not processed",
+            "evidence": "cancelled = opts.cancel.load() is read after all work and finalization (line 584), not 'some work was actually left'. Notes then add '已停止：还有 0 个没处理' and run_state is saved as 'cancelled'.",
+            "failure_scenario": "The user clicks 停止 just as the bar reaches 100%. The done page title is 已停止 even though everything completed, and the note says 0 not processed.",
+            "suggested_fix": "Set cancelled = flag && (not_processed.count > 0 || any unit never started)."
+          }
+        ]
+      },
+      {
+        "lens": "ux",
+        "findings": [
+          {
+            "severity": "medium",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 502,
+            "title": "The 改放 D 盘 chip deletes files outright instead of moving them to D",
+            "evidence": "I ran this in the dev server with Playwright and Edge. I opened the dialog with only 可放心清理 items and picked 回收站 from the menu, so the line read '可放心清理 进回收站'. The row '回收站在 C 盘，不腾空间 [改放 D 盘]' was shown. After clicking 改放 D 盘 the line read '可放心清理 直接删' and the free-space text went to 'C 盘剩余 14.0 → 37.1 GB'. Nothing goes to D. Cause: pick('stash') makes currentPlanArgs return safeDirect=true, and safe items never go to the stash. The real-exe screenshot phaseJ-F1-exe-recycle-C.png shows this exact chip on a plan with only safe items.",
+            "failure_scenario": "The user picks 回收站 because they want to be able to undo. They see 回收站在 C 盘，不腾空间 and click 改放 D 盘, expecting the files to be kept on D. Instead the files are deleted permanently with no undo. The button says one thing and does another on a destructive action.",
+            "suggested_fix": "Only show 改放 D 盘 when the plan has 需你判断 items (hasReview). For a safe-only plan, label the chip 直接删 (what it actually does), or keep safeDirect=false when moving away from an explicit 回收站 choice."
+          },
+          {
+            "severity": "medium",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 508,
+            "title": "Clicking the text 我知道这些删了的后果 does nothing because the checkbox toggles twice",
+            "evidence": "The markup is <label class=\"m-ack\"><button class=\"cb\" @click=\"ack=!ack\">…</button><span @click=\"ack=!ack\">我知道这些删了的后果</span>…</label>. A button counts as a label's control in HTML, so clicking the span runs its handler and then the label sends a click to the button, which toggles again. Playwright output: 'ack initial false', 'after click label text false', 'after click box true', 'after click count text false'. The bug already existed on master but it is in the dialog this phase rewrote. This checkbox is the only thing that unlocks the main button whenever 需你判断 items are present.",
+            "failure_scenario": "A non-technical user clicks the words 我知道这些删了的后果, as most people do. The box stays empty and the 清理 button stays grey, so the dialog looks broken. Clicking the gray 2 项需你判断 text, by contrast, does toggle it.",
+            "suggested_fix": "Remove @click from the span and let the label do the toggle, or change <label> to a <div>. A cleaner option is one <button role=checkbox> that contains the text."
+          },
+          {
+            "severity": "medium",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 324,
+            "title": "The dialog backdrop covers the title bar, so the window cannot be minimized or moved during a long cleanup",
+            "evidence": ".scrim is position:absolute; inset:0; z-index:80 inside .app, and the TitleBar has z-index 40. With the dialog open, document.elementFromPoint(1325,21), the minimize button at 1440x900, returns DIV.scrim. Every F1 screenshot shows the min/max/close buttons dimmed under the backdrop. The dialog estimates '约 13 分钟' for the user's real case.",
+            "failure_scenario": "During a 10+ minute cleanup the user cannot minimize DiskWhy or drag it out of the way with the mouse. The title-bar ✕ handling added in TitleBar.vue also cannot be reached by mouse. Only Alt+F4 or the taskbar work.",
+            "suggested_fix": "Start the backdrop below the title bar (top: var(--titlebar)), or raise the title bar above it and keep only the ✕ blocked while cleaning. The 先停止再关 nudge already covers ✕."
+          },
+          {
+            "severity": "medium",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 325,
+            "title": "Keyboard focus is not kept inside the dialog; Tab+Enter can start a new preview while a cleanup is running",
+            "evidence": "Playwright, with run=hold: Tab moves focus from 停止 to the title bar and page controls behind the dialog. After 30 Tabs it reached the cleanup page's 'btn|清理 28.3 GB'. Pressing Enter changed dialogSeq from 1 to 2 while execPhase stayed 'running' and a new report appeared. In the real backend, preview_plan (src-tauri/src/lib.rs:564) does not check whether a cleanup is running: it clears state.plan and runs a full file-by-file check alongside the cleanup. The dialog also has no Escape handler in any state, and focus is not moved into it when it opens.",
+            "failure_scenario": "A keyboard user, or a stray Enter on a focused page button, starts a second heavy preflight during execution. The dialog is remounted, so its progress and rate samples reset. Keyboard users also cannot close the confirm step with Esc.",
+            "suggested_fix": "While the dialog is open, make the page and title bar inert (the inert attribute) or trap focus, and move focus into the dialog when it opens. Have Esc call close(); close() already ignores the running state. Also disable the cleanup page's 清理 button while execPhase !== 'idle', and have preview_plan refuse while a cleanup is running."
+          },
+          {
+            "severity": "medium",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 366,
+            "title": "The done page shows an orange '注意 N 条' on almost every run, and its tooltip still says 隔离区",
+            "evidence": "execute.rs:694-706 always adds notes: '可放心清理的缓存已直接删除…' whenever anything is deleted directly, '文件在回收站里…', and '隔离区保留 7 天（不会自动删），可以在“隔离区”里…'. ConfirmDialog shows them as <div class=note :title=…>注意 {{ notes.length }} 条</div> in --review-label orange. The mock always returns notes: [], so no F1 screenshot shows this. I added real-shaped notes through the store and the done page showed '注意 2 条', with the tooltip containing '隔离区' twice.",
+            "failure_scenario": "Every successful cleanup ends with a warning-colored 注意 line, which suggests something went wrong when nothing did. Hovering it shows the old 隔离区 name, against decision §3.8 (暂存区 everywhere).",
+            "suggested_fix": "Drop the routine notes; the rows already say 直接删除 and 回收站 · 还没腾出. Show the line only for real problems (nuked files, manifest error). Rename 隔离区 to 暂存区 in the backend note and warning strings."
+          },
+          {
+            "severity": "medium",
+            "file": "src/store.ts",
+            "line": 176,
+            "title": "After scanning D:, the default 暂存区 is put on C:, the nearly full system drive",
+            "evidence": "stashDrives = every fixed drive except the source drive. pickDefaultDest only requires free > need + 64 MB. Playwright: after switching to D (summary.root = 'D:\\\\') and opening the dialog with a 需你判断 item, the destination line read '可放心清理 直接删 · 需你判断 暂存到 C 盘'.",
+            "failure_scenario": "On the user's machine C: has about 7 GB free. Cleaning 5 GB of 需你判断 items on D would by default fill C to about 2 GB free, making the exact problem the app exists to fix worse.",
+            "suggested_fix": "Never pick the system drive (or any drive under 10–15% free) as the default 暂存区. Fall back to 回收站 on the source drive, or keep it only as an explicit menu choice."
+          },
+          {
+            "severity": "low",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 411,
+            "title": "With only 可放心清理 items, the destination menu shows D 盘暂存区 as selected, and choosing it changes nothing",
+            "evidence": "Playwright with modal=1 and no 需你判断 items: the line read '可放心清理 直接删' while the menu's checked entry was 'D 盘暂存区 剩 43.0 GB'. Clicking D 盘暂存区 left the line at '可放心清理 直接删'. Only 回收站 has any effect on safe items.",
+            "failure_scenario": "The user thinks the files will be kept in D 盘暂存区 because it is ticked, but they are deleted directly. Picking 直接删除 or a stash drive is a no-op.",
+            "suggested_fix": "When hasReview is false, offer only 直接删 and 回收站, or mark the current choice from what destParts actually shows."
+          },
+          {
+            "severity": "low",
+            "file": "src/pages/CleanupPage.vue",
+            "line": 216,
+            "title": "The cleanup page footer still shows 'C 盘剩余 x → free + everything checked', even when 需你判断 items go to the recycle bin",
+            "evidence": "The footer computes gbNum(free + checkedBytes) without looking at the destination. The dialog uses freesBytes correctly. In the nodrive/recycle screenshots the footer says 14.0 → 46.2 GB while the dialog says 14.0 → 37.1 GB.",
+            "failure_scenario": "Two different 'C 盘剩余 after' numbers are on screen at once. This is the same kind of number mismatch the user complained about (30.1 → 29.3, and the recycle bin not freeing space).",
+            "suggested_fix": "Show only the 可放心清理 part plus 需你判断 when a stash on another drive is available, or label the footer number as an estimate (估) and leave the exact figure to the dialog."
+          },
+          {
+            "severity": "low",
+            "file": "src/labels.ts",
+            "line": 157,
+            "title": "Hard-coded 'D 盘' is still on screen",
+            "evidence": "Grep of non-comment UI strings: labels.ts:157 ADVICE_TEXT.migrate = '别删，搬到 D 盘更好' and CleanupPage.vue:91 '搬到 D 盘'. In the backend explanations, explain/mod.rs:490/492 says '迁到别的盘可让 C 盘腾出约 …', and rules/misc.toml:649 (aclos-highlight-videos) says '默认进回收站', which no longer matches the phase J defaults.",
+            "failure_scenario": "After switching to D: (§3.6), advice reads 'move it to D 盘' for items already on D, and the explanation text still says C 盘.",
+            "suggested_fix": "Use the target drive from stashDrives, or a neutral phrase such as 搬到其他盘. Build the 'C 盘' in explain/mod.rs from the scanned volume. Update the 默认进回收站 wording in the rule."
+          },
+          {
+            "severity": "low",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 505,
+            "title": "Blocking warnings and the 'merged' note are shown as full backend sentences, some still saying 隔离区",
+            "evidence": "blocking warnings render as {{ w.message }}. For example quarantine_no_space produces '隔离区所在的 D:\\\\ 只剩 …，放不下这次要隔离的 …（另留 64 MB 余量）。请换一个盘或改用回收站。', and a bad folder chosen with 其他文件夹… produces '隔离区位置 … 在要清理的「…」里面…' (preflight.rs:679-690, 930-938). The non-blocking 'merged' warning (plan.rs:58, '「C:\\\\…」已经包含在「C:\\\\…」里，合并为一项') also renders as raw text.",
+            "failure_scenario": "The user sees red two-line sentences full of paths and the retired 隔离区 name, breaking both the no-sentences rule and the 暂存区 naming.",
+            "suggested_fix": "Map each code to a short label (e.g. 'D 盘放不下' or '换个文件夹') and put the original text in title, as NOTE_SHORT already does. Drop the 'merged' note."
+          },
+          {
+            "severity": "low",
+            "file": "src/store.ts",
+            "line": 698,
+            "title": "Notices still say 快照 although the setting is now called 扫描结果",
+            "evidence": "store.ts:698 says '快照已保存：${p}', :700 '保存快照失败', :719 '正在查看快照：${path}', :722 '打开快照失败'. The file dialogs in lib.rs:355/357/384/385 are titled '保存扫描快照' / 'DiskWhy 快照'. Settings now labels this 扫描结果 with 保存 / 打开 (§3.8).",
+            "failure_scenario": "The user clicks 扫描结果 → 保存 and gets a banner and a dialog titled 快照 with a full path, a term that appears nowhere else in the UI.",
+            "suggested_fix": "Use '已保存' / '正在看保存的扫描结果' and put the path in the title. Rename the dialog titles and filters to 扫描结果."
+          },
+          {
+            "severity": "low",
+            "file": "src/components/ConfirmDialog.vue",
+            "line": 501,
+            "title": "Some dialog text is still sentence-length: '回收站在 C 盘，不腾空间' and the cause '被结束 · 0x8f'",
+            "evidence": "The act-row text is a comma sentence of 11 characters. The interrupted popup (HomePage, interruptedCause) shows a raw hex exit code. On the done page, 没成功 N 个 rows have no reason or expansion, so a repeat of last run's 444 回收失败 would show only a count.",
+            "failure_scenario": "Small departures from the zero-friction rule. A hex code means nothing to the user.",
+            "suggested_fix": "Use '回收站不腾空间' with the explanation in title. Write '被结束' with the code in title only. Give 没成功 the same › expansion of reasons as 跳过."
+          }
+        ]
+      }
+    ],
+    "fixReport": "I fixed nearly everything that held up against the code. I refuted one finding (C9), and two others (C13 and the unexplained exit) are left unfixed. All tests and builds pass. The new UI behaviour was checked in the dev server only, not on the real exe.\n\nBefore fixing, I tried to refute each finding against the code. Three findings changed what the app does with files, so they come first:\n- **S1 (critical):** recycle mode silently deleted files with paths of 260+ characters, and could take a whole folder with them. Fixed. The new test fails if the guard is switched off.\n- **Before-run promise:** NTFS reports 8-byte allocation for tiny files (0→0, 64→64, 700→704, 800→4096); I measured this on D:. Those files were counted as 4 KB each, so the dialog promised far more space than the run freed. They now count as 0.\n- **Log rotation:** a second rotation overwrote the only old copy, which is how the 06:19 evidence log was lost. Old logs are no longer overwritten. The log that was already lost cannot be recovered.\n\n## Findings\n\n| Finding | Status | Fix |\n|---|---|---|\n| **Verification report** | | |\n| Before-run number promises too much | FIXED | Preflight now uses the file's real allocation size, so tiny files count as 0. The home and cleanup numbers still come from the scan's rounded estimate. Test `tiny_mft_resident_files_count_as_zero_bytes`. |\n| Log rotation wipes the evidence log | FIXED | Old logs are renamed `actions.<UTC time>.log`, newest 5 kept, nothing overwritten; the legacy `actions.1.log` is never touched. Test updated. |\n| Opening the dialog creates `X:\\DiskWhy暂存区` | FIXED | `prepare_quarantine` now only checks the folder can be created and leaves nothing behind; the folder is made at execute time. |\n| Old \"隔离区\" wording in done-page notes | FIXED | Routine notes removed; backend strings now say 暂存区. |\n| Method logged as \"回收站\" for an all-direct run | FIXED | `Plan::method_label()` records the real method in the log and `last-run.json`. Tested. |\n| 3 s delay before the done page | FIXED | The backend signals \"finished\" before the rescan and the done page shows immediately. Checked in the dev server only. |\n| Theme C dot disappears in the open dropdown | FIXED | The dot gets a dark outline (screenshot). |\n| Unexplained exit of PID 102336 | NOT FIXED | No evidence to work from. |\n| **Safety review** | | |\n| S1 long paths deleted for good in recycle mode | FIXED | Paths over 258 characters are skipped as \"回收站放不下\", both at preflight and again at execute. Folders containing long paths are not recycled whole. Test `recycle_never_nukes_long_paths_or_their_folder`. |\n| S2 report wording misstates the outcome | FIXED | Files the bin rejected are counted separately (`by_dest.nuked`), with a \"回收站没收 · 找不回\" row. Notes appear only for real problems. |\n| S3 live-browser cache check only at preflight | FIXED | Rechecked when the run starts; if the check fails, the cache counts as in use. Test `chromium_cache_opened_after_preflight_is_skipped_at_execute`. |\n| S4 whole-folder recycle check window | FIXED | Stop is checked inside the verify loop, whole-folder units are capped at 2,000 files, and size/mtime are compared against the fresh listing. No timing test. |\n| S5 / C1 / C5 store records lost if the app is killed | FIXED | Each stashed file is appended to `manifest.journal` as it moves; loading merges it, and saving the full manifest deletes it. The 10 s timer saves are gone and saves are now ordered. Tests `quarantine_journal_survives_kill_and_is_merged` and `quarantine_execute_writes_journal_then_compacts`. |\n| S6 elevated helper follows junctions | FIXED | Permissions are changed on the folder's own handle after confirming it is a plain folder; icacls is gone. Only personal-account SIDs are accepted (`S-1-5-21-…` and `S-1-12-1-…`). Test `elevated_grant_refuses_junctions_and_group_sids`. I did not add \"refuse if the user can already write the root\". |\n| S7 / C10 stop still removes empty folders | FIXED | On stop, items that never started are left alone. Test `stop_before_start_touches_nothing_and_method_is_honest`. |\n| **Concurrency review** | | |\n| C2 ✕ can never reach the 20 s close valve | FIXED | After 停止, ✕ sends a real close request and the stopping state shows \"稍等再关\". Restore, purge and the post-run rescan start the 20 s valve on the first close attempt. |\n| C3 \"已处理 N 个\" up to 30 s stale | FIXED | `last-run.json` is updated every 2 s. |\n| C4 restore shows an old cleanup's progress | FIXED | `exec_progress` is cleared when a run ends. |\n| C6 stopped runs skew the time estimate | FIXED | Copy speed is learned only from completed copies, and stopped or failed runs are not learned from. No test. |\n| C7 thread crash reported as \"原样没动\" | FIXED | Its files are counted as failed with an \"结果不确定\" note and a `unit_panic` log line. No test: there is no way to trigger a crash without adding a test hook. |\n| C8 hang if no worker thread starts | FIXED | Returns an error instead of hanging. |\n| C9 partial folder recycle mislabelled | REFUTED | Not reproduced; recycling a folder on the same drive should be a single, all-or-nothing move. |\n| C11 停止 does nothing during the post-run rescan | FIXED | The done page now shows first, and closing is allowed after 20 s. The rescan still blocks a new preview on purpose. |\n| C12 \"知道了\" can dismiss the live run | FIXED | Only a run left by another process can be dismissed. Unit test. |\n| C13 freed space includes other disk activity | NOT FIXED | Measuring before/after free space is the intended design (§3.5), and there is no reliable signal to separate other activity. |\n| C14 停止 after the last file shows \"已停止\" | FIXED | \"已停止\" is shown only if something was actually left undone. |\n| **UX review** | | |\n| U1 改放 D 盘 deletes safe-only items | FIXED | The chip shows only when there are 需你判断 items. |\n| U2 clicking the checkbox text does nothing | FIXED | The row is a `div` that toggles once. Playwright: clicking the text sets it checked. |\n| U3 backdrop covers the title bar | FIXED | Backdrop starts below the title bar; a click at the minimize button now lands on the title bar. |\n| U4 Tab+Enter starts a new preview | FIXED | Page and title-bar left side are `inert` while the dialog is open, focus moves into the dialog, Esc closes it, and the backend refuses a preview while a run is active. In 40 Tab presses focus never reached the page. |\n| U5 orange \"注意\" on every run | FIXED | Routine notes removed (see S2). |\n| U6 default stash on C: when scanning D: | FIXED | The Windows drive (new `system_drive` field) is never the default. I also tried \"skip drives under 15% free\" but removed it: your D: has only 25.7 GB free, so it would have dropped the D: default entirely. |\n| U7 safe-only menu shows a no-op choice | FIXED | Safe-only menu offers only 直接删除 and 回收站. |\n| U8 footer number ignores the destination | FIXED | Footer uses `freesByDefault`. |\n| U9 hard-coded \"D 盘\" / \"C 盘\" | FIXED | Now 搬到别的盘 / 这个盘; three \"默认进回收站\" texts updated. |\n| U10 raw backend sentences | FIXED | Short labels plus 换个文件夹, full text on hover; the \"merged\" note dropped. |\n| U11 快照 wording | FIXED | Notices and dialogs now say 扫描结果. |\n| U12 sentence text and hex code | FIXED | 回收站不腾空间; 被结束 with the exit code on hover; 没成功 shows reasons on hover rather than an expandable list. |\n\n## Test and build output\n- **`cargo test --workspace -- --test-threads=1`** (cross-drive folder on D:): exit 0, 2m51s, **131 passed, 0 failed, 2 ignored**.\n  - lib 1 · core unit 20 · action_tests 48 (126.97 s, 8 of them new) · bench 0 (1 ignored) · crash 4 · dedup 5 (1 ignored) · explain 39 · mock 8 · real_fs 6.\n- **`npm test`**: `Test Files 6 passed (6)`, `Tests 73 passed (73)`.\n- **`npm run build`**: `✓ built in 1.19s`.\n- **`npm run tauri build -- --no-bundle`**: exit 0, `Finished release profile [optimized + debuginfo] in 3m 53s`. `target\\release\\diskwhy.exe` is 14,339,584 bytes.\n- **Release exe launch** (own WebView2 folder): `alive=True responding=True title=DiskWhy`, closed with `exit=0`.\n- **Screenshots:** 11 new `docs/screenshots/phaseJ-FIX-*.png` covering themes A, B and C, mostly at 1440, plus 864 for C. I looked at each one.\n\n## Not verified\n- None of the new UI behaviour was driven on the real exe with UI Automation: early done page, ✕ valve, inert page, the probe-only stash folder.\n- The UAC 授权 path.\n\n## Files\n- **Rust:** `crates/diskwhy-core/src/action/{execute,winops,preflight,quarantine,log,runstate,mod}.rs`, `crates/diskwhy-core/src/explain/{mod,big_items,heuristics}.rs`, `rules/misc.toml`, `src-tauri/src/lib.rs`, `crates/diskwhy-core/tests/action_tests.rs`.\n- **Frontend:** `src/{store,api,labels}.ts`, `src/App.vue`, `src/components/{ConfirmDialog,TitleBar}.vue`, `src/pages/{CleanupPage,HomePage}.vue`, `src/labels.test.ts`, `src/labels.exec.test.ts`, `src/dev/mock.ts` (not in HEAD; not shown by git status).\n- Other files git shows as modified were already modified before I started (`llm.rs`, `explain_tests.rs`, `main.ts`, `QuarantinePage.vue`, `SettingsPage.vue`). No git operations.\n\n## Cleanup\n- Removed my test folders: `dw-test-fix`, `dw-test-xvol-fix`, `dw-test-wv2-fix`.\n- Stopped my dev server on port 5317.\n- The long-path test restored all 21 of its recycled files from the bin.\n- The empty `C:\\DiskWhy暂存区` from the previous lane is still there; I did not touch it. Please run `rmdir \"C:\\DiskWhy暂存区\"`.",
+    "verify2": "I built and tested the release exe; most complaints check out, but three things need attention. A ~20-second cleanup took 24–30 s and showed 快好了 for the last 16 s. The drive-space numbers before and after a cleanup can mislead, and on the synthetic run the done page reported space freed (0.18 GB) while also saying 0 B were deleted. I changed no source code. All test data, the demo rule and the extra WebView2 folders are removed. Your own `DiskWhy-app\\DiskWhy.exe` (pid 84436) was never touched, and I never pressed the final 清理 on real C: data or approved UAC.\n\n## 1. Build and tests\n- `npm run tauri build -- --no-bundle` succeeded in 3m44s: \"Built application at: D:\\desk\\claudex\\13\\diskwhy\\target\\release\\diskwhy.exe\" (14,339,584 B), with `diskwhy.pdb` (32,518,144 B) next to it.\n- `cargo test --workspace -- --test-threads=1` (with `DISKWHY_TEST_XVOL_DIR=...\\dw-test-xvol-2`): all \"test result: ok\". Totals are 131 passed, 0 failed, 2 ignored:\n  - diskwhy_core unit 20\n  - action_tests 48 (109.28 s)\n  - crash_tests 4\n  - dedup 5 (+1 ignored)\n  - explain 39, mock 8, real_fs 6\n  - bench 0 (+1 ignored)\n  - src-tauri lib 1\n- None of the tests' items were left in the recycle bins (no `$I` entries from the last 3 h on C: or D:).\n- `npm test`: \"Test Files 6 passed (6) / Tests 73 passed (73)\".\n\n## 2. Real C: check (read-only)\n- Screenshots of home, drive menu, explore (default, root C:\\, Users), legend, cleanup, confirm (checking, done, skip row expanded, destination menu), settings and 暂存区 exist for theme C at 1440×900, 864×1400 and 720×640, and for themes A and B at 1440×900. I looked at all of them.\n- On real C:, the confirm check took 34–98 s. 7.3 GB became 6.7 GB, explained by \"跳过 845 个 · 637 MB · 正在使用\", which expands to 正在使用 468 / 330 MB, 刚改过 320 / 153 MB, 已变小 104 MB, 没权限 57 / 50.4 MB, plus the list of programs holding files.\n- For the review destination I ticked one review item (AMD 驱动安装包) and only ran the check:\n  - The default was 暂存到 D 盘 and showed 「D 盘暂存区要授权 · 授权」 with the run button blocked.\n  - I did not press 授权. Choosing 其他文件夹 `D:\\desk\\claudex\\13\\dw-test-q-2` cleared the warning.\n  - An earlier opening had quietly reused my test folder from the remembered-folders list (`quarantine-roots.json`), so your real default may differ depending on what your own list contains. Not verified.\n\n## 3. Cleanup run on synthetic data (D:)\nThe test exe ran with `PUBLIC=...\\dw-test-exec-2`, because user rules only accept certain `%VAR%` roots, and the demo rule was `%PUBLIC%\\cache` (safe) plus `%PUBLIC%\\review` (review, redownload, \"要重新下载\").\n\n**Default destination for 需你判断:** it was 回收站, not a D: 暂存区. The test data is on D:, so the only other drive offered was \"C 盘暂存区 剩 5.0 GB\". I chose 其他文件夹 instead.\n\n**Run 1, stopped:**\n- The button read \"清理 0.63 GB 几秒\" and the destination line showed both parts: 可放心清理 直接删 · 需你判断 暂存到 D 盘.\n- WM_CLOSE at 1.5 s: the window stayed open and showed \"先停止再关\".\n- 停止 at 3.1 s: \"正在停止 / 稍等再关\", then ended at 3.5 s.\n- The result read 已停止 · 0.34 GB D 盘多出 · 直接删除 347 MB · 暂存到 D 盘 297 MB · 跳过 20 个 · 没处理 125,366 个.\n- On disk afterwards: 125,386 cache files = 125,366 + the 20 recently-modified files. My free-space measurement was +366,432,256 B, matching the app.\n\n**Run 2, rest of the cache:** done in 11.2 s (estimate 几秒). The result read 清理完成 · 0.18 GB D 盘多出 · 直接删除 0 B · 跳过 20 个. The cache folder was emptied except the 20 recently-modified files, and the empty folders were removed.\n\n**Runs 3–5 (100,000 extra files, same-drive 暂存):**\n- Wall time vs estimate (约 20 秒): 29.7 s, 26.7 s and 23.5 s.\n- 剩约 30 → 25 → 20 → 15 秒 showed, then 快好了 for the last 16 s.\n- Pressing the web title-bar ✕ by UI Automation (button class \"close\") during a run: the window stayed open and \"先停止再关\" appeared. The native close command (Alt+F4 / taskbar path) was also blocked.\n\n**Restore from the 暂存区 page:**\n- \"已还原 2000 个文件（297 MB）\": 2000 files and 307,200,000 B back in place.\n- \"已还原 100000 个文件（0 B）\" and twice \"已还原 102000 个文件（297 MB）\": 102,000 files back each time.\n- Restoring 102k files took 60–69 s.\n\n## 4. Checklist\n\n| Complaint | Result | Evidence |\n|---|---|---|\n| 能选盘 | PASS | `drivemenu-*`: C 盘 剩 5.1 GB / D 盘 剩 32.0 GB. I didn't pick D: in the real exe. |\n| 预估时间 | PASS | `exec-confirm`, `exec3-confirm`, `confirm-*`: \"约 20 秒\", \"约 2 分钟\" (回收站), \"几秒\". |\n| 进度条按耗时 | PASS, with two problems | `exec3-running2`. The bar fills steadily, but the 20 s estimate took 24–30 s, and 快好了 showed for 16 s. In run 1 the big number read 0.63 of 0.63 GB at 1.5 s while the bar was at about 5%. |\n| 能停止 | PASS | `exec-stopped`: 没处理 125,366 = files left on disk. |\n| 清理中拦关窗 | PASS | `exec-closeblocked` (WM_CLOSE), `exec5-xbutton` (web ✕), `exec4-xbutton` (native close). The block is also logged in `crash.log`. |\n| 改放 D 盘可用 | PARTIAL | Clean state shows 要授权 and the run is blocked until you authorize or pick a folder (`confirm-elev-C-1440`). 其他文件夹 works (`confirm-otherfolder-C-1440`). UAC not tested. On a D: source, the destination resets to 回收站 every time the dialog opens. |\n| 竖屏不变形 | PASS, with polish issues | `*-C-864`, `*-C-720`. The 864×1400 home card is about 1220 px tall and mostly empty; the 720×640 home shows a scrollbar. |\n| 分析页能选 C:\\ 根和 Users | PASS | `explore-root-*` lists C:'s 15 items; `explore-users-*` lists Users' 5 items. |\n| 方块图图例 | PASS | `legend-*`, five rows. In theme B, 先别动 and 认不出来 look almost the same. |\n| 设置页改名加说明 | PASS | `settings-*`, `settings-help-C-1440` (AI 识别 / 扫描结果 / 暂存区, each with ?). |\n| 说清了的 GB = 真腾出的空间 | PARTIAL | See below. |\n| 30.1→29.3 有解释 | PASS | `confirm-skip-*`: 7.3 → 6.7 GB with reasons and byte counts. The skip header names the most common reason even when the bytes are mostly 已变小 (synthetic: \"跳过 20 个 · 586 MB · 刚改过\", where 586 MB is all 已变小). |\n| 速度 | PASS | 125,366 direct deletes in 10.9 s (about 11.5k/s); 26,664 in 3.2 s; 100k same-drive 暂存 in 29.4 s (about 3.4k/s). Restore is slower: about 1.6k/s, 60–69 s for 102k files. |\n\n**Why 「说清了的 GB」 is only partial:**\n- **Before the run, the numbers are too high for tiny files.** The scan counts every tiny file as a full 4 KB block. 150k files of 64 bytes showed as \"0.91 GB\" on home and \"490 MB\" on the cleanup page, while the confirm check said 0 B.\n- **After the run, the measured number is noisy.** The done page uses the measured change in free space, which matched in run 1 (app 0.34 GB, my measurement 366 MB). But D: has something else periodically using and releasing about 290 MB (I logged −259 MB then +283 MB within 5 s while idle). That is how run 2 showed \"直接删除 0 B\" next to \"D 盘多出 0.18 GB\".\n\n## Not verified\n- The 授权 / UAC path.\n- The 上次中断 notice.\n- Switching drive in the real exe.\n- Recycle-bin mode execution.\n- What the restore page shows while a long restore is running.\n- Whether the settings model field showing \"qwen-plus\" with no preset highlighted is a placeholder or a stored value.\n\n## Files and notes\n- I added 93 screenshots, `docs/screenshots/phaseJ-R2-*.png`, under `D:\\desk\\claudex\\13\\diskwhy\\docs\\screenshots\\`. No source files changed; `git status` shows the same modified set as before.\n- Scripts are in the session scratchpad: `r2_matrix.py`, `r2_run.py`, `r2_run3.py`, `r2_xbtn*.py`, `r2_gen.py`, `r2_rb.py`, `r2-demo.toml`.\n- Base conda has no `comtypes`, so the UI Automation scripts ran with `D:\\conda\\envs\\lingpet\\python.exe`; comtypes may have written its cache into that environment.\n- In the sandbox's view of `%LOCALAPPDATA%\\DiskWhy` I removed the logs, `perf.json`, `last-run.json`, `crash.log` and `quarantine-roots.json` my runs created, plus the demo rule. Pre-existing `ui.json` (theme \"C\"), `crash\\` and `rules\\` were left.",
+    "signoff": "# Phase J final sign-off (read-only review)\n\n**Verdict: SHIPPABLE** to `D:\\desk\\claudex\\13\\DiskWhy-app` — with two pre-ship housekeeping steps (no code changes required). Nothing I found breaks the §3 deletion-safety decisions or leaves one of the user's original complaints unaddressed.\n\n## What I checked\n- `docs/PHASE_J_PLAN.md` §0/§3, `docs/PHASE_J_CRASH.md`, build-1 reports (`rMain` \"not done\" list = panic hook / minidump / WebView2 ProcessFailed → all present now in `crash.rs` and `lib.rs:1078`).\n- Full worktree diff (fixer) for `execute.rs`, `preflight.rs`, `winops.rs`, `quarantine.rs`, `log.rs`, `mod.rs`, `runstate.rs`, `lib.rs`, `llm.rs`, `explain_tests.rs`, `store.ts`, `api.ts`, `App.vue`, `TitleBar.vue`, `ConfirmDialog.vue`, `HomePage.vue`, `labels.ts`, `main.ts`; plus `git diff master...HEAD --stat` (86 files).\n- Current source of `Plan::dest_for/entry_dest`, `permanent()`, `prepare_dest_with`, `elevate_and_prepare`, `close_should_block`, `restore_batch`, `elevated_mkdir_from_args` call order (`lib.rs:1166`, before `crash::install` and any window).\n- 15 screenshots (FIX confirm/done/menus/stopping in A and C; R2 stopped/done/running/skip/elev/home-864/destmenu-720/settings).\n- Build freshness: `target\\release\\diskwhy.exe` 21:03:56, 14,339,584 B; `find … -newer` returns no source file newer than it, so the verified exe is built from the current tree. Rules are `include_str!`-embedded (`explain/rules.rs:52-57`), so the exe alone carries `rules/misc.toml`.\n- The 7 new tests named by the fixer exist (`action_tests.rs:1760-1969`); dir-recycle still exercised (`action_tests.rs:1429` asserts `ifileoperation_dir` 41+1). I did not re-run cargo/npm tests; fixer and verifier independently reported 131/0/2 and 73/73.\n\n## 1. Blocking before shipping\nNo code blockers. Two housekeeping steps that must happen as part of the ship (not fixes to source):\n\n1. **Remove the stray empty folder `C:\\DiskWhy暂存区`** (exists, empty, mtime 21:36 today; created by an earlier lane via `prepare_quarantine(create=true)`, which the fixer has since changed to probe-only in `src-tauri/src/lib.rs:854-859`). The user would otherwise find an unexplained folder at the root of C:. Command: `rmdir \"C:\\DiskWhy暂存区\"`. I did not delete it (read-only mandate).\n2. **Copy `target\\release\\diskwhy.exe` → `DiskWhy-app\\DiskWhy.exe` only while the user's running instance (pid 84436, `DiskWhy-app\\DiskWhy.exe`) is closed by the user**, or copy to a new name first; overwriting a running exe fails. Do not kill it. `DiskWhy-app\\diskwhy-cli.exe` (Sep 30 build) is older than the new core; `target\\release\\diskwhy-cli.exe` is Sep 24 — rebuild with `cargo build --release -p diskwhy-cli` before copying, or leave the CLI out of this ship (it is not what the user uses).\n\n## 2. Non-blocking follow-ups (ranked)\n1. **Done-page \"多出\" vs rows mismatch on noisy drives** (`crates/diskwhy-core/src/action/execute.rs` ~line 337 `freed_bytes`): measured free-space delta showed 0.18 GB while 直接删除 was 0 B. Suggest clamping: if (permanent + cross-volume quarantine bytes) == 0 → report 0; otherwise `freed = min(measured, expected × 1.1 + 64 MB)`. On the user's 30 GB C: run the ±0.3 GB noise is immaterial, which is why this is not blocking.\n2. **\"快好了\" shown for the last ~16 s; 20 s estimate took 24–30 s** (`execute.rs` cost model + `src/labels.ts::remainText`): finalize work (rmdir of emptied folders, `manifest.json` write of 100k entries) is not in `cost_total`. Add a finalize cost term (dirs × rmdir cost + entries × manifest-write cost) so the bar and ETA cover the tail.\n3. **Scan estimate still counts MFT-resident tiny files as 4 KB** (`crates/diskwhy-core/src/scan*`; preflight fixed in `preflight.rs:795-798`). 150k × 64 B showed 0.91 GB on home → 0 B in the dialog. Cheap heuristic in scan: treat files < ~600 B as 0 allocated on NTFS (fixer measured 700→704, 800→4096). This is the remaining \"数字缩水\" source; it is explained by the 已变小 row today.\n4. **Running-page big number saturates early** (`ConfirmDialog.vue` 执行中 block): bytes_done hits the total while the cost bar is at 5–40 % because large files go first. Consider showing cost-weighted progress or \"已处理 N 个\" instead of GB.\n5. **UAC 授权 path untested on the real machine** (`quarantine::elevate_and_prepare`, `winops::run_elevated_wait`, `elevated_mkdir_from_args`). Code reviewed: SID restricted to personal accounts, reparse-point refused on the opened handle, MODIFY mask 0x1301BF correct. Failure degrades to 选文件夹…, so not a dead end. Watch the first real use.\n6. **Restore/purge 20 s close valve** (`lib.rs:1195-1200`): first ✕ during a long restore starts the valve; after 20 s the app can exit mid-restore. Journal only covers execute, not restore. Acceptable by §3 decision 0, but consider a journal for restore too.\n7. **Portrait 864×1400 home card ~1220 px tall, mostly empty** (`HomePage.vue` narrow layout; screenshot `phaseJ-R2-home-C-864.png`). Cap the hero height or move the capacity bar up.\n8. **Theme B legend: 先别动 and 认不出来 nearly identical** (`TreemapView`/legend CSS). Give mix a stripe in B too.\n9. **C-theme heading font lacks 暂/识/密/钥…** — worked around with `kaiSafe()` font switching (`labels.ts`, `TitleBar.vue`, `QuarantinePage.vue`, `SettingsPage.vue`), so \"暂存区\" renders in the UI font while \"清理\" is in Kai. Proper fix: re-subset the WenKai font with `KAI_MISSING`.\n10. `src/dev/` is gitignored, so the fixer's `src/dev/mock.ts` changes will not be in the orchestrator's commit; dev-only, but future UI lanes will need it re-done or the ignore relaxed.\n11. §3.2 step ③ silently reuses a remembered folder from `quarantine-roots.json` while the dialog says only \"暂存到 D 盘\"; show the folder on hover.\n12. Unexplained exit of test PID 102336 and C13 (free-space noise) remain open by design; no evidence to act on.\n\n## 3. 给用户的说明（这次改了什么）\n- 清理快多了：几十万个小文件几十秒就完，不再卡在最后一项。\n- 清理中能点「停止」，已经删的算数，没动的原样留着；清理时关窗会被拦下，先停止再关。\n- 「可放心清理」的缓存直接删，真正腾出空间；「需你判断」的默认暂存到别的盘，可以在「暂存区」整批放回。\n- 弹层里能选去向：D 盘暂存区 / 回收站 / 直接删除 / 其他文件夹；D 盘根目录写不进去时点「授权」一次，或自己挑个文件夹。\n- 清理前显示预计用时，清理中显示还剩多久。\n- 完成页的大数字是实测多出来的空间，下面分别写直接删了多少、暂存了多少、跳过多少。\n- 数字为什么比首页小，点「跳过 N 个」能看到原因（正在使用、刚改过、没权限……）。\n- 首页能换盘扫描；窗口缩到竖屏大小也不变形。\n- 分析页能选到 C:\\ 根目录和 Users，方块图有图例。\n- 设置页改名加了说明，AI 识别可一键选 DeepSeek / 通义 / Kimi / OpenAI / 本机。\n- 程序如果中途被结束，下次打开会提示「上次清理中断，已处理 N 个」。\n\nFiles I changed: none (review only). Scratch file written: `C:\\Users\\king\\AppData\\Local\\Temp\\claude\\D--desk-claudex-13\\13680466-cb4e-4db2-8449-e9655c7ca804\\scratchpad\\confirm.diff` (diff copy for reading)."
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "F1"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Check"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Fix"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 4,
+      "title": "Sign-off"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "F1: execution UI",
+      "phaseIndex": 1,
+      "phaseTitle": "F1",
+      "agentId": "a6c50650a537c9da9",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791336214917,
+      "queuedAt": 1791336214915,
+      "attempt": 1,
+      "lastToolName": "Bash",
+      "lastToolSummary": "git check-ignore -v src/dev/mock.ts src/dev/nav.ts; git dif…",
+      "promptPreview": "Project: DiskWhy — Windows C-drive cleanup assistant. Repo D:\\desk\\claudex\\13\\diskwhy, git branch phase-j (last commit 55566e0 = unreviewed WIP of this phase). Tauri 2 + Rust core crates/diskwhy-core + CLI crates/diskwhy-cli + Tauri shell src-tauri + Vue 3 frontend src/. Read docs/PHASE_J_PLAN.md (§0 facts from the user's machine, §3 binding decisions) and docs/PHASE_J_CRASH.md. The previous lanes…",
+      "promptFramed": true,
+      "lastProgressAt": 1791337878393,
+      "tokens": 404443,
+      "toolCalls": 165,
+      "durationMs": 1663474,
+      "resultPreview": "F1 (the cleanup and execution UI) is done. `npm test` passes (72/72) and `npm run build` passes. I also ran your current backend in the existing debug exe through UI Automation, but only up to the confirm dialog: no cleanup was run, nothing was authorized and no files were touched.\n\n**Files changed**\n- `src/api.ts`: types and wrappers for every new or changed command, event and field in the backen…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "R: llm temperature",
+      "phaseIndex": 1,
+      "phaseTitle": "F1",
+      "agentId": "a4b0569a0a36c170a",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791336214918,
+      "queuedAt": 1791336214915,
+      "attempt": 1,
+      "lastToolName": "Bash",
+      "lastToolSummary": "CARGO_INCREMENTAL=0 cargo test -p diskwhy-core 2>&1 | grep …",
+      "promptPreview": "Project: DiskWhy — Windows C-drive cleanup assistant. Repo D:\\desk\\claudex\\13\\diskwhy, git branch phase-j (last commit 55566e0 = unreviewed WIP of this phase). Tauri 2 + Rust core crates/diskwhy-core + CLI crates/diskwhy-cli + Tauri shell src-tauri + Vue 3 frontend src/. Read docs/PHASE_J_PLAN.md (§0 facts from the user's machine, §3 binding decisions) and docs/PHASE_J_CRASH.md. The previous lanes…",
+      "promptFramed": true,
+      "lastProgressAt": 1791337116600,
+      "tokens": 95537,
+      "toolCalls": 26,
+      "durationMs": 901680,
+      "resultPreview": "Kimi will no longer reject the request. The backend now sends no `temperature` at all, and `cargo test -p diskwhy-core` passes. All five presets check out against official docs today. Two are worth a second look: 通义千问's address is now the \"old\" one (it still works) and OpenAI's model is a reasoning model.\n\n**Fix choice.** I dropped `temperature`, `top_p` and `max_tokens` from every request instead…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "verify: real exe r1",
+      "phaseIndex": 2,
+      "phaseTitle": "Check",
+      "agentId": "a08b1b84b6201093c",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791337878420,
+      "queuedAt": 1791337878396,
+      "attempt": 1,
+      "lastToolName": "PowerShell",
+      "lastToolSummary": "Get-ChildItem \"$env:LOCALAPPDATA\\DiskWhy\" -Force -Recurse |…",
+      "promptPreview": "Project: DiskWhy — Windows C-drive cleanup assistant. Repo D:\\desk\\claudex\\13\\diskwhy, git branch phase-j (last commit 55566e0 = unreviewed WIP of this phase). Tauri 2 + Rust core crates/diskwhy-core + CLI crates/diskwhy-cli + Tauri shell src-tauri + Vue 3 frontend src/. Read docs/PHASE_J_PLAN.md (§0 facts from the user's machine, §3 binding decisions) and docs/PHASE_J_CRASH.md. The previous lanes…",
+      "promptFramed": true,
+      "lastProgressAt": 1791339739156,
+      "tokens": 345183,
+      "toolCalls": 167,
+      "durationMs": 1860732,
+      "resultPreview": "**Phase J real-exe verification, round 1**\n\nMost of the user's complaints check out on the real exe. The release build, `cargo test` and `npm test` all pass. Two things are not fully right: the numbers shown before a cleanup can promise much more space than it frees, and log rotation can wipe the user's 138 MB `actions.log`, which is the evidence of the 06:19 interrupted run. One test leftover cou…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "review: safety",
+      "phaseIndex": 2,
+      "phaseTitle": "Check",
+      "agentId": "ac6d3bec0e331fa91",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791337878421,
+      "queuedAt": 1791337878396,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Review lens: DELETION SAFETY. This phase added permanent deletion (safe tier deletes directly), whole-folder recycle, a unified multi-threaded work queue, cross-volume CopyFileExW, own-data protection, live-Chromium-cache skipping, recycle_unavailable pre-filtering, quarantine fallback chain + elevated helper (--mkdir-quarantine, icacls grant). Diff: git diff master...HEAD plus the working tree (g…",
+      "promptFramed": true,
+      "lastProgressAt": 1791338459694,
+      "tokens": 247995,
+      "toolCalls": 55,
+      "durationMs": 581269,
+      "resultPreview": "{\"findings\":[{\"severity\":\"critical\",\"file\":\"crates/diskwhy-core/src/action/winops.rs\",\"line\":422,\"title\":\"Recycle mode silently and permanently deletes a whole batch (or whole folder) when any path is 260 characters or longer\",\"evidence\":\"Phase J removed FOF_WANTNUKEWARNING from RECYCLE_FLAGS. The pre-filters (RecycleBinInfo::refuse, which skip_unrecyclable at preflight.rs:450 and bin_refuse at ex…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "review: concurrency",
+      "phaseIndex": 2,
+      "phaseTitle": "Check",
+      "agentId": "a68fc8f20e598b5e0",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791337878423,
+      "queuedAt": 1791337878396,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Review lens: CONCURRENCY / CORRECTNESS OF NUMBERS. Unified chunk queue with per-item countdown, empty-dir removal by the last finisher, manifest flush every 10 s, cancel semantics, ~200 ms progress timer, cost-weighted progress monotonicity, est_secs/perf.json EMA, freed_bytes measurement (multiple source volumes, concurrent writers), by_dest / skipped_by_reason accounting, runstate last-run.json …",
+      "promptFramed": true,
+      "lastProgressAt": 1791338387447,
+      "tokens": 240396,
+      "toolCalls": 32,
+      "durationMs": 507010,
+      "resultPreview": "{\"findings\":[{\"severity\":\"medium\",\"file\":\"crates/diskwhy-core/src/action/execute.rs\",\"line\":525,\"title\":\"Quarantine manifest only reaches disk every 10 s; after a kill, files moved in that window are not shown and cannot be restored from the UI\",\"evidence\":\"execute() saves an empty Manifest at start (line 378). After that, entries go only to the in-memory Mutex<Option<Manifest>> (add_manifest, lin…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "review: ux",
+      "phaseIndex": 2,
+      "phaseTitle": "Check",
+      "agentId": "a5dc2611359177382",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791337878424,
+      "queuedAt": 1791337878396,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Review lens: USER-FACING BEHAVIOUR vs the user's complaints and the binding decisions in docs/PHASE_J_PLAN.md §3. Read the user's complaint list in §0/§1, then the frontend diff (git diff master...HEAD -- src/ plus working tree): HomePage, CapacityColumn, CleanupPage, ExplorePage, TreemapView, SettingsPage, QuarantinePage, ConfirmDialog, TitleBar, store.ts, labels.ts, layout.ts, tokens.css. Also l…",
+      "promptFramed": true,
+      "lastProgressAt": 1791338571502,
+      "tokens": 261867,
+      "toolCalls": 95,
+      "durationMs": 691066,
+      "resultPreview": "{\"findings\":[{\"severity\":\"medium\",\"file\":\"src/components/ConfirmDialog.vue\",\"line\":502,\"title\":\"The 改放 D 盘 chip deletes files outright instead of moving them to D\",\"evidence\":\"I ran this in the dev server with Playwright and Edge. I opened the dialog with only 可放心清理 items and picked 回收站 from the menu, so the line read '可放心清理 进回收站'. The row '回收站在 C 盘，不腾空间 [改放 D 盘]' was shown. After clicking 改放 D 盘 …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "fixer",
+      "phaseIndex": 3,
+      "phaseTitle": "Fix",
+      "agentId": "aefbe44fff45247fd",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791339739161,
+      "queuedAt": 1791339739158,
+      "attempt": 1,
+      "lastToolName": "Bash",
+      "lastToolSummary": "git ls-files src/dev/mock.ts src/labels.exec.test.ts; git s…",
+      "promptPreview": "Project: DiskWhy — Windows C-drive cleanup assistant. Repo D:\\desk\\claudex\\13\\diskwhy, git branch phase-j (last commit 55566e0 = unreviewed WIP of this phase). Tauri 2 + Rust core crates/diskwhy-core + CLI crates/diskwhy-cli + Tauri shell src-tauri + Vue 3 frontend src/. Read docs/PHASE_J_PLAN.md (§0 facts from the user's machine, §3 binding decisions) and docs/PHASE_J_CRASH.md. The previous lanes…",
+      "promptFramed": true,
+      "lastProgressAt": 1791341983275,
+      "tokens": 427982,
+      "toolCalls": 154,
+      "durationMs": 2244114,
+      "resultPreview": "I fixed nearly everything that held up against the code. I refuted one finding (C9), and two others (C13 and the unexplained exit) are left unfixed. All tests and builds pass. The new UI behaviour was checked in the dev server only, not on the real exe.\n\nBefore fixing, I tried to refute each finding against the code. Three findings changed what the app does with files, so they come first:\n- **S1 (…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "verify: real exe r2",
+      "phaseIndex": 3,
+      "phaseTitle": "Fix",
+      "agentId": "a5cdc4d239fbcab1b",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791341983287,
+      "queuedAt": 1791341983285,
+      "attempt": 1,
+      "lastToolName": "PowerShell",
+      "lastToolSummary": "(Get-ChildItem D:\\desk\\claudex\\13\\diskwhy\\docs\\screenshots …",
+      "promptPreview": "Project: DiskWhy — Windows C-drive cleanup assistant. Repo D:\\desk\\claudex\\13\\diskwhy, git branch phase-j (last commit 55566e0 = unreviewed WIP of this phase). Tauri 2 + Rust core crates/diskwhy-core + CLI crates/diskwhy-cli + Tauri shell src-tauri + Vue 3 frontend src/. Read docs/PHASE_J_PLAN.md (§0 facts from the user's machine, §3 binding decisions) and docs/PHASE_J_CRASH.md. The previous lanes…",
+      "promptFramed": true,
+      "lastProgressAt": 1791344734905,
+      "tokens": 346534,
+      "toolCalls": 158,
+      "durationMs": 2751618,
+      "resultPreview": "I built and tested the release exe; most complaints check out, but three things need attention. A ~20-second cleanup took 24–30 s and showed 快好了 for the last 16 s. The drive-space numbers before and after a cleanup can mislead, and on the synthetic run the done page reported space freed (0.18 GB) while also saying 0 B were deleted. I changed no source code. All test data, the demo rule and the ext…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "Fable sign-off",
+      "phaseIndex": 4,
+      "phaseTitle": "Sign-off",
+      "agentId": "a0d521c54ac1720b4",
+      "model": "claude-fable-5-1",
+      "state": "done",
+      "startedAt": 1791344734911,
+      "queuedAt": 1791344734908,
+      "attempt": 1,
+      "lastToolName": "Bash",
+      "lastToolSummary": "grep -n \"elevated_mkdir_from_args\\|crash::install\\|pub fn r…",
+      "promptPreview": "Project: DiskWhy — Windows C-drive cleanup assistant. Repo D:\\desk\\claudex\\13\\diskwhy, git branch phase-j (last commit 55566e0 = unreviewed WIP of this phase). Tauri 2 + Rust core crates/diskwhy-core + CLI crates/diskwhy-cli + Tauri shell src-tauri + Vue 3 frontend src/. Read docs/PHASE_J_PLAN.md (§0 facts from the user's machine, §3 binding decisions) and docs/PHASE_J_CRASH.md. The previous lanes…",
+      "promptFramed": true,
+      "lastProgressAt": 1791345159854,
+      "tokens": 247217,
+      "toolCalls": 35,
+      "durationMs": 424942,
+      "resultPreview": "# Phase J final sign-off (read-only review)\n\n**Verdict: SHIPPABLE** to `D:\\desk\\claudex\\13\\DiskWhy-app` — with two pre-ship housekeeping steps (no code changes required). Nothing I found breaks the §3 deletion-safety decisions or leaves one of the user's original complaints unaddressed.\n\n## What I checked\n- `docs/PHASE_J_PLAN.md` §0/§3, `docs/PHASE_J_CRASH.md`, build-1 reports (`rMain` \"not done\" …"
+    }
+  ],
+  "totalTokens": 2617154,
+  "totalToolCalls": 887
+}

@@ -487,9 +487,9 @@ pub fn gain(tier: Tier, how: &[How], allocated: u64) -> (u64, String) {
         Tier::Safe => (allocated, format!("用建议的工具清理，最多可腾出约 {sz}")),
         Tier::Review if can_delete => (allocated, format!("删掉最多可腾出 {sz}，但有代价，见“删了会失去什么”")),
         Tier::Review if how.contains(&How::BuiltinTool) => (allocated, format!("用系统工具处理，最多可腾出约 {sz}，具体由工具决定")),
-        Tier::Review if how.contains(&How::Migrate) => (0, format!("不建议直接删；迁到别的盘可让 C 盘腾出约 {sz}")),
+        Tier::Review if how.contains(&How::Migrate) => (0, format!("不建议直接删；迁到别的盘可让这个盘腾出约 {sz}")),
         Tier::Review => (0, format!("占 {sz}；得先弄清楚是什么再决定，这里不估算能腾多少")),
-        Tier::Keep if how.contains(&How::Migrate) => (0, format!("不能删；迁到别的盘可让 C 盘腾出约 {sz}")),
+        Tier::Keep if how.contains(&How::Migrate) => (0, format!("不能删；迁到别的盘可让这个盘腾出约 {sz}")),
         Tier::Keep if how.contains(&How::BuiltinTool) => {
             (0, format!("不能手动删；用系统自带工具清理能腾出一部分（最多 {sz}），多少由工具决定"))
         }

@@ -613,7 +613,7 @@ fn signature(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Option<Hint> {
                     why: "你（或浏览器）下载软件时保存的安装文件".into(),
                     lose: "软件装好后安装包一般就用不上了；删了以后想重装得重新下载。个别安装包是现在很难再下到的旧版本，先确认。".into(),
                     how: vec![How::Delete],
-                    how_detail: "确认对应软件已经装好、以后不需要再装，删掉即可（默认进回收站）。".into(),
+                    how_detail: "确认对应软件已经装好、以后不需要再装，删掉即可（默认放进别的盘的暂存区，可以放回）。".into(),
                     confidence: 0.6,
                     owner: None,
                     clues: vec![format!("在“下载”文件夹里，.iso/.msi/.exe 占 {}", pct(inst_share))],

@@ -18,6 +18,8 @@ export interface EnvInfo {
   rule_warnings: string[];
   registry_apps: number;
   llm_ready: boolean;
+  /** Windows 所在的盘（"C:\\"），默认暂存区不放这里 */
+  system_drive?: string;
 }
 
 // ───── 阶段 B：解释 ─────
@@ -296,7 +298,37 @@ export function startScan(root: string, onProgress: (p: ScanProgress) => void): 
 }
 
 // ───── 阶段 D：带护栏的动作 ─────
-export type Strategy = { kind: "recycle_bin" } | { kind: "quarantine"; dest_root: string };
+/** 怎么删（阶段 J 加了 permanent = 直接删除）。safe 档默认直接删，strategy 只管 review 档（见 previewPlan 的 safeDirect） */
+export type Strategy = { kind: "recycle_bin" } | { kind: "quarantine"; dest_root: string } | { kind: "permanent" };
+/** 一条实际去了哪里 */
+export type DestKind = "permanent" | "recycle" | "quarantine";
+export interface CountBytes {
+  count: number;
+  bytes: number;
+}
+/** 按去向分别多少个 / 多少字节 */
+export interface ByDest {
+  permanent: CountBytes;
+  recycle: CountBytes;
+  quarantine: CountBytes;
+  /** 本该进回收站、却被 Windows 直接删掉的（旧报告没有） */
+  nuked?: CountBytes;
+}
+/**
+ * 跳过原因代码（预检 / 执行报告共用）：hot / cloud / locked / no_permission / protected / changed / missing / unreadable /
+ * hardlink（跨盘暂存的硬链接，删了不腾空间）/ recycle_unavailable（回收站收不下，送进去会被直接删掉）
+ */
+export type SkipCode =
+  | "hot"
+  | "cloud"
+  | "locked"
+  | "no_permission"
+  | "protected"
+  | "changed"
+  | "missing"
+  | "unreadable"
+  | "hardlink"
+  | "recycle_unavailable";
 export type EntryKind = "file" | "link" | "cloud_dir";
 
 export interface PlanRequest {
@@ -374,6 +406,8 @@ export interface DriveChoice {
   label: string;
   free_bytes: number;
   total_bytes: number;
+  /** 阶段 J：这个盘上已经能用的暂存区位置；null = 要先 prepareQuarantine / elevateQuarantine 或让用户选文件夹 */
+  dest_root?: string | null;
 }
 
 export interface PreflightReport {
@@ -395,6 +429,16 @@ export interface PreflightReport {
   /** 阶段 G：true = 弹层先用的估算（扫描时的大小），逐个文件的检查还在后台进行，不能执行 */
   pending: boolean;
   timing_ms: Record<string, number>;
+  /** 阶段 J：safe 档是否直接删除 */
+  safe_direct?: boolean;
+  /** 阶段 J：预计用时（秒）；pending 时为 0 = 还不知道 */
+  est_secs?: number;
+  /** 阶段 J：按去向分（pending 时个数为 0、字节按扫描时的大小） */
+  by_dest?: ByDest;
+  skipped_bytes?: number;
+  skipped_by_reason?: Record<string, CountBytes>;
+  /** 阶段 J：扫描时的估算总量（= quote 的 total_bytes），用来解释“数字为什么变小了” */
+  scan_total_bytes?: number;
 }
 
 /** 预检进度（阶段 G） */
@@ -417,11 +461,20 @@ export type PreviewEvent =
 /** 后端取消预检时 invoke 失败的原文 */
 export const PREVIEW_CANCELLED = "已取消";
 
+/** 执行进度（约每 200 ms 一次，最后再发一次）。进度条 = cost_done / cost_total（按估计耗时加权，单调） */
 export interface ExecProgress {
   done: number;
   total: number;
   bytes_done: number;
+  total_bytes: number;
+  cost_done: number;
+  cost_total: number;
+  elapsed_ms: number;
   current: string;
+  /** 已经收到停止，正在收尾 */
+  cancelling: boolean;
+  /** 执行已结束、报告可以取了（后端随后还要重扫几秒） */
+  finished?: boolean;
 }
 
 export interface EntryResult {
@@ -431,6 +484,7 @@ export interface EntryResult {
   result: "ok" | "skipped" | "failed";
   reason: string;
   dest: string | null;
+  dest_kind?: DestKind | null;
 }
 
 export interface ItemResult {
@@ -443,6 +497,11 @@ export interface ItemResult {
   links_removed: number;
   dirs_removed: number;
   details: EntryResult[];
+  skipped_bytes?: number;
+  failed_bytes?: number;
+  by_dest?: ByDest;
+  not_processed?: number;
+  not_processed_bytes?: number;
 }
 
 export interface ExecReport {
@@ -461,7 +520,35 @@ export interface ExecReport {
   cancelled: boolean;
   affected_dirs: string[];
   notes: string[];
+  /** 阶段 J：源盘执行前后剩余空间的实测差值（≥ 0） */
+  freed_bytes?: number;
+  by_dest?: ByDest;
+  skipped_bytes?: number;
+  skipped_by_reason?: Record<string, CountBytes>;
+  failed_bytes?: number;
+  /** 停止时还没处理、原样没动的 */
+  not_processed?: CountBytes;
+  duration_ms?: number;
+  safe_direct?: boolean;
+  workers?: number;
 }
+
+/** 上次被打断的清理（last_interrupted） */
+export interface Interrupted {
+  batch: string;
+  /** unix 秒 */
+  started: number;
+  processed: number;
+  processed_bytes: number;
+  total: number;
+  /** Windows 记下的异常退出码（如 0x8f），没有为 null */
+  exit_code?: string | null;
+  /** 这次清理之后 crash.log 里有崩溃记录 */
+  crash_logged?: boolean;
+}
+
+/** prepare_quarantine / elevate_quarantine 的结果 */
+export type DestStatus = { status: "ok"; dest_root: string } | { status: "needs_elevation" } | { status: "failed"; message: string };
 
 export interface RefreshReport {
   rescanned: string[];
@@ -528,10 +615,16 @@ export interface Guidance {
 
 export const actionEnv = () => invoke<ActionEnv>("action_env");
 /** 预检：先收到 quote（弹层立刻出现），之后是 progress，全部检查完 promise 才返回完整报告 */
-export function previewPlan(items: PlanRequest[], strategy: Strategy, onEvent: (e: PreviewEvent) => void): Promise<PreflightReport> {
+/** safeDirect（默认 true）：safe 档直接删；用户明确选了「回收站」时传 false，safe 也进回收站 */
+export function previewPlan(
+  items: PlanRequest[],
+  strategy: Strategy,
+  onEvent: (e: PreviewEvent) => void,
+  safeDirect = true,
+): Promise<PreflightReport> {
   const ch = new Channel<PreviewEvent>();
   ch.onmessage = onEvent;
-  return invoke<PreflightReport>("preview_plan", { items, strategy, onEvent: ch });
+  return invoke<PreflightReport>("preview_plan", { items, strategy, safeDirect, onEvent: ch });
 }
 export const cancelPreview = () => invoke<void>("cancel_preview");
 export function executePlan(planId: string, skipLocked: boolean, onProgress: (p: ExecProgress) => void): Promise<ExecOutcome> {
@@ -539,6 +632,26 @@ export function executePlan(planId: string, skipLocked: boolean, onProgress: (p:
   ch.onmessage = onProgress;
   return invoke<ExecOutcome>("execute_plan", { planId, skipLocked, onProgress: ch });
 }
+/** 停止正在进行的执行；true = 确实有一个在执行（它会尽快返回 cancelled = true 的报告） */
+export const cancelExecute = () => invoke<boolean>("cancel_execute");
+/** 现在是否有执行 / 还原 / 清空在进行（界面重载后恢复状态用） */
+export const actionStatus = () => invoke<boolean>("action_status");
+/** 执行中最近一次进度（重新附着用；没在执行为 null） */
+export const execProgress = () => invoke<ExecProgress | null>("exec_progress");
+/** 本次运行里最近一次执行的报告 */
+export const lastExecReport = () => invoke<ExecReport | null>("last_exec_report");
+/** 上次清理被打断了吗（正在执行时也返回 null） */
+export const lastInterrupted = () => invoke<Interrupted | null>("last_interrupted");
+export const dismissInterrupted = () => invoke<null>("dismiss_interrupted");
+/** 前端错误记进 crash.log（每次运行最多 200 条） */
+export const logFrontendError = (message: string, stack?: string, source?: string) =>
+  invoke<null>("log_frontend_error", { message, stack: stack ?? null, source: source ?? null });
+/** 某个盘（"D:\\"）上能用的暂存区位置（不提权；可能会建 X:\DiskWhy暂存区） */
+export const prepareQuarantine = (driveRoot: string) => invoke<DestStatus>("prepare_quarantine", { driveRoot });
+/** 提权建暂存区（UAC 一次）；用户取消授权也是 failed */
+export const elevateQuarantine = (driveRoot: string) => invoke<DestStatus>("elevate_quarantine", { driveRoot });
+/** 执行中拦下了关窗（✕ / Alt+F4 / 任务栏），payload 为 null */
+export const CLOSE_BLOCKED_EVENT = "close-blocked";
 export const listQuarantine = () => invoke<BatchInfo[]>("list_quarantine");
 export const restoreBatch = (manifestPath: string) =>
   invoke<{ report: RestoreReport; summary: ScanSummary | null }>("restore_batch", { manifestPath });

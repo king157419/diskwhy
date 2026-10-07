@@ -828,6 +828,106 @@ fn llm_end_to_end_against_local_fake_server() {
     if !user.is_empty() && p.to_lowercase().contains(&format!(r"\users\{user}\")) {
         assert!(!raw.to_lowercase().contains(&format!(r"users\\\\{user}")), "真实请求里用户名没脱敏");
     }
+    // Kimi K2.6+ 固定 temperature/top_p，传了就 400：真实请求里不能有任何采样参数。
+    for k in ["temperature", "top_p", "max_tokens"] {
+        assert!(!raw.contains(&format!("\"{k}\"")), "请求里不该带 {k}：{raw}");
+    }
+}
+
+// ───────────────────────── 阶段 J：多家服务商预设（DeepSeek / 通义 / Kimi / OpenAI / Ollama） ─────────────────────────
+
+#[test]
+fn llm_request_body_sends_no_sampling_params() {
+    let input = llm::LlmInput {
+        name: "x".into(),
+        parent: "~".into(),
+        kind: "文件夹".into(),
+        total_size: "1 GB".into(),
+        files: 1,
+        dirs: 0,
+        top_children: vec![],
+        extensions: vec![],
+        modified: "2026-01-01".into(),
+    };
+    let b = llm::build_request_body("kimi-k2.6", &input);
+    let o = b.as_object().unwrap();
+    for k in ["temperature", "top_p", "max_tokens", "n", "presence_penalty", "frequency_penalty"] {
+        assert!(!o.contains_key(k), "不该发 {k}：{b}");
+    }
+    assert_eq!(o["model"], "kimi-k2.6");
+    assert_eq!(o["stream"], false);
+}
+
+#[test]
+fn llm_preset_urls_build_official_endpoints() {
+    // 各家官方文档里的 chat/completions 完整地址
+    assert_eq!(llm::chat_url("https://api.deepseek.com"), "https://api.deepseek.com/chat/completions");
+    assert_eq!(llm::chat_url("https://dashscope.aliyuncs.com/compatible-mode/v1"), "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+    assert_eq!(llm::chat_url("https://api.moonshot.cn/v1"), "https://api.moonshot.cn/v1/chat/completions");
+    assert_eq!(llm::chat_url("https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions");
+    assert_eq!(llm::chat_url(" http://localhost:11434/v1/ "), "http://localhost:11434/v1/chat/completions");
+}
+
+#[test]
+fn llm_parse_tolerates_fences_reasoning_and_think() {
+    let ok = |s: &str| llm::parse_answer(s).unwrap_or_else(|e| panic!("应能解析：{e}\n{s}"));
+    // 1) 代码块，没写 json 标签
+    let a = ok("```\n{\"what\":\"缓存\",\"owner\":\"\",\"why\":\"w\",\"lose\":\"l\",\"confidence\":0.5}\n```");
+    assert_eq!(a.what, "缓存");
+    // 2) 先推理（推理里带花括号），再给 JSON，后面还补一句（也带花括号）
+    let a = ok("我来分析一下。名字里有 {cache} 字样，结构像 {a:b}。\n结论：\n```json\n{\"what\":\"浏览器缓存\",\"owner\":\"Edge\",\"why\":\"上网自动存\",\"lose\":\"网页第一次打开慢一点\",\"confidence\":0.8}\n```\n以上仅供参考 {完}");
+    assert_eq!(a.what, "浏览器缓存");
+    assert_eq!(a.owner, "Edge");
+    assert!((a.confidence - 0.8).abs() < 1e-6);
+    // 3) <think> 思考段（Ollama 的 qwen3 / deepseek-r1），思考里有一个“示例” JSON
+    let a = ok("<think>格式应该是 {\"what\":\"示例\"}，嗯……</think>\n{\"what\":\"游戏录像\",\"why\":\"自动录\",\"lose\":\"录像没了\",\"confidence\":\"0.4\"}");
+    assert_eq!(a.what, "游戏录像");
+    assert!((a.confidence - 0.4).abs() < 1e-6, "字符串 confidence 也认");
+    // 4) 推理里先举了个例子 JSON，正式答案在后：取最后一个
+    let a = ok("比如 {\"what\":\"举例\"} 这种。我的回答：{\"what\":\"正式答案\",\"confidence\":70}");
+    assert_eq!(a.what, "正式答案");
+    assert!((a.confidence - 0.7).abs() < 1e-6, "0–100 的百分数换成 0–1");
+    // 5) 字符串里带花括号、owner 是 null、confidence 是 "60%"
+    let a = ok("{\"what\":\"模板 {x} 的输出\",\"owner\":null,\"why\":\"}\",\"lose\":\"不确定\",\"confidence\":\"60%\"}");
+    assert_eq!(a.what, "模板 {x} 的输出");
+    assert_eq!(a.owner, "");
+    assert_eq!(a.why, "}");
+    assert!((a.confidence - 0.6).abs() < 1e-6);
+    // 6) 坏的
+    assert!(llm::parse_answer("我不知道").is_err());
+    assert!(llm::parse_answer("{\"what\":\"\"}").is_err());
+    assert!(llm::parse_answer("<think>{\"what\":\"只在思考里\"}").is_err(), "没闭合的思考段整段丢掉");
+    assert!(llm::parse_answer("{\"what\": \"截断了").is_err());
+    let a = ok("{\"what\":\"x\",\"confidence\":-3}");
+    assert_eq!(a.confidence, 0.0);
+}
+
+#[test]
+fn llm_retry_drops_only_params_the_server_named() {
+    let b = serde_json::json!({"model":"m","temperature":0.2,"top_p":0.9,"messages":[]});
+    // Kimi 的真实报错文案（见 MoonshotAI/kimi-cli#1924）
+    let kimi = r#"{"error":{"message":"invalid temperature: only 0.6 is allowed for this model","type":"invalid_request_error"}}"#;
+    assert_eq!(llm::params_to_drop(&b, 400, kimi), vec!["temperature"]);
+    // OpenAI 推理模型的报错
+    let oai = r#"{"error":{"message":"Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported.","param":"temperature"}}"#;
+    assert_eq!(llm::params_to_drop(&b, 400, oai), vec!["temperature"]);
+    // 不是 400、没点名、或请求里本来就没有这个参数：不重试
+    assert!(llm::params_to_drop(&b, 401, kimi).is_empty());
+    assert!(llm::params_to_drop(&b, 400, "model not found").is_empty());
+    let no_t = serde_json::json!({"model":"m","messages":[]});
+    assert!(llm::params_to_drop(&no_t, 400, kimi).is_empty());
+}
+
+#[test]
+fn llm_test_connection_sends_no_max_tokens_and_strips_think() {
+    let (url, h) = fake_server("<think>用户要我说你好</think>你好");
+    let s = LlmSettings { enabled: true, base_url: url, model: "gpt-5.4-mini".into(), api_key: "sk-test".into() };
+    let r = llm::test_connection(&s).expect("假服务器应返回成功");
+    let raw = h.join().unwrap();
+    assert!(r.contains("你好") && !r.contains("think"), "{r}");
+    for k in ["temperature", "max_tokens"] {
+        assert!(!raw.contains(&format!("\"{k}\"")), "测试连接不该带 {k}：{raw}");
+    }
 }
 
 // ───────────────────────── 阶段 C：管理员才看得到的目录 + 阶段 B 遗留未知项 ─────────────────────────

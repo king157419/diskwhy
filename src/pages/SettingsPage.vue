@@ -235,11 +235,6 @@ h3 {
   font-weight: var(--heading-w);
   margin-bottom: 18px;
 }
-/* C 主题的标题字体（文楷子集）缺“识”“暂”等字：这一页的分区标题统一用界面字体，不在一个词里混两种字体 */
-[data-theme="C"] h3 {
-  font-family: var(--ui);
-  font-weight: var(--w-bold);
-}
 .themes {
   display: flex;
   gap: 18px;

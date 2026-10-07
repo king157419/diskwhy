@@ -285,9 +285,9 @@ describe("上次中断 / 盘名 / 文楷缺字", () => {
     expect(stashFolder("D:\\备份\\")).toBe("D:\\备份\\DiskWhy暂存区");
     expect(stashFolder("D:\\")).toBe("D:\\DiskWhy暂存区");
   });
-  it("文楷子集缺的字", () => {
+  it("文楷子集已重做：界面文案都能用标题字体", () => {
     expect(kaiSafe("清理完成")).toBe(true);
-    expect(kaiSafe("暂存区")).toBe(false);
-    expect(kaiSafe("AI 识别")).toBe(false);
+    expect(kaiSafe("暂存区")).toBe(true);
+    expect(kaiSafe("AI 识别")).toBe(true);
   });
 });

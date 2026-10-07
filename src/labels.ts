@@ -478,8 +478,11 @@ export function driveOf(s: string | null | undefined): string | undefined {
   return m ? driveName(m[0]) : undefined;
 }
 
-/** C 主题标题字体（霞鹜文楷子集）里没有的字：含这些字的元素改用界面字体，避免一个词里两种字体（重做子集要下载上游字体） */
-export const KAI_MISSING = "识暂获密钥义千授准备崩溃退码";
+/**
+ * C 主题标题字体（霞鹜文楷子集）里没有的字：含这些字的元素改用界面字体，避免一个词里两种字体。
+ * 2026-10-07 已按现有界面文案重做子集（scripts/subset-fonts.py），目前没有缺字；以后界面加了新字又没重做子集时填在这里。
+ */
+export const KAI_MISSING = "";
 export function kaiSafe(s: string): boolean {
   for (const ch of s) if (KAI_MISSING.includes(ch)) return false;
   return true;

@@ -132,9 +132,8 @@ function day(unix: number) {
   font-weight: var(--w-med);
   color: var(--ink2);
 }
-/* C 主题的标题字体（文楷子集）没有“暂”字：页名用界面字体，不混字体 */
 [data-theme="C"] .k {
-  font-family: var(--ui);
+  font-family: var(--heading);
   font-weight: 700;
   font-size: 22px;
   color: var(--ink);

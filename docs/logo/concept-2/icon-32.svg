@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+  <path d="M8,2L24,2A6,6 0 0 1 30,8L30,19A6,6 0 0 1 24,25L11,25L2,30L2,8A6,6 0 0 1 8,2Z" fill="#141412"/>
+  <path d="M8,4L16,4A1,1 0 0 1 17,5L17,22A1,1 0 0 1 16,23L10.48,23L4,26.6L4,8A4,4 0 0 1 8,4Z" fill="#d4f24a"/>
+  <path d="M20,4H24A4,4 0 0 1 28,8V11A1,1 0 0 1 27,12H20A1,1 0 0 1 19,11V5A1,1 0 0 1 20,4Z" fill="#f6f1e4"/>
+  <path d="M20,14H27A1,1 0 0 1 28,15V19A4,4 0 0 1 24,23H20A1,1 0 0 1 19,22V15A1,1 0 0 1 20,14Z" fill="#ff8a73"/>
+</svg>

@@ -1,0 +1,104 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+@font-face{font-family:Geist;src:url(../../../src/assets/fonts/Geist-latin.woff2) format("woff2");font-weight:100 900}
+@font-face{font-family:NotoSC;src:url(../../../src/assets/fonts/NotoSansSC-DiskWhy.woff2) format("woff2");font-weight:100 900}
+*{box-sizing:border-box}
+body{margin:0;width:1600px;background:#f4f0e6;font-family:Geist,NotoSC,sans-serif;color:#141412;
+  background-image:radial-gradient(#d9d3c4 1.2px,transparent 1.3px);background-size:18px 18px}
+.wrap{padding:40px 48px 48px}
+h1{font-size:40px;margin:0 0 4px;font-weight:800;letter-spacing:-.02em}
+.sub{font-size:18px;color:#46433d;margin:0 0 28px}
+h2{font-size:15px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#46433d;margin:30px 0 12px}
+.row{display:flex;gap:20px;align-items:stretch}
+.card{border:2px solid #141412;border-radius:18px;box-shadow:5px 5px 0 #141412;padding:22px;background:#fff}
+.lt{background:#f3f3f3}.dk{background:#202020;color:#eee}
+.px{image-rendering:pixelated}
+.lad{display:flex;align-items:flex-end;gap:24px}
+.lad figure{margin:0;text-align:center;font-size:12px;color:#86817a}
+.lad figure img{display:block;margin:0 auto 6px}
+.dk .lad figure{color:#999}
+.tb{height:48px;display:flex;align-items:center;justify-content:center;gap:12px;border-radius:10px;padding:0 16px}
+.tb .slot{width:40px;height:40px;border-radius:6px;display:flex;align-items:center;justify-content:center}
+.tb .on{background:rgba(127,127,127,.18)}
+.tb .g{width:24px;height:24px;border-radius:5px}
+.title{height:32px;display:flex;align-items:center;gap:8px;padding:0 12px;font-size:13px}
+.title .ctl{margin-left:auto;display:flex;gap:22px;opacity:.55;font-size:12px}
+.win{border-radius:8px;overflow:hidden;flex:1;border:1px solid rgba(0,0,0,.15)}
+.win .body{height:56px}
+.tag{font-size:12px;color:#86817a;margin-top:8px}
+</style></head><body><div class="wrap">
+<h1>concept-1 · “嗯？盒” (Huh? Box)</h1>
+<p class="sub">一个柠檬绿小盒子歪着头、掀开盖子，好奇地“嗯？”一声 —— 打开你的磁盘，看看里面到底是什么。</p>
+
+<div class="row">
+  <div class="card lt" style="flex:0 0 330px;text-align:center"><img src="png/mark-256.png" width="256"><div class="tag">256 · light #f3f3f3</div></div>
+  <div class="card dk" style="flex:0 0 330px;text-align:center"><img src="png/mark-256.png" width="256"><div class="tag">256 · dark #202020</div></div>
+  <div class="card" style="flex:1;background:#d4f24a;display:flex;align-items:center;justify-content:center;gap:36px">
+     <img src="wip/mono-ink.svg" width="150">
+     <div style="background:#f3f1ec;border-radius:14px;padding:16px"><img src="wip/mono-green.svg" width="96"></div>
+     <div style="background:#14110e;border-radius:14px;padding:16px"><img src="wip/mono-gold.svg" width="96"></div>
+     <div class="tag" style="color:#46433d;width:120px">one-colour<br>mark-mono.svg<br>ink / A green / B gold</div>
+  </div>
+</div>
+
+<h2>Size ladder — 1× real pixels, then 24 / 16 enlarged ×4 (nearest-neighbour)</h2>
+<div class="row">
+ <div class="card lt" style="flex:1"><div class="lad">
+   <figure><img src="png/mark-64.png" width="64">64</figure>
+   <figure><img src="png/mark-48.png" width="48">48</figure>
+   <figure><img src="png/mark-32.png" width="32">32</figure>
+   <figure><img src="png/mark-24-24.png" width="24">24</figure>
+   <figure><img src="png/mark-16-16.png" width="16">16</figure>
+   <figure><img class="px" src="png/mark-24-24.png" width="96">24 hand ×4</figure>
+   <figure><img class="px" src="png/mark-16-16.png" width="64">16 hand ×4</figure>
+   <figure><img class="px" src="png/mark-24.png" width="96">24 auto ×4</figure>
+   <figure><img class="px" src="png/mark-16.png" width="64">16 auto ×4</figure>
+ </div></div>
+ <div class="card dk" style="flex:1"><div class="lad">
+   <figure><img src="png/mark-64.png" width="64">64</figure>
+   <figure><img src="png/mark-48.png" width="48">48</figure>
+   <figure><img src="png/mark-32.png" width="32">32</figure>
+   <figure><img src="png/mark-24-24.png" width="24">24</figure>
+   <figure><img src="png/mark-16-16.png" width="16">16</figure>
+   <figure><img class="px" src="png/mark-24-24.png" width="96">24 hand ×4</figure>
+   <figure><img class="px" src="png/mark-16-16.png" width="64">16 hand ×4</figure>
+   <figure><img class="px" src="png/mark-24.png" width="96">24 auto ×4</figure>
+   <figure><img class="px" src="png/mark-16.png" width="64">16 auto ×4</figure>
+ </div></div>
+</div>
+
+<h2>Taskbar at 100% (24 px icons) — light #f3f3f3 / dark #202020</h2>
+<div class="row">
+ <div class="tb" style="flex:1;background:#f3f3f3;border:1px solid #ddd">
+  <div class="slot"><div class="g" style="background:#0067c0"></div></div>
+  <div class="slot"><div class="g" style="background:#f2b600;border-radius:4px"></div></div>
+  <div class="slot on"><img src="png/mark-24-24.png" width="24"></div>
+  <div class="slot"><div class="g" style="background:#2b7d3d;border-radius:50%"></div></div>
+  <div class="slot"><div class="g" style="background:#555"></div></div>
+ </div>
+ <div class="tb" style="flex:1;background:#202020">
+  <div class="slot"><div class="g" style="background:#4cc2ff"></div></div>
+  <div class="slot"><div class="g" style="background:#f2b600;border-radius:4px"></div></div>
+  <div class="slot on"><img src="png/mark-24-24.png" width="24"></div>
+  <div class="slot"><div class="g" style="background:#2b7d3d;border-radius:50%"></div></div>
+  <div class="slot"><div class="g" style="background:#bbb"></div></div>
+ </div>
+</div>
+
+<h2>Title bar at 100% — 16 px mark + “DiskWhy”</h2>
+<div class="row">
+ <div class="win" style="background:#f3f1ec"><div class="title" style="background:#f3f1ec;color:#1c1b18"><img src="mark-16.svg" width="16" height="16"><span>DiskWhy</span><span class="ctl"><span>&#8212;</span><span>&#9744;</span><span>&#10005;</span></span></div><div class="body"></div><div class="tag" style="padding:0 12px 8px">A 浅色 · full colour</div></div>
+ <div class="win" style="background:#f3f1ec"><div class="title" style="background:#f3f1ec;color:#1c1b18"><img src="wip/mono16-green.svg" width="16" height="16"><span>DiskWhy</span><span class="ctl"><span>&#8212;</span><span>&#9744;</span><span>&#10005;</span></span></div><div class="body"></div><div class="tag" style="padding:0 12px 8px">A 浅色 · one-colour green</div></div>
+ <div class="win" style="background:#14110e"><div class="title" style="background:#1b1713;color:#f3ece2"><img src="mark-16.svg" width="16" height="16"><span>DiskWhy</span><span class="ctl"><span>&#8212;</span><span>&#9744;</span><span>&#10005;</span></span></div><div class="body"></div><div class="tag" style="padding:0 12px 8px;color:#7e7468">B 深色 · full colour</div></div>
+ <div class="win" style="background:#14110e"><div class="title" style="background:#1b1713;color:#f3ece2"><img src="wip/mono16-gold.svg" width="16" height="16"><span>DiskWhy</span><span class="ctl"><span>&#8212;</span><span>&#9744;</span><span>&#10005;</span></span></div><div class="body"></div><div class="tag" style="padding:0 12px 8px;color:#7e7468">B 深色 · one-colour gold</div></div>
+ <div class="win" style="background:#f4f0e6"><div class="title" style="background:#f4f0e6;color:#141412;font-weight:500"><img src="mark-16.svg" width="16" height="16"><span>DiskWhy</span><span class="ctl"><span>&#8212;</span><span>&#9744;</span><span>&#10005;</span></span></div><div class="body"></div><div class="tag" style="padding:0 12px 8px">C 卡通 · full colour</div></div>
+</div>
+
+<h2>Horizontal lockup</h2>
+<div class="row">
+ <div class="card" style="flex:1;background:#f4f0e6;display:flex;align-items:center;justify-content:center;height:190px"><img src="lockup.svg" height="110"></div>
+ <div class="card" style="flex:1;background:#f3f1ec;display:flex;align-items:center;justify-content:center;height:190px;box-shadow:none;border-color:#ddd"><img src="lockup.svg" height="80"></div>
+ <div class="card" style="flex:1;background:#14110e;display:flex;align-items:center;justify-content:center;height:190px;box-shadow:none;border-color:#14110e"><img src="lockup-on-dark.svg" height="80"></div>
+</div>
+</div></body></html>

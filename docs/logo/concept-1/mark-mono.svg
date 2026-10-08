@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- one-colour version (fill = currentColor): no shadow, face knocked out. For A/B title bars, docs, print. -->
+  <defs>
+    <mask id="face" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#fff"/>
+      <!-- carve a gap around the lid so it reads as a separate, popped-open piece -->
+      <g transform="translate(52.1 30.5) scale(0.93) rotate(-7 512 650) translate(14 34) rotate(-11 170 352)">
+        <rect x="74" y="168" width="868" height="244" rx="122" fill="#000"/>
+        <rect x="110" y="204" width="796" height="172" rx="86" fill="#fff"/>
+      </g>
+      <g transform="translate(52.1 30.5) scale(0.93) rotate(-7 512 650)">
+        <rect x="356" y="530" width="96" height="156" rx="48" fill="#000"/>
+        <rect x="572" y="530" width="96" height="156" rx="48" fill="#000"/>
+        <ellipse cx="512" cy="772" rx="30" ry="36" fill="#000"/>
+      </g>
+    </mask>
+  </defs>
+  <g fill="currentColor" mask="url(#face)">
+    <g transform="translate(52.1 30.5) scale(0.93) rotate(-7 512 650)">
+      <rect x="140" y="378" width="744" height="544" rx="152"/>
+      <g transform="translate(14 34) rotate(-11 170 352)">
+        <rect x="110" y="204" width="796" height="172" rx="86"/>
+      </g>
+    </g>
+  </g>
+</svg>

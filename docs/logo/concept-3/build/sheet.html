@@ -1,0 +1,104 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+@font-face{font-family:Geist;src:url(Geist-latin.woff2)}
+*{box-sizing:border-box}
+body{margin:0;width:1600px;background:#ebe7dc;color:#141412;font:400 15px Geist,"Microsoft YaHei UI",sans-serif}
+.wrap{padding:44px 56px 56px}
+h1{font:700 34px Geist,"Microsoft YaHei UI",sans-serif;margin:0;letter-spacing:-.01em}
+.sub{margin:8px 0 0;color:#46433d;font-size:17px}
+h2{font:600 13px Geist,sans-serif;letter-spacing:.08em;text-transform:uppercase;color:#86817a;margin:36px 0 12px}
+.row{display:flex;gap:20px;align-items:stretch}
+.card{border-radius:14px;padding:22px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+.cap{font-size:12px;color:#86817a;text-align:center}
+.dark .cap{color:#8a8378}
+.px{image-rendering:pixelated}
+.ladder{display:flex;align-items:flex-end;gap:26px;padding:22px 26px;border-radius:14px}
+.ladder figure{margin:0;display:flex;flex-direction:column;align-items:center;gap:8px}
+.ladder figcaption{font-size:11px;opacity:.6}
+.taskbar{height:48px;border-radius:8px;display:flex;align-items:center;justify-content:center;gap:6px;padding:0 12px}
+.taskbar .slot{width:40px;height:40px;border-radius:5px;display:grid;place-items:center}
+.taskbar .ph{width:24px;height:24px;border-radius:6px;opacity:.85}
+</style>
+<div class="wrap">
+  <h1>Concept 3 · “Di” 字标</h1>
+  <p class="sub">一个粗壮的 D 里面掏出一个 i：i 是“说明”，i 头上那一小片就是容量柱顶上“可放心清理”的那一截。D + i 也正好是 DiskWhy 的头两个字母。</p>
+
+  <h2>App icon · primary (C sticker) + colourways</h2>
+  <div class="row">
+    <div class="card" style="background:#f4f0e6;flex:0 0 360px"><img src="../png/icon-auto-256.png" width="256"><div class="cap">icon.svg · 256</div></div>
+    <div class="card" style="background:#fff;flex:1"><img src="../png/icon-mono-160.png" width="160"><div class="cap">icon-mono.svg · 单色（真镂空）</div></div>
+    <div class="card" style="background:#f3f1ec;flex:1"><img src="../png/icon-theme-A-160.png" width="160"><div class="cap">icon-theme-A.svg · 浅色主题配色</div></div>
+    <div class="card dark" style="background:#14110e;flex:1"><img src="../png/icon-theme-B-160.png" width="160"><div class="cap">icon-theme-B.svg · 深色主题配色</div></div>
+    <div class="card dark" style="background:#2a2a28;flex:1"><img src="../png/icon-theme-ink-160.png" width="160"><div class="cap">icon-theme-ink.svg · 墨底青柠</div></div>
+  </div>
+
+  <h2>Size ladder on Windows taskbars — actual pixels (light #f3f3f3 / dark #202020)</h2>
+  <div class="row" style="gap:20px">
+    <div class="ladder" style="background:#f3f3f3;flex:1">
+      <figure><img src="../png/icon-auto-256.png" width="256"><figcaption>256</figcaption></figure>
+      <figure><img src="../png/icon-auto-64.png" width="64"><figcaption>64</figcaption></figure>
+      <figure><img src="../png/icon-auto-32.png" width="32"><figcaption>32</figcaption></figure>
+      <figure><img src="../png/icon-24.png" width="24"><figcaption>24*</figcaption></figure>
+      <figure><img src="../png/icon-16.png" width="16"><figcaption>16*</figcaption></figure>
+    </div>
+    <div class="ladder" style="background:#202020;color:#fff;flex:1">
+      <figure><img src="../png/icon-auto-256.png" width="256"><figcaption>256</figcaption></figure>
+      <figure><img src="../png/icon-auto-64.png" width="64"><figcaption>64</figcaption></figure>
+      <figure><img src="../png/icon-auto-32.png" width="32"><figcaption>32</figcaption></figure>
+      <figure><img src="../png/icon-24.png" width="24"><figcaption>24*</figcaption></figure>
+      <figure><img src="../png/icon-16.png" width="16"><figcaption>16*</figcaption></figure>
+    </div>
+  </div>
+  <p class="cap" style="text-align:left;margin:8px 2px 0">* 24 / 16 are hand-tuned on the pixel grid (icon-24.svg, icon-16.svg); 16 drops the hard shadow.</p>
+
+  <h2>Pixel check — 1x renders enlarged ×5, nearest-neighbour (hand-tuned vs. plain downscale of icon.svg)</h2>
+  <div class="row">
+    <div class="ladder" style="background:#f3f3f3;flex:1;align-items:center">
+      <figure><img class="px" src="../png/icon-24.png" width="120"><figcaption>24 tuned</figcaption></figure>
+      <figure><img class="px" src="../png/icon-auto-24.png" width="120"><figcaption>24 auto</figcaption></figure>
+      <figure><img class="px" src="../png/icon-16.png" width="80"><figcaption>16 tuned</figcaption></figure>
+      <figure><img class="px" src="../png/icon-auto-16.png" width="80"><figcaption>16 auto</figcaption></figure>
+    </div>
+    <div class="ladder" style="background:#202020;color:#fff;flex:1;align-items:center">
+      <figure><img class="px" src="../png/icon-24.png" width="120"><figcaption>24 tuned</figcaption></figure>
+      <figure><img class="px" src="../png/icon-auto-24.png" width="120"><figcaption>24 auto</figcaption></figure>
+      <figure><img class="px" src="../png/icon-16.png" width="80"><figcaption>16 tuned</figcaption></figure>
+      <figure><img class="px" src="../png/icon-auto-16.png" width="80"><figcaption>16 auto</figcaption></figure>
+    </div>
+  </div>
+
+  <h2>In a taskbar row (24 px, among neutral placeholders)</h2>
+  <div class="row">
+    <div class="taskbar" style="background:#f3f3f3;flex:1">
+      <div class="slot"><div class="ph" style="background:#3b82c4"></div></div>
+      <div class="slot"><div class="ph" style="background:#e3a21a"></div></div>
+      <div class="slot" style="background:#e4e4e4"><img src="../png/icon-24.png" width="24"></div>
+      <div class="slot"><div class="ph" style="background:#5a5a5a"></div></div>
+      <div class="slot"><div class="ph" style="background:#2e8b57"></div></div>
+    </div>
+    <div class="taskbar" style="background:#202020;flex:1">
+      <div class="slot"><div class="ph" style="background:#3b82c4"></div></div>
+      <div class="slot"><div class="ph" style="background:#e3a21a"></div></div>
+      <div class="slot" style="background:#2e2e2e"><img src="../png/icon-24.png" width="24"></div>
+      <div class="slot"><div class="ph" style="background:#cfcfcf"></div></div>
+      <div class="slot"><div class="ph" style="background:#2e8b57"></div></div>
+    </div>
+  </div>
+
+  <h2>Title bar lockups — 16 px mark (A 浅色 / B 深色 / C 卡通), 1x and ×2.3</h2>
+  <div class="row" style="align-items:flex-start">
+    <div class="card" style="background:#fff;flex:0 0 470px;padding:16px"><img src="../png/titlebars.png" width="420"><div class="cap">1x — real size</div></div>
+    <div class="card" style="background:#fff;flex:1;padding:16px"><img class="px" src="../png/titlebars.png" width="1260" style="width:100%;max-width:960px"><div class="cap">×~2.3 nearest-neighbour</div></div>
+  </div>
+
+  <h2>Horizontal lockup — icon + “DiskWhy” (Geist Bold 700, outlined to paths; the i’s dot becomes the same flat slice)</h2>
+  <div class="row">
+    <div class="card" style="background:#f4f0e6;flex:1;padding:40px"><img src="../lockup-light.svg" height="120"></div>
+    <div class="card" style="background:#141412;flex:1;padding:40px"><img src="../lockup-dark.svg" height="120"></div>
+  </div>
+  <div class="row" style="margin-top:20px">
+    <div class="card" style="background:#fff;flex:1;padding:24px;flex-direction:row;gap:40px"><img src="../lockup-light.svg" height="48"><img src="../lockup-light.svg" height="28"></div>
+    <div class="card" style="background:#1b1713;flex:1;padding:24px;flex-direction:row;gap:40px"><img src="../lockup-dark.svg" height="48"><img src="../lockup-dark.svg" height="28"></div>
+  </div>
+</div>

@@ -1,0 +1,17 @@
+# mark-16.txt hand-pixelled variant (from make_pixels.py)
+................
+........KKKKKK..
+.KKKKKKKLLLLLLK.
+.KLLLLLLLLLLLLK.
+.KLLLLLLKKKKKKK.
+..KKKKKK........
+................
+..KKKKKKKKKKK...
+.KLLLLLLLLLLLKK.
+.KLLLKLLLKLLLKK.
+.KLLLKLLLKLLLKK.
+.KLLLLLLLLLLLKK.
+.KLLLLLLLLLLLKK.
+..KKKKKKKKKKKKK.
+..KKKKKKKKKKKKK.
+................

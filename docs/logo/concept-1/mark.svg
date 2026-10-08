@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- DiskWhy concept-1 "Huh? box": a lime storage box tilting its head, lid popped open, going "huh?" -->
+  <g transform="translate(52.1 30.5) scale(0.93)">
+    <!-- hard offset shadow (theme C), screen-aligned bottom-right -->
+    <g transform="translate(40 36) rotate(-7 512 650)">
+      <rect x="162" y="400" width="700" height="500" rx="130" fill="#141412"/>
+    </g>
+    <g transform="rotate(-7 512 650)">
+      <!-- body -->
+      <rect x="162" y="400" width="700" height="500" rx="130" fill="#d4f24a" stroke="#141412" stroke-width="44"/>
+      <!-- eyes -->
+      <rect x="356" y="530" width="96" height="156" rx="48" fill="#141412"/>
+      <rect x="572" y="530" width="96" height="156" rx="48" fill="#141412"/>
+      <circle cx="388" cy="564" r="19" fill="#ffffff"/>
+      <circle cx="604" cy="564" r="19" fill="#ffffff"/>
+      <!-- "o" mouth: the "huh?" -->
+      <ellipse cx="512" cy="772" rx="30" ry="36" fill="#141412"/>
+      <!-- lid, hinged at the left, popped open on the right -->
+      <g transform="translate(14 34) rotate(-11 170 352)">
+        <rect x="132" y="226" width="752" height="128" rx="64" fill="#d4f24a" stroke="#141412" stroke-width="44"/>
+      </g>
+    </g>
+  </g>
+</svg>

@@ -37,7 +37,22 @@ async function win(action: "min" | "max" | "close") {
 
 <template>
   <header class="titlebar" data-tauri-drag-region>
-    <div v-if="page === 'home'" class="brand" data-tauri-drag-region><span class="mark"></span>DiskWhy</div>
+    <div v-if="page === 'home'" class="brand" data-tauri-drag-region>
+        <svg class="mark" viewBox="0 0 16 16" aria-hidden="true">
+          <defs><clipPath id="tbmlime"><path d="M4,2L9,2L9,12L5,12L5,13L2,13L2,4A2,2 0 0 1 4,2Z"/></clipPath><clipPath id="tbmpaper"><path d="M10,2L12,2A2,2 0 0 1 14,4L14,6L10,6L10,2Z"/></clipPath><clipPath id="tbmcoral"><path d="M10,7L14,7L14,10A2,2 0 0 1 12,12L10,12L10,7Z"/></clipPath></defs>
+          <path d="M4,1L12,1A3,3 0 0 1 15,4L15,10A3,3 0 0 1 12,13L5,13L5,14L3,14L3,15L1,15L1,4A3,3 0 0 1 4,1Z" fill="none" stroke="#f6f1e4" stroke-opacity="0.45" stroke-width="2" stroke-linejoin="round"/>
+          <path d="M4,1L12,1A3,3 0 0 1 15,4L15,10A3,3 0 0 1 12,13L5,13L5,14L3,14L3,15L1,15L1,4A3,3 0 0 1 4,1Z" fill="#141412"/>
+          <rect x="5" y="13" width="1" height="1" fill="#141412" fill-opacity="0.45"/>
+          <rect x="3" y="14" width="1" height="1" fill="#141412" fill-opacity="0.45"/>
+          <path d="M4,2L9,2L9,12L5,12L5,13L2,13L2,4A2,2 0 0 1 4,2Z" fill="#d4f24a"/>
+          <rect x="2" y="2" width="7" height="1" fill="#e3f87a" clip-path="url(#tbmlime)"/>
+          <path d="M10,2L12,2A2,2 0 0 1 14,4L14,6L10,6L10,2Z" fill="#f6f1e4"/>
+          <rect x="10" y="2" width="4" height="1" fill="#fffdf7" clip-path="url(#tbmpaper)"/>
+          <path d="M10,7L14,7L14,10A2,2 0 0 1 12,12L10,12L10,7Z" fill="#ff8f72"/>
+          <rect x="10" y="7" width="4" height="1" fill="#ffaa8f" clip-path="url(#tbmcoral)"/>
+          <rect x="5" y="12" width="1" height="1" fill="#d4f24a" fill-opacity="0.5"/>
+        </svg>
+        DiskWhy</div>
     <button v-else class="back" :class="{ 'ui-font': uiFont }" aria-label="返回首页" :inert="modal" @click="page = 'home'">
       <svg class="i" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></svg>{{ title }}
     </button>
@@ -74,22 +89,12 @@ async function win(action: "min" | "max" | "close") {
   color: var(--ink2);
   letter-spacing: 0.01em;
 }
+/* 图标（阶段 J：logo 第三轮「糖果光泽」的 16 px 手工像素版，docs/logo/round3/variant-3/icon-16.svg） */
 .brand .mark {
   width: 16px;
   height: 16px;
-  border-radius: 4px;
-  background: var(--ink);
-  position: relative;
-  overflow: hidden;
-}
-.brand .mark::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 6px;
-  background: var(--safe);
+  flex: none;
+  display: block;
 }
 [data-theme="C"] .brand {
   font-family: var(--heading);

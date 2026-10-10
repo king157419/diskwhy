@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { crumbTarget, DEFAULT_LAYOUT, hitTest, layoutTreemap, samePath, squarify, type Rect, type TmInput } from "./treemap";
+import { BOOST, boostWeight, DEFAULT_LAYOUT, hitTest, layoutTreemap, samePath, squarify, squarifyBoosted, type Rect, type TmInput, type TmItem } from "./treemap";
 
 const area = (r: Rect) => r.w * r.h;
 const EPS = 1e-6;
@@ -233,19 +233,381 @@ describe("尾巴合并（阶段 I）", () => {
   });
 });
 
-describe("空间分析导航（阶段 J）", () => {
+describe("空间分析导航", () => {
   it("samePath：大小写、末尾反斜杠不敏感", () => {
     expect(samePath("C:\\", "c:")).toBe(true);
     expect(samePath("C:\\Users\\", "c:\\users")).toBe(true);
     expect(samePath("C:\\Users", "C:\\Users\\king")).toBe(false);
     expect(samePath(null, "C:\\")).toBe(false);
   });
-  it("crumbTarget：第 0 级打开并选中盘根，其余级打开上一级、选中自己", () => {
-    const bc = [{ path: "C:\\" }, { path: "C:\\Users" }, { path: "C:\\Users\\king" }];
-    expect(crumbTarget(bc, 0)).toEqual({ open: "C:\\", focus: "C:\\" });
-    expect(crumbTarget(bc, 1)).toEqual({ open: "C:\\", focus: "C:\\Users" });
-    expect(crumbTarget(bc, 2)).toEqual({ open: "C:\\Users", focus: "C:\\Users\\king" });
-    expect(crumbTarget(bc, 3)).toBeNull();
-    expect(crumbTarget([], 0)).toBeNull();
+});
+
+// ───── 阶段 K：展开链上的块在原地放大（BOOST） ─────
+
+describe("boost：展开链上的块至少占父块内容区的 60%", () => {
+  const kids = (vals: number[], boostAt = -1): TmInput[] =>
+    vals.map((v, i) => ({ key: `k${i}`, name: `k${i}`, value: v, boost: i === boostAt ? BOOST : undefined }));
+  const root = (children: TmInput[], extra: Partial<TmInput> = {}): TmInput => ({
+    key: "r",
+    name: "r",
+    value: children.reduce((s, c) => s + c.value, 0) + (extra.hidden ?? 0),
+    children,
+    ...extra,
+  });
+  const rect = { x: 0, y: 0, w: 900, h: 600 };
+  const VALS = [500, 300, 120, 80, 60, 40, 30, 20, 10, 5];
+
+  it("有效权重：eff / (eff + 其余) = boost；本来就更大就不动", () => {
+    const eff = boostWeight(10, 90, 0.6);
+    expect(eff / (eff + 90)).toBeCloseTo(0.6, 9);
+    expect(boostWeight(80, 20, 0.6)).toBe(80);
+  });
+
+  for (const at of [1, 3, 6]) {
+    it(`第 ${at + 1} 大的块被放大：面积 ≥ 60%、不重叠、不出界、兄弟比例 / 值不变（boost 在 ${at}）`, () => {
+      const items = layoutTreemap(root(kids(VALS, at)), rect, { ...DEFAULT_LAYOUT, minPx: 1 });
+      const top = items.filter((i) => i.depth === 1);
+      const b = top.find((i) => i.key === `k${at}`)!;
+      expect(b.chain).toBe(true);
+      expect(area(b.rect) / area(rect)).toBeGreaterThanOrEqual(BOOST - 1e-9);
+      for (let i = 0; i < top.length; i++) {
+        expect(inside(top[i].rect, rect)).toBe(true);
+        for (let j = i + 1; j < top.length; j++) expect(overlaps(top[i].rect, top[j].rect)).toBe(false);
+      }
+      // 输出的值是真实值；兄弟之间面积比 = 值比
+      for (const it of top) if (it.kind === "node") expect(it.value).toBe(VALS[Number(it.key.slice(1))]);
+      const sib = top.filter((i) => i.kind === "node" && i.key !== b.key);
+      for (const s of sib) expect(area(s.rect) / area(sib[0].rect)).toBeCloseTo(s.value / sib[0].value, 6);
+    });
+  }
+
+  it("原地长大：分行不变，任意两块在放大前后都沿同一个方向分开（过渡动画里没有块横穿别的块）", () => {
+    const before = squarify(VALS.map((v, i) => ({ value: v, data: i })), rect, true);
+    for (const at of [1, 4, 7]) {
+      const after = squarifyBoosted(VALS.map((v, i) => ({ value: v, data: i })), rect, (d) => d === at, BOOST);
+      const A = new Map(before.map((p) => [p.data, p.rect]));
+      const B = new Map(after.map((p) => [p.data, p.rect]));
+      // 两块之间的分隔：i 在 j 左边 / 右边 / 上边 / 下边
+      const seps = (m: Map<number, Rect>, i: number, j: number) => {
+        const a = m.get(i)!;
+        const b = m.get(j)!;
+        return [a.x + a.w <= b.x + 1e-6, b.x + b.w <= a.x + 1e-6, a.y + a.h <= b.y + 1e-6, b.y + b.h <= a.y + 1e-6];
+      };
+      for (let i = 0; i < VALS.length; i++)
+        for (let j = i + 1; j < VALS.length; j++) {
+          const sa = seps(A, i, j);
+          const sb = seps(B, i, j);
+          // 同一个分隔在前后都成立 → 线性插值的每一帧里它们都不重叠
+          expect(sa.some((s, k) => s && sb[k])).toBe(true);
+        }
+      // 放大的块的新位置和原来的位置有重叠（是“在原地”长大）
+      expect(overlaps(A.get(at)!, B.get(at)!)).toBe(true);
+    }
+  });
+
+  it("本来就 ≥ 60% 的块：布局和不放大完全一样", () => {
+    const plain = layoutTreemap(root(kids([700, 200, 100])), rect);
+    const boosted = layoutTreemap(root(kids([700, 200, 100], 0)), rect);
+    expect(boosted.map((i) => i.rect)).toEqual(plain.map((i) => i.rect));
+  });
+
+  it("放大的块再小也不会被并进“其他”；它的兄弟太小照样并进“其他”", () => {
+    const vals = [5000, 3000, 2000, ...Array.from({ length: 40 }, () => 1)];
+    const r = { x: 0, y: 0, w: 300, h: 200 };
+    // 不放大时 k20（值 1）会被并掉
+    expect(layoutTreemap(root(kids(vals), { hidden: 500, hiddenCount: 9 }), r).some((i) => i.key === "k20")).toBe(false);
+    const items = layoutTreemap(root(kids(vals, 20), { hidden: 500, hiddenCount: 9 }), r);
+    const b = items.find((i) => i.key === "k20")!;
+    expect(b).toBeTruthy();
+    expect(area(b.rect) / (300 * 200)).toBeGreaterThanOrEqual(BOOST - 1e-9);
+    // 其余值为 1 的兄弟都还在「其他」里（不会为了露出 k20 把一串细条画出来）；k20 单独拿出来，排在留下的块后面
+    expect(items.filter((i) => i.kind === "node" && i.value === 1 && i.key !== "k20")).toHaveLength(0);
+    const other = items.find((i) => i.kind === "other")!;
+    expect(other.mergedCount).toBe(39 + 9);
+    // 不放大时就够大的块都还在，而且都 ≥ minPx；被放大挤小的只有「其他」（仍然看得见，≥ 2px）
+    for (const it of items) if (it.kind === "node") expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(DEFAULT_LAYOUT.minPx - EPS);
+    expect(Math.min(other.rect.w, other.rect.h)).toBeGreaterThanOrEqual(2);
+    // 面积不留洞
+    expect(items.reduce((s, i) => s + area(i.rect), 0)).toBeCloseTo(300 * 200, 6);
+  });
+
+  it("链上的块下面再画两层（pk 的子项和孙项），链外的兄弟照旧只画一层子项", () => {
+    // 4 层深的树：r → a → b → c → d → e；a / b 在链上（pk = b），x 是 a 的兄弟
+    const leafs = (p: string, n: number, d: number): TmInput[] =>
+      Array.from({ length: n }, (_, i) => {
+        const key = `${p}/${i}`;
+        return { key, name: key, value: 10, children: d > 0 ? leafs(key, n, d - 1) : undefined };
+      });
+    const sum = (c: TmInput[]) => c.reduce((s, x) => s + x.value, 0);
+    const fix = (n: TmInput): TmInput => {
+      if (n.children) {
+        n.children = n.children.map(fix);
+        n.value = sum(n.children);
+      }
+      return n;
+    };
+    const b: TmInput = fix({ key: "b", name: "b", value: 0, boost: BOOST, children: leafs("b", 3, 3) });
+    const a: TmInput = fix({ key: "a", name: "a", value: 0, boost: BOOST, children: [b, ...leafs("a", 2, 3)] });
+    const x: TmInput = fix({ key: "x", name: "x", value: 0, children: leafs("x", 3, 3) });
+    const r = fix({ key: "r", name: "r", value: 0, children: [a, x] });
+    const opt = { ...DEFAULT_LAYOUT, maxDepth: 2, boostDepth: 2, minContainerPx: 30, minPx: 2, headerPx: 10 };
+    const items = layoutTreemap(r, { x: 0, y: 0, w: 1600, h: 1200 }, opt);
+    const depthOf = (pre: string) => Math.max(...items.filter((i) => i.key.startsWith(pre)).map((i) => i.depth));
+    // a 在第 1 层、b 在第 2 层；b 的子项第 3 层、孙项第 4 层，不再往下
+    expect(items.find((i) => i.key === "b")!.depth).toBe(2);
+    expect(depthOf("b/")).toBe(4);
+    // a 的其他子项（链外）只画一层子项：a/0 在第 2 层，它的子项在第 3 层
+    expect(depthOf("a/")).toBe(3);
+    // 链外的顶层兄弟 x：照旧两层
+    expect(depthOf("x/")).toBe(2);
+    expect(items.filter((i: TmItem) => i.chain).map((i) => i.key)).toEqual(["a", "b"]);
+  });
+});
+
+// ───── 阶段 K 修订（M1 / M4）：结构稳定、镜头、按像素缩放 ─────
+import { bigEnough, canonPath, contentBox, mapBox, pickMapRoot } from "./treemap";
+
+describe("结构稳定：容器的行 / 列结构只按数据和基础参照矩形定，放大 / 挤小 / 换链都不重排", () => {
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+  /** 随机树：幂律大小，有的带后端没发来的尾巴 */
+  function tree(key: string, depth: number): TmInput {
+    const n = 2 + Math.floor(rnd() * 14);
+    const kids: TmInput[] = Array.from({ length: n }, (_, i) => {
+      const k = `${key}/${i}`;
+      if (depth > 0 && rnd() < 0.7) return tree(k, depth - 1);
+      return { key: k, name: k, value: Math.round(1000 / (i + 1) ** (0.8 + rnd()) + 1) };
+    });
+    const hidden = rnd() < 0.4 ? Math.round(rnd() * 300) : 0;
+    return { key, name: key, value: kids.reduce((s, c) => s + c.value, 0) + hidden, children: kids, hidden };
+  }
+  /** 给链上的节点加 boost（复制一份） */
+  function withChain(t: TmInput, chain: string[]): TmInput {
+    const on = new Set(chain);
+    const f = (n: TmInput): TmInput => ({ ...n, boost: on.has(n.key) ? BOOST : undefined, children: n.children?.map(f) });
+    return f(t);
+  }
+  /** 随机挑一条链（从 t 往下，只挑文件夹） */
+  function pickChain(t: TmInput, len: number): string[] {
+    const out: string[] = [];
+    let cur = t;
+    for (let i = 0; i < len; i++) {
+      const dirs = (cur.children ?? []).filter((c) => c.children?.length);
+      if (!dirs.length) break;
+      cur = dirs[Math.floor(rnd() * Math.min(dirs.length, 6))];
+      out.push(cur.key);
+    }
+    return out;
+  }
+  const opt = { minPx: 8, maxDepth: 2, boostDepth: 2, headerPx: 26, pad: 6, padEnd: 12, minContainerPx: 90 };
+  const seps = (a: Rect, b: Rect) => [a.x + a.w <= b.x + 1e-6, b.x + b.w <= a.x + 1e-6, a.y + a.h <= b.y + 1e-6, b.y + b.h <= a.y + 1e-6];
+  /** 两次布局里都画出来的同一个容器的子块：任意两块在两次里都沿同一个方向分开（线性插值的每一帧都不重叠） */
+  function stable(A: TmItem[], B: TmItem[]): string | null {
+    const kidsOf = (L: TmItem[]) => {
+      const m = new Map<string, Map<string, Rect>>();
+      for (const it of L) {
+        if (it.kind !== "node") continue;
+        const p = it.parentKey ?? "";
+        if (!m.has(p)) m.set(p, new Map());
+        m.get(p)!.set(it.key, it.rect);
+      }
+      return m;
+    };
+    const ka = kidsOf(A);
+    const kb = kidsOf(B);
+    for (const [p, ma] of ka) {
+      const mb = kb.get(p);
+      if (!mb) continue;
+      const both = [...ma.keys()].filter((k) => mb.has(k));
+      for (let i = 0; i < both.length; i++)
+        for (let j = i + 1; j < both.length; j++) {
+          const sa = seps(ma.get(both[i])!, ma.get(both[j])!);
+          const sb = seps(mb.get(both[i])!, mb.get(both[j])!);
+          if (!sa.some((s, k) => s && sb[k])) return `${p}: ${both[i]} x ${both[j]}`;
+        }
+    }
+    return null;
+  }
+
+  it("随机 300 棵树 × 多条链：同一个容器的子块在任意两个状态之间都不会横穿（包括被挤小的兄弟容器）", () => {
+    const rect = { x: 0, y: 0, w: 900, h: 640 };
+    let containersChecked = 0;
+    for (let t = 0; t < 300; t++) {
+      const T = tree("r", 3);
+      const c1 = pickChain(T, 1);
+      const first = T.children!.find((c) => c.key === c1[0]);
+      const c2 = first ? [...c1, ...pickChain(first, 1)] : c1;
+      const c3 = pickChain(T, 3);
+      const states = [[], c1, c2, c3].map((ch) => layoutTreemap(withChain(T, ch), rect, opt));
+      for (let a = 0; a < states.length; a++)
+        for (let b = a + 1; b < states.length; b++) {
+          expect(stable(states[a], states[b])).toBeNull();
+        }
+      containersChecked += states[1].filter((i) => i.container && !i.chain).length;
+    }
+    // 真的比较到了被挤小、但还画着子块的链外容器
+    expect(containersChecked).toBeGreaterThan(100);
+  });
+
+  it("尾巴按不放大的布局判断：被放大的块挤成细条的兄弟不会因此被并进「其他」", () => {
+    const rect = { x: 0, y: 0, w: 900, h: 640 };
+    for (let t = 0; t < 300; t++) {
+      const T = tree("r", 1);
+      const plain = layoutTreemap(T, rect, opt);
+      const ch = pickChain(T, 1);
+      const boosted = layoutTreemap(withChain(T, ch), rect, opt);
+      const top = (L: TmItem[]) => L.filter((i) => i.depth === 1);
+      const mergedA = top(plain).find((i) => i.kind === "other")?.mergedCount ?? 0;
+      const mergedB = top(boosted).find((i) => i.kind === "other")?.mergedCount ?? 0;
+      // 放大以后「其他」里的项只会更少（被放大的那块如果本来在「其他」里，会被单独拿出来）
+      expect(mergedB).toBeLessThanOrEqual(mergedA);
+    }
+  });
+
+  it("数据变细（懒加载取回更多子项、尾巴变小）：大块的位置一点不动，新块出现在原来「其他」的地方", () => {
+    const big = [400, 250, 180, 120, 90];
+    const small = Array.from({ length: 30 }, (_, i) => 40 / (i + 1));
+    const total = big.reduce((a, b) => a + b, 0) + small.reduce((a, b) => a + b, 0);
+    const kid = (v: number, i: number): TmInput => ({ key: `k${i}`, name: `k${i}`, value: v });
+    const coarse: TmInput = { key: "r", name: "r", value: total, children: big.map(kid), hidden: total - big.reduce((a, b) => a + b, 0), hiddenCount: 30 };
+    const fine: TmInput = { key: "r", name: "r", value: total, children: [...big, ...small].map(kid) };
+    const rect = { x: 0, y: 0, w: 800, h: 500 };
+    const A = new Map(layoutTreemap(coarse, rect, opt).map((i) => [i.key, i.rect]));
+    const B = new Map(layoutTreemap(fine, rect, opt).map((i) => [i.key, i.rect]));
+    for (const k of ["k0", "k1", "k2"]) {
+      const a = A.get(k)!;
+      const b = B.get(k)!;
+      expect(b.x).toBeCloseTo(a.x, 6);
+      expect(b.y).toBeCloseTo(a.y, 6);
+      expect(b.w).toBeCloseTo(a.w, 6);
+      expect(b.h).toBeCloseTo(a.h, 6);
+    }
+    // 细数据里多出来的块都落在粗数据「其他」那块里面
+    const otherKey = [...A.keys()].find((k) => k.startsWith("r|其他"))!;
+    const other = A.get(otherKey)!;
+    for (const [k, r] of B) if (!A.has(k) && !k.startsWith("r|其他")) expect(inside(r, other)).toBe(true);
+  });
+
+  it("被挤得变形的链外容器：子块会成细条时整体不画（只剩带名字的块），不会画一片细条", () => {
+    const rect = { x: 0, y: 0, w: 900, h: 640 };
+    let hidden = 0;
+    for (let t = 0; t < 200; t++) {
+      const T = tree("r", 2);
+      const ch = pickChain(T, 1);
+      const L = layoutTreemap(withChain(T, ch), rect, opt);
+      const byKey = new Map(L.map((i) => [i.key, i]));
+      // 链外容器里画出来的子块都 ≥ minPx（被挤成细条的只可能是链上块的兄弟）
+      for (const it of L) {
+        const parent = it.parentKey ? byKey.get(it.parentKey) : undefined;
+        if (parent && !parent.chain && it.kind === "node") expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(opt.minPx - EPS);
+      }
+      const plain = new Map(layoutTreemap(T, rect, opt).map((i) => [i.key, i]));
+      for (const it of L) if (!it.chain && !it.container && plain.get(it.key)?.container) hidden++;
+    }
+    expect(hidden).toBeGreaterThan(0);
+  });
+});
+
+describe("正在看的文件夹（pk）里的子文件夹不按「被挤变形」藏起来", () => {
+  // WinSxS 这种：盘根视图里近似正方形，展开 Windows 以后变成又高又窄的一条（形状变了）。它是 pk 的子项，正是要看的细节：
+  // 照样画子块（放不下的行并进「其他」），不变成一整块没内容的叶子。（只按「被挤变形」判断时，这里约一半会被藏掉）
+  let seed = 7;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  function tree(key: string, depth: number): TmInput {
+    const n = 2 + Math.floor(rnd() * 30);
+    const kids: TmInput[] = [];
+    for (let i = 0; i < n; i++) {
+      const v = Math.round(1000 * rnd() ** 3) + 1;
+      if (depth > 0 && rnd() < 0.5) kids.push(tree(`${key}/${i}`, depth - 1));
+      else kids.push({ key: `${key}/${i}`, name: `${key}/${i}`, value: v });
+    }
+    return { key, name: key, value: kids.reduce((s, c) => s + c.value, 0), children: kids };
+  }
+  it("随机 200 棵树：展开第一层的一个文件夹后，它里面有子项、两边都 ≥ 2 × 容器门槛的子文件夹全都画成容器", () => {
+    const opt = { minPx: 20, maxDepth: 2, boostDepth: 2, headerPx: 26, pad: 6, padEnd: 12, minContainerPx: 90 };
+    const rect = { x: 0, y: 0, w: 880, h: 760 };
+    let checked = 0;
+    for (let t = 0; t < 200; t++) {
+      const T = tree("r", 3);
+      const dirs = T.children!.filter((c) => c.children?.length);
+      if (!dirs.length) continue;
+      const pk = dirs[0].key;
+      const B = { ...T, children: T.children!.map((c) => (c.key === pk ? { ...c, boost: BOOST } : c)) };
+      const kids = new Map(B.children!.find((c) => c.key === pk)!.children!.map((c) => [c.key, c]));
+      for (const it of layoutTreemap(B, rect, opt)) {
+        if (it.parentKey !== pk || it.kind !== "node" || !kids.get(it.key)?.children?.length) continue;
+        if (Math.min(it.rect.w, it.rect.h) < 2 * opt.minContainerPx) continue;
+        checked++;
+        expect(it.container).toBe(true);
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
+  });
+});
+
+describe("自动缩放（M4）：按像素决定；镜头推近时块按同一个比例移动", () => {
+  it("bigEnough：一般要 ≥ 360×260；图矮于 500 px 时要 ≥ 图面积的 30%", () => {
+    expect(bigEnough({ x: 0, y: 0, w: 400, h: 300 }, { w: 1100, h: 760 })).toBe(true);
+    expect(bigEnough({ x: 0, y: 0, w: 300, h: 300 }, { w: 1100, h: 760 })).toBe(false);
+    expect(bigEnough({ x: 0, y: 0, w: 400, h: 200 }, { w: 1100, h: 760 })).toBe(false);
+    // 矮图（760×380）：340×120 = 14%，不够；420×230 = 33%，够
+    expect(bigEnough({ x: 0, y: 0, w: 340, h: 120 }, { w: 760, h: 380 })).toBe(false);
+    expect(bigEnough({ x: 0, y: 0, w: 420, h: 230 }, { w: 760, h: 380 })).toBe(true);
+    expect(bigEnough({ x: 0, y: 0, w: -4, h: 230 }, { w: 760, h: 380 })).toBe(false);
+  });
+
+  it("pickMapRoot：从浅到深试，第一个够大的；都不够用最深的；画不出来的跳过", () => {
+    const size: Record<string, number> = { a: 100, b: 200, c: 400, d: 900 };
+    expect(pickMapRoot(["a", "b", "c", "d"], (r) => size[r], (s) => s >= 300)?.root).toBe("c");
+    expect(pickMapRoot(["a", "b"], (r) => size[r], (s) => s >= 300)?.root).toBe("b");
+    expect(pickMapRoot(["x", "a"], (r) => (r === "x" ? null : size[r]), () => true)?.root).toBe("a");
+  });
+
+  it("mapBox：框里的相对位置按比例映射", () => {
+    expect(mapBox({ x: 15, y: 30, w: 10, h: 20 }, { x: 10, y: 20, w: 20, h: 40 }, { x: 0, y: 0, w: 200, h: 400 })).toEqual({ x: 50, y: 100, w: 100, h: 200 });
+  });
+
+  it("镜头一致：以链上一层为根重铺（参照矩形沿原始的层走下来），它里面的块 ≈ 原图里的位置按「它的内容区 → 整张图」放大", () => {
+    const leafs = (p: string, n: number, d: number): TmInput[] =>
+      Array.from({ length: n }, (_, i) => {
+        const key = `${p}/${i}`;
+        const v = Math.round(100 / (i + 1)) + 3;
+        return d > 0 ? { key, name: key, value: 0, children: leafs(key, n, d - 1) } : { key, name: key, value: v };
+      });
+    const fix = (n: TmInput): TmInput => {
+      if (n.children) {
+        n.children = n.children.map(fix);
+        n.value = n.children.reduce((s, c) => s + c.value, 0);
+      }
+      return n;
+    };
+    const R = fix({ key: "r", name: "r", value: 0, children: leafs("r", 7, 3) });
+    const chain = ["r/1", "r/1/0", "r/1/0/2"];
+    const on = new Set(chain);
+    const mark = (n: TmInput): TmInput => ({ ...n, boost: on.has(n.key) ? BOOST : undefined, children: n.children?.map(mark) });
+    const M = mark(R);
+    const opt = { minPx: 8, maxDepth: 2, boostDepth: 2, headerPx: 26, pad: 6, padEnd: 12, minContainerPx: 90 };
+    const frame = { x: 0, y: 0, w: 1100, h: 760 };
+    const before = layoutTreemap(M, frame, opt);
+    const a = M.children!.find((c) => c.key === "r/1")!;
+    const canon = canonPath([R, R.children!.find((c) => c.key === "r/1")!], frame, opt);
+    const after = layoutTreemap(a, frame, opt, canon, frame);
+    const aItem = before.find((i) => i.key === "r/1")!;
+    const lens = (r: Rect) => mapBox(r, contentBox(aItem.rect, opt), frame);
+    const B = new Map(after.map((i) => [i.key, i.rect]));
+    let n = 0;
+    for (const it of before) {
+      if (!it.key.startsWith("r/1/") || it.kind !== "node") continue;
+      const b = B.get(it.key);
+      if (!b) continue;
+      const m = lens(it.rect);
+      // 允许的误差：容器标题栏 / 内边距不跟着放大（固定像素），层层累积几个百分点
+      expect(Math.abs(m.x - b.x)).toBeLessThan(frame.w * 0.05);
+      expect(Math.abs(m.y - b.y)).toBeLessThan(frame.h * 0.06);
+      expect(Math.abs(m.w - b.w)).toBeLessThan(frame.w * 0.05);
+      expect(Math.abs(m.h - b.h)).toBeLessThan(frame.h * 0.06);
+      n++;
+    }
+    expect(n).toBeGreaterThan(5);
   });
 });

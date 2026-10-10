@@ -1,6 +1,6 @@
 // 全局界面状态 + 动作（阶段 F：首页 / 清理 / 看看都是什么 / 确认弹层 / 暂存区 / 设置）。
 // 只调用 api.ts 里的后端命令；清理候选由后端算好（ScanSummary.candidates），这里只管勾选和预检。
-import { computed, ref, watch } from "vue";
+import { computed, ref, shallowRef, watch } from "vue";
 import {
   actionEnv,
   cancelScan,
@@ -48,7 +48,8 @@ import {
   type TreemapNode,
 } from "./api";
 import { cleanCat, type CleanCat } from "./labels";
-import { collapseChain, samePath } from "./treemap";
+import { samePath } from "./treemap";
+import { ancestorsIn, buildDisplay, chainLevelStarts, findTm, isUnder, pathKey, type MapHit, type Stub } from "./tmtree";
 
 export type Phase = "idle" | "scanning" | "done";
 export type Page = "home" | "cleanup" | "explore" | "quarantine" | "settings";
@@ -617,9 +618,7 @@ export async function doScan() {
   phase.value = "scanning";
   progress.value = null;
   summary.value = null;
-  listing.value = null;
-  tm.value = null;
-  focus.value = null;
+  resetExplore();
   cancelling.value = false;
   checked.value = new Set();
   try {
@@ -641,17 +640,59 @@ export async function doCancel() {
   await cancelScan();
 }
 
-// ───── 看看都是什么（方块图 + 列表） ─────
-/** 方块图的根（当前文件夹） */
+// ───── 看看都是什么（阶段 K：一张平面图，单击原地展开） ─────
+// 方块图的根是扫描根；单击一个文件夹 = 展开链变成「根 → 它」，它在原位置放大（BOOST）并显示更深的层级。
+// pk 太小时图的根自动下移（按像素，TreemapView 决定）；面包屑仍从盘根开始。右边列表 = 链的最后一级（空链 = 盘根）。
+// 数据：链上每一级都按它自己做根取一次子树（getTreemap(path, 3)，每个文件夹只取一次），显示树 = 盘根的数据 +
+// 链上每一级自己的子树依次拼上去（buildDisplay：只看链和缓存，同一条链永远是同一张图，展开后的细节和浏览历史无关）。
+
+/** 扫描根的列表（盘根） */
 export const listing = ref<DirListing | null>(null);
-export const tm = ref<TreemapNode | null>(null);
+/** 扫描根自己取回来的方块图数据 */
+const rootTm = shallowRef<TreemapNode | null>(null);
+/** 展开链：从根往下被单击挖开的文件夹路径 [p1 … pk]（p1 是根的子文件夹） */
+export const chain = ref<string[]>([]);
+/** 正在取方块图数据（方块图上最深的展开块标题栏有轻微的 loading 态，不挡操作） */
 export const tmLoading = ref(false);
-/** 右边列表展示的文件夹（当前文件夹里选中的那一块；默认最大的子文件夹） */
+/** 右边列表展示的文件夹（= 链的最后一级；空链 = 盘根） */
 export const focus = ref<DirListing | null>(null);
-export const focusKey = ref<string | null>(null);
+/** 方块图里单击选中的文件 / 其余小文件 / 「其他」/ 伪块（块的 key） */
+export const selKey = ref<string | null>(null);
+/** 选中的是「其他」时它的内容签名（项数 | 大小）：它所在的文件夹重新取数、原来的「其他」被拆开后对不上，就不再算选中 */
+export const selSig = ref<string | null>(null);
 /** 列表里展开说明的那一行 */
 export const openRow = ref<string | null>(null);
 export const exploreView = ref<ExploreView>(loadView());
+
+// ── 数据：按路径缓存「以它自己为根」取回来的子树（大小写不敏感），新扫描 / 清理之后整个作废 ──
+const tmCache = new Map<string, TreemapNode>();
+/** 父级数据里没有的文件夹（超过每层个数上限）：用列表信息补的节点 */
+const tmStubs = new Map<string, Stub>();
+const tmInflight = new Map<string, Promise<void>>();
+/** 缓存 / 补节点变了 +1（显示树重新拼） */
+const tmVer = ref(0);
+
+const rootPath = () => rootTm.value?.path ?? listing.value?.node.path ?? summary.value?.root ?? "";
+/** 当前展开的文件夹 pk（空链 = null） */
+export const focusKey = computed(() => chain.value[chain.value.length - 1] ?? null);
+/** 方块图画的树（扫描根）：盘根的数据 + 链上每一级自己的子树 */
+export const tm = computed<TreemapNode | null>(() => {
+  void tmVer.value;
+  return buildDisplay(rootTm.value, chain.value, tmCache, tmStubs);
+});
+/** 当前展开的文件夹（空链 = 盘根）在方块图数据里的名字和大小：链一变立刻跟上，不等列表 */
+export const pkInfo = computed(() => {
+  const p = focusKey.value ?? rootPath();
+  const n = p ? findTm(tm.value, p) : null;
+  return n ? { path: n.path, name: n.name.replace(/[\\/]+$/, "") || n.path, size: n.allocated } : null;
+});
+/** 面包屑：盘根 → … → pk（名字取自方块图数据，链一变立刻跟上，不等列表） */
+export const crumbs = computed(() => {
+  const root = rootPath();
+  if (!root) return [];
+  const name = (p: string) => findTm(tm.value, p)?.name ?? p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? p;
+  return [{ name: root.replace(/[\\/]+$/, ""), path: root }, ...chain.value.map((p) => ({ name: name(p), path: p }))];
+});
 
 function loadView(): ExploreView {
   try {
@@ -671,61 +712,312 @@ export function setExploreView(v: ExploreView) {
   }
 }
 
-/**
- * 打开一个文件夹作为方块图的根；focusPath 给了就把它当右边列表（可以就是根自己）。
- * 没给 focusPath 时：第一次进入分析页（listing 还是 null）自动挑最大的子文件夹；之后一律列根自己（阶段 J §3.9）。
- */
-export async function openDir(path: string, focusPath?: string) {
-  const first = listing.value === null;
+/** 数据的代数：新扫描 / 清理之后 +1，之前发出去的请求回来一律丢掉 */
+let tmGen = 0;
+/** 导航的序号：快速连点时，只有最后一次的列表结果才用 */
+let navSeq = 0;
+/** 正在取的方块图数据个数（tmLoading = 有没有） */
+let loads = 0;
+async function loading<T>(p: Promise<T>): Promise<T> {
+  loads++;
+  tmLoading.value = true;
   try {
-    tmLoading.value = true;
-    const [l, t] = await Promise.all([listDir(path), getTreemap(path, 3)]);
-    listing.value = l;
-    tm.value = t;
-    openRow.value = null;
-    const target = focusPath ?? (first ? defaultFocus(t) : undefined);
-    await setFocus(target ?? null);
-  } catch (e) {
-    message.value = String(e);
+    return await p;
   } finally {
-    tmLoading.value = false;
+    loads--;
+    tmLoading.value = loads > 0;
   }
 }
 
-/** 第一次进入时的右边列表：最大的子文件夹；它如果只是个“外壳”（Users 里几乎全是 king），就再往里走一层 */
-function defaultFocus(t: TreemapNode): string | undefined {
-  const dirs = t.children.filter((c) => c.kind === "Dir" && c.children.length > 0);
-  if (!dirs.length) return undefined;
-  const big = dirs.reduce((a, b) => (b.allocated > a.allocated ? b : a));
-  return collapseChain(big).node.path;
+function resetExplore() {
+  tmGen++;
+  navSeq++;
+  tmCache.clear();
+  tmStubs.clear();
+  tmInflight.clear();
+  tmVer.value++;
+  listing.value = null;
+  rootTm.value = null;
+  focus.value = null;
+  chain.value = [];
+  selKey.value = null;
+  selSig.value = null;
+  openRow.value = null;
 }
 
-/** 右边列表换成 path；path 为空或就是方块图的根 → 列根自己（方块图里不框任何块） */
-export async function setFocus(path: string | null) {
-  openRow.value = null;
-  if (!path || (listing.value && samePath(path, listing.value.node.path))) {
-    focus.value = listing.value;
-    focusKey.value = null;
+/** 以 path 为根取它的子树（深 3 层）放进缓存；取过的不再取，同一个路径同时只发一次 */
+function fetchOwn(path: string, gen: number): Promise<void> {
+  const k = pathKey(path);
+  if (tmCache.has(k)) return Promise.resolve();
+  let p = tmInflight.get(k);
+  if (!p) {
+    const req: Promise<void> = loading(getTreemap(path, 3))
+      .then((sub) => {
+        if (gen !== tmGen) return;
+        tmCache.set(k, sub);
+        tmVer.value++;
+      })
+      .finally(() => {
+        if (tmInflight.get(k) === req) tmInflight.delete(k);
+      });
+    tmInflight.set(k, req);
+    p = req;
+  }
+  return p;
+}
+
+/** 往里挖时最多等数据这么久再动（超过就先用手上的数据动，数据回来再补一次） */
+const DATA_WAIT_MS = 90;
+
+/** 链上每一级都按它自己做根取一次（后台、并行；显示树按链的顺序拼，到达的先后不影响结果） */
+async function loadOwn(ch: readonly string[], gen: number) {
+  await Promise.all(ch.map((p) => fetchOwn(p, gen).catch(() => {})));
+}
+
+/**
+ * 保证链上每一级都在显示树里：父级的数据里没有就先取父级自己的子树；还没有（超过每层的个数上限）就用列表数据补一个节点
+ * （补节点单独记着，祖先的数据重拼以后照样补上）；连列表都读不到 = 已经不存在了，链在这一级之前截断。返回还有效的那一段链。
+ */
+async function ensureChain(ch: string[], gen: number, alive: () => boolean = () => true): Promise<string[]> {
+  const root = rootPath();
+  for (let i = 0; i < ch.length; i++) {
+    const p = ch[i];
+    const parent = i ? ch[i - 1] : root;
+    const shown = () => findTm(buildDisplay(rootTm.value, ch.slice(0, i + 1), tmCache, tmStubs), p);
+    if (shown()) continue;
+    await fetchOwn(parent, gen).catch(() => {});
+    // 用户已经点了别处（或者数据换代了）：不再为这条链取数据
+    if (gen !== tmGen || !alive()) return ch;
+    if (shown()) continue;
+    const l = await listDir(p, 1).catch(() => null);
+    if (gen !== tmGen || !alive()) return ch;
+    if (!l) return ch.slice(0, i);
+    tmStubs.set(pathKey(p), { parent, node: stubNode(l) });
+    tmVer.value++;
+  }
+  return ch;
+}
+
+/** 方块图数据里没有的文件夹：用列表里它自己的信息补一个（子项等它被取回来时再拼） */
+function stubNode(l: DirListing): TreemapNode {
+  const n = l.node;
+  const e = n.explanation;
+  return {
+    name: n.name,
+    path: n.path,
+    kind: n.kind,
+    allocated: n.allocated,
+    tier: !e || e.source.kind === "unknown" ? "unknown" : e.tier,
+    what: e?.what ?? "",
+    owner: e?.owner ?? null,
+    lose_kind: e?.lose_kind ?? null,
+    category: e?.category ?? "unknown",
+    inaccessible: n.inaccessible,
+    reparse_skipped: n.reparse_skipped,
+    system_reserved: n.system_reserved,
+    cloud_placeholder: n.cloud_placeholder,
+    hardlink_dup: !!n.hardlink_dup,
+    mapped: !!n.mapped,
+    can_open: n.kind === "Dir" && n.child_count > 0 && !n.reparse_skipped,
+    children: [],
+    hidden_bytes: 0,
+    hidden_count: 0,
+  };
+}
+
+/** 右边列表换成 path（null = 盘根）；过期的结果丢掉 */
+async function loadFocus(path: string | null, seq: number, pre?: DirListing) {
+  const root = rootPath();
+  if (!path || samePath(path, root)) {
+    if (listing.value) focus.value = listing.value;
     return;
   }
   try {
-    focus.value = await listDir(path, 200);
-    focusKey.value = path;
+    const l = pre ?? (await listDir(path, 200));
+    if (seq === navSeq) focus.value = l;
   } catch {
-    focus.value = listing.value;
-    focusKey.value = null;
+    if (seq === navSeq) focus.value = listing.value;
   }
 }
 
-/** 进入列表里的某个文件夹：它的父文件夹成为方块图的根，它自己成为右边列表 */
-export async function enterRow(n: NodeView) {
-  if (n.kind !== "Dir" || !focus.value) return;
-  await openDir(focus.value.node.path, n.path);
+/** 取盘根的列表和方块图数据（第一次进分析页 / 清理之后） */
+async function fetchRoot(root: string, gen: number): Promise<boolean> {
+  const [l, t] = await loading(Promise.all([listDir(root), getTreemap(root, 3)]));
+  if (gen !== tmGen) return false;
+  listing.value = l;
+  tmCache.set(pathKey(t.path), t);
+  rootTm.value = t;
+  tmVer.value++;
+  return true;
 }
 
-/** 进入方块图里的某一块（双击）：它成为方块图的根，右边列表也是它 */
-export async function enterBlock(path: string) {
-  await openDir(path, path);
+/** 第一次进分析页：什么都不展开，方块图按真实比例显示整个盘，右边列表 = 盘根 */
+async function openRoot() {
+  resetExplore();
+  const root = summary.value?.root;
+  if (!root) return;
+  const gen = tmGen;
+  try {
+    if (await fetchRoot(root, gen)) focus.value = listing.value;
+  } catch (e) {
+    message.value = String(e);
+  }
+}
+
+/**
+ * 往里挖到 path：展开链 = 「根 → path」（祖先从方块图数据里找，找不到用列表的面包屑），
+ * 链一变方块图立刻重排（块在原地长大），链上每一级自己的子树在后台取回来拼上；右边列表 = path。
+ * path 为空或就是根 = 全部收起。opts.sel / opts.row / opts.sig：同时选中方块图里的一块、展开列表的一行。
+ */
+export async function digTo(path: string | null, opts: { sel?: string | null; row?: string | null; sig?: string | null } = {}) {
+  const root = rootPath();
+  if (!root) return;
+  const seq = ++navSeq;
+  const gen = tmGen;
+  const pick = () => {
+    selKey.value = opts.sel ?? null;
+    selSig.value = opts.sig ?? null;
+    openRow.value = opts.row ?? null;
+  };
+  if (!path || samePath(path, root)) {
+    pick();
+    chain.value = [];
+    await loadFocus(null, seq);
+    return;
+  }
+  let anc = ancestorsIn(tm.value, path);
+  let pre: DirListing | undefined;
+  if (!anc) {
+    try {
+      pre = await listDir(path, 200);
+    } catch (e) {
+      if (seq === navSeq) message.value = String(e);
+      return;
+    }
+    if (seq !== navSeq) return;
+    anc = pre.breadcrumb.slice(1).map((c) => c.path);
+  }
+  const alive = () => seq === navSeq;
+  const data = ensureChain(anc, gen, alive).then(async (ok) => {
+    if (gen === tmGen && alive()) await loadOwn(ok, gen);
+    return ok;
+  });
+  const list = loadFocus(path, seq, pre);
+  // 链上有还没取过的数据：先等一小会儿（一般很快就回来），块的放大和更细的子块一次到位，不用先动一遍、数据回来再动一遍
+  // （只有列表、看不见方块图时不用等）
+  if (exploreView.value !== "list" && anc.some((p) => !tmCache.has(pathKey(p)))) await Promise.race([data, sleep(DATA_WAIT_MS)]);
+  if (seq !== navSeq) return;
+  pick();
+  chain.value = anc;
+  const [ok] = await Promise.all([data, list]);
+  // 链上有一级已经不存在了（被清理掉）：截到它之前
+  if (seq === navSeq && gen === tmGen && ok.length < anc.length) {
+    chain.value = ok;
+    await loadFocus(ok[ok.length - 1] ?? null, seq);
+  }
+}
+
+/** 面包屑第 i 级 / 收起：链截到前 i 级（0 = 全部收起） */
+export async function collapseTo(i: number) {
+  const ch = chain.value;
+  const n = Math.max(0, Math.min(i, ch.length));
+  await digTo(n === 0 ? null : ch[n - 1]);
+}
+/**
+ * Backspace：收起一级。看得见方块图时按图上的一层（合并成一块的外壳 Users \ king 一次收起）；
+ * 只有列表时（byMap = false）按文件夹一级一级往上。
+ */
+export async function collapseOne(byMap = true) {
+  if (chain.value.length) {
+    const starts = byMap ? chainLevelStarts(tm.value, chain.value) : [];
+    await collapseTo(starts[starts.length - 1] ?? chain.value.length - 1);
+  } else if (selKey.value) {
+    clearSel();
+    openRow.value = null;
+  }
+}
+/** Esc：全部收起 */
+export async function collapseAll() {
+  if (chain.value.length || selKey.value || openRow.value) await collapseTo(0);
+}
+
+/** 不再选中方块图里的任何块（「其他」被拆开了等） */
+export function clearSel() {
+  selKey.value = null;
+  selSig.value = null;
+}
+
+/**
+ * 单击文件 / 其余小文件 / 「其他 N 项」/ 伪块：选中它。展开链设为它的父文件夹（已经是就不动），
+ * 这块描粗边；row 给了就在右边列表展开那一行的说明（伪块 / 其他不给）。
+ */
+export async function selectLeaf(key: string, parent: string | null, row: string | null = null, sig: string | null = null) {
+  const pk = focusKey.value ?? rootPath();
+  const par = parent ?? rootPath();
+  if (samePath(par, pk)) {
+    selKey.value = key;
+    selSig.value = sig;
+    openRow.value = row;
+    return;
+  }
+  await digTo(par, { sel: key, row, sig });
+}
+
+export type { MapHit };
+
+/** 键盘（Enter / Space）的双击防抖：第二次落在这么多毫秒内、且第一次刚改变了展开链，就忽略 */
+export const TAP_GUARD_MS = 300;
+/** 上一次改变了展开链的单击：落在哪一块（路径）、什么时候 */
+let lastTap: { path: string; at: number } | null = null;
+
+/** 单击的目标在图上的位置（路径）：文件夹 / 标题栏 = 那一块（合并块按外层）；文件 = 它自己；其他 / 伪块 = 所在的文件夹 */
+function hitPath(h: MapHit, root: string): string {
+  if (h.kind === "dir") return h.path;
+  if (h.kind === "head") return h.outer;
+  return h.row ? h.key.replace(/\|.*$/, "") : (h.parent ?? root);
+}
+const related = (a: string, b: string) => samePath(a, b) || isUnder(a, b) || isUnder(b, a);
+
+/** 单击的事件信息：at = 时间戳；detail = 鼠标连击次数（系统的双击判定；键盘触发 = 0） */
+export interface TapInfo {
+  at?: number;
+  detail?: number;
+}
+
+/**
+ * 方块图的单击（阶段 K §2）。双击 = 两次单击：第二下（鼠标按 detail ≥ 2，跟系统的双击设置走；键盘按 300 ms）
+ * 只有落在第一下那块、或它的祖先 / 后代上，而且第一下刚改变了展开链，才忽略（防止一次双击连挖两层 / 挖了又收）；点别的块照常处理。
+ */
+export async function mapClick(hit: MapHit, ev: TapInfo = {}) {
+  const at = ev.at ?? performance.now();
+  const detail = ev.detail ?? 0;
+  const root = rootPath();
+  const target = hitPath(hit, root);
+  if (lastTap && related(target, lastTap.path)) {
+    const dt = at - lastTap.at;
+    if (detail >= 2 || (detail === 0 && dt >= 0 && dt < TAP_GUARD_MS)) return;
+  }
+  const pk = focusKey.value ?? root;
+  // 单击当前展开块（pk）自己的空白处：什么都不做（不重取列表、不收起列表里展开的行）
+  if (hit.kind === "dir" && samePath(hit.path, pk)) {
+    lastTap = null;
+    return;
+  }
+  let changes = false;
+  let run: () => Promise<void>;
+  if (hit.kind === "dir") {
+    changes = true;
+    run = () => digTo(hit.path);
+  } else if (hit.kind === "head") {
+    const i = chain.value.findIndex((c) => samePath(c, hit.outer));
+    changes = i >= 0 || !samePath(hit.path, pk);
+    run = i >= 0 ? () => collapseTo(i) : () => digTo(hit.path);
+  } else {
+    changes = !samePath(hit.parent ?? root, pk);
+    run = () => selectLeaf(hit.key, hit.parent, hit.row, hit.sig ?? null);
+  }
+  lastTap = changes ? { path: target, at } : null;
+  await run();
 }
 
 /** 换盘（阶段 J §3.6）：首页盘名下拉选了另一个盘 → 扫那个盘；正在扫就先停下当前这次 */
@@ -753,23 +1045,42 @@ export async function switchDrive(root: string) {
   await doScan();
 }
 
-export async function goUp() {
-  const bc = listing.value?.breadcrumb;
-  if (bc && bc.length > 1) await openDir(bc[bc.length - 2].path, listing.value!.node.path);
-}
-
 export async function goExplore() {
   page.value = "explore";
-  if (!listing.value && summary.value) await openDir(summary.value.root);
+  if (!listing.value && summary.value) await openRoot();
 }
 
 export function selectKeyOf(n: { kind: NodeView["kind"]; path: string }): string {
   return tmKey(n);
 }
 
-/** 动作之后重新读当前视图（后端已经只重扫了受影响的子树） */
-async function reloadViews() {
-  if (listing.value) await openDir(listing.value.node.path, focusKey.value ?? undefined);
+/**
+ * 动作之后重新读当前视图（后端已经只重扫了受影响的子树）：清缓存、重取盘根，
+ * 按原来的链重新取数据；链上不存在了的路径截掉。
+ */
+export async function reloadViews() {
+  if (!listing.value) return;
+  const root = listing.value.node.path;
+  const keep = chain.value.slice();
+  tmGen++;
+  navSeq++;
+  tmCache.clear();
+  tmStubs.clear();
+  tmInflight.clear();
+  const gen = tmGen;
+  const seq = navSeq;
+  clearSel();
+  openRow.value = null;
+  try {
+    if (!(await fetchRoot(root, gen))) return;
+    const ok = await ensureChain(keep, gen);
+    // 重新读的时候用户已经点了别处：听用户的
+    if (gen !== tmGen || seq !== navSeq) return;
+    chain.value = ok;
+    await Promise.all([loadOwn(ok, gen), loadFocus(ok[ok.length - 1] ?? null, seq)]);
+  } catch (e) {
+    message.value = String(e);
+  }
 }
 
 // ───── 其他 ─────
@@ -806,8 +1117,7 @@ export async function doOpenSnapshot(path?: string) {
     scanRoot.value = s.root;
     scanFinishedAt.value = s.snapshot ? s.snapshot.meta.saved_at * 1000 : Date.now();
     phase.value = "done";
-    listing.value = null;
-    focus.value = null;
+    resetExplore();
     resetSelection();
     if (s.snapshot) notice.value = "在看保存的扫描结果";
     page.value = "home";

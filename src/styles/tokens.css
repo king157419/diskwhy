@@ -88,6 +88,8 @@
   --tm-g-r: 4px;
   --tm-g-bw: 1px;
   --tm-head: 26px;
+  /* 块的最短边小于这个就并进「其他」 */
+  --tm-min: 12px;
   --stroke: var(--line);
   --shadow: none;
   --shadow-hard: none;
@@ -146,6 +148,7 @@
   --tm-g-r: 6px;
   --tm-g-bw: 1px;
   --tm-head: 26px;
+  --tm-min: 12px;
   --stroke: var(--line);
   --shadow: none;
   --shadow-hard: none;
@@ -205,6 +208,8 @@
   --tm-g-r: 10px;
   --tm-g-bw: 2px;
   --tm-head: 26px;
+  /* 2px 描边 + 4px 间隙：再小的块只剩一圈边框（一片没字的小格子），并进「其他」 */
+  --tm-min: 20px;
   --stroke: #141412;
   --shadow: 4px 4px 0 #141412;
   --shadow-hard: 6px 6px 0 #141412;

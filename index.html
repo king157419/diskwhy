@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <title>DiskWhy</title>
+    <!-- 不让浏览器 / WebView 自己去要 /favicon.ico（没有这个文件，控制台会报 404） -->
+    <link rel="icon" href="data:," />
     <script>
       // 样式加载前就设好主题（A 浅色 / B 深色 / C 趣味），避免启动时闪一下别的颜色。
       // 真正的存档在 %LOCALAPPDATA%\DiskWhy\ui.json，src/theme.ts 启动后会再读一次。

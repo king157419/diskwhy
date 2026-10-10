@@ -1,9 +1,10 @@
 <script setup lang="ts">
-// 看看都是什么（空间分析）：左方块图（两层，颜色 = 三档），右列表（选中的那个文件夹的子项）。
+// 看看都是什么（空间分析）：左方块图（颜色 = 三档），右列表（当前展开的那个文件夹的子项）。
 // 行 = 色点、图标、名字、灰色类别（≤ 8 字）、细条、大小；混合 / 零散的用空心点，排在最后。
-// 点一行在行内展开说明；有子项的文件夹点右端“›”进去。右上切「方块图 / 并排 / 列表」。
-// 阶段 J：面包屑每一级都能点（盘根 → 方块图和列表都是盘根；其余 → 上一级做方块图、它自己做列表）；
-// 「图例」按钮（悬停 / 点击出现，色块复用方块的配色类）；窄窗口 / 竖屏时方块图在上、列表在下。
+// 点一行在行内展开说明；有子项的文件夹点右端“›”= 在方块图里展开它。右上切「方块图 / 并排 / 列表」。
+// 阶段 J：「图例」按钮（悬停 / 点击出现，色块复用方块的配色类）；窄窗口 / 竖屏时方块图在上、列表在下。
+// 阶段 K：方块图是一张平面图，单击原地展开（见 store.ts mapClick）；面包屑第 i 级 = 收起到第 i 级；
+// Esc = 全部收起，Backspace = 收起一级。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   AppWindow,
@@ -13,6 +14,7 @@ import {
   File as FileIcon,
   Folder,
   HardDrive,
+  Lightbulb,
   MoreHorizontal,
   ScrollText,
   Sparkles,
@@ -23,24 +25,34 @@ import TreemapView from "../components/TreemapView.vue";
 import { askAi, type Category, type Explanation, type NodeView } from "../api";
 import { sizeParts, gbNum } from "../capacity";
 import { advice, CATEGORY_LABEL, clipWidth, isHardTag, loseTag } from "../labels";
-import { crumbTarget } from "../treemap";
+import { samePath } from "../treemap";
+import { pathKey } from "../tmtree";
 import {
-  enterBlock,
-  enterRow,
+  chain,
+  collapseAll,
+  collapseOne,
+  collapseTo,
+  crumbs,
+  digTo,
+  execPhase,
   exploreView,
   focus,
-  focusKey,
-  goUp,
   listing,
   llmReady,
-  openDir,
+  clearSel,
+  mapClick,
   openRow,
+  pkInfo,
+  report,
+  selKey,
+  selSig,
   setExploreView,
-  setFocus,
   summary,
   tm,
   tmLoading,
   type ExploreView,
+  type MapHit,
+  type TapInfo,
 } from "../store";
 
 const VIEWS: { id: ExploreView; name: string }[] = [
@@ -49,21 +61,27 @@ const VIEWS: { id: ExploreView; name: string }[] = [
   { id: "list", name: "列表" },
 ];
 
-const isScanRoot = computed(() => !!summary.value && !!listing.value && listing.value.node.path === summary.value.root);
-
-/** 面包屑：右边列表那个文件夹的完整路径（最后一段加粗 = 当前选中） */
-const crumbs = computed(() => {
-  const bc = (focus.value ?? listing.value)?.breadcrumb ?? [];
-  return bc.map((c, i) => ({ name: i === 0 ? c.name.replace(/\\$/, "") : c.name, path: c.path }));
-});
-/** 点面包屑第 i 级：见 treemap.ts crumbTarget（盘根也能选中，列在右边） */
-async function crumbGo(i: number) {
-  const t = crumbTarget(crumbs.value, i);
-  if (t) await openDir(t.open, t.focus);
+/** 点面包屑第 i 级：展开链截到第 i 级（第 0 级 = 全部收起） */
+function crumbGo(i: number) {
+  void collapseTo(i);
 }
-// 路径很长时面包屑横向滚动，总是露出最后一段
+function onHit(h: MapHit, ev: TapInfo) {
+  void mapClick(h, ev);
+}
+// 路径很长时面包屑横向滚动，总是露出最后一段；左边被盖住的部分渐隐（不会把「C:」切成「:」）
 const crumbEl = ref<HTMLElement | null>(null);
-watch(crumbs, () => nextTick(() => crumbEl.value && (crumbEl.value.scrollLeft = crumbEl.value.scrollWidth)));
+const crumbCut = ref(false);
+function crumbFade() {
+  const el = crumbEl.value;
+  crumbCut.value = !!el && el.scrollLeft > 1;
+}
+function crumbEnd() {
+  if (crumbEl.value) crumbEl.value.scrollLeft = crumbEl.value.scrollWidth;
+  crumbFade();
+}
+watch(crumbs, () => nextTick(crumbEnd));
+// 窗口变窄、面包屑放不下了：同样露出最后一段、左边渐隐
+let crumbRo: ResizeObserver | null = null;
 
 // ── 图例：悬停出现，点一下钉住（再点 / 点别处 / Esc 收起） ──
 const LEGEND: { tone: string; name: string; note: string }[] = [
@@ -120,7 +138,40 @@ const rows = computed(() => {
   return [...main, ...tail];
 });
 const maxRow = computed(() => Math.max(1, ...rows.value.map((r) => r.allocated)));
-const focusTotal = computed(() => focus.value?.node.allocated ?? 0);
+/**
+ * 换了文件夹：先只画前面一屏的行，方块图的过渡（约 260 ms）结束后再补上其余的——
+ * 几百行和方块图的过渡挤在同一帧里渲染，会让方块图的动画卡一下。
+ */
+const ROWS_FIRST = 24;
+const rowLimit = ref(Infinity);
+let rowTimer: ReturnType<typeof setTimeout> | undefined;
+watch(focus, () => {
+  rowLimit.value = ROWS_FIRST;
+  clearTimeout(rowTimer);
+  rowTimer = setTimeout(() => (rowLimit.value = Infinity), 320);
+});
+const shownRows = computed(() => rows.value.slice(0, rowLimit.value));
+/** 列表数据已经是当前展开的那个文件夹的（链一变到列表数据回来之前：旧行淡化，标题先用方块图数据里的名字和大小） */
+const listFresh = computed(() => !pkInfo.value || (!!focus.value && samePath(focus.value.node.path, pkInfo.value.path)));
+/** 面包屑旁边 / 列表标题的大小：方块图数据里 pk 的大小（链一变立刻跟上，不等列表） */
+const focusTotal = computed(() => pkInfo.value?.size ?? focus.value?.node.allocated ?? 0);
+const focusName = computed(() => (listFresh.value ? focus.value?.node.name.replace(/\\$/, "") : pkInfo.value?.name) ?? "");
+
+/** 认不出来的东西的第一条线索（列表数据里才有）：方块图的悬停卡片直接写它 */
+const firstClue = (n: NodeView | undefined) => (n?.explanation?.source.kind === "unknown" ? n.explanation.clues[0] : undefined);
+const clueMap = computed(() => {
+  const m = new Map<string, string>();
+  for (const l of [listing.value, focus.value]) {
+    if (!l) continue;
+    for (const n of [l.node, ...l.children]) {
+      const c = firstClue(n);
+      if (c) m.set(pathKey(n.path), c);
+    }
+  }
+  return m;
+});
+/** 当前展开的文件夹自己认不出来时，列表标题下面写它的第一条线索 */
+const pkClue = computed(() => (listFresh.value ? firstClue(focus.value?.node) : undefined));
 
 /** 列表里的大小：GB 一位小数（和设计稿一致），小于 1 GB 用 MB */
 function rowSize(b: number): [string, string] {
@@ -131,6 +182,30 @@ function rowSize(b: number): [string, string] {
 function toggleRow(n: NodeView) {
   openRow.value = openRow.value === n.path + n.kind ? null : n.path + n.kind;
 }
+/** 列表里的「›」：在方块图里展开这个文件夹（链延长一级） */
+function digRow(n: NodeView) {
+  if (n.kind === "Dir") void digTo(n.path);
+}
+// 方块图里选中了一个文件：列表滚到那一行，连同它展开的说明一起进入可视区（说明比列表还高时让行在最上面）
+const rowsEl = ref<HTMLElement | null>(null);
+watch([openRow, focus, rowLimit], () =>
+  nextTick(() => {
+    const box = rowsEl.value;
+    const row = box?.querySelector<HTMLElement>(".li.open");
+    if (!box || !row) return;
+    const detail = row.nextElementSibling?.classList.contains("detail") ? (row.nextElementSibling as HTMLElement) : null;
+    const c = box.getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    // 说明刚出现时带一点位移动画（往上 4px），多留 8px
+    const bottom = (detail ?? row).getBoundingClientRect().bottom + (detail ? 8 : 0);
+    const top = box.scrollTop + (r.top - c.top);
+    const end = box.scrollTop + (bottom - c.top);
+    let to = box.scrollTop;
+    if (end > box.scrollTop + box.clientHeight) to = Math.min(top, end - box.clientHeight);
+    if (top < to) to = top;
+    if (Math.abs(to - box.scrollTop) > 1) box.scrollTo({ top: to, behavior: "smooth" });
+  }),
+);
 
 // 问 AI（只在认不出来、而且用户在设置里开了 AI 时出现）
 const ai = ref<Record<string, Explanation | string>>({});
@@ -150,17 +225,29 @@ function adviceOf(e: Explanation) {
 }
 
 function onKey(e: KeyboardEvent) {
-  if (e.key === "Escape") lgPinned.value = false;
-  if (e.key === "Backspace" && !(e.target instanceof HTMLInputElement)) {
+  const t = e.target;
+  if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || e.isComposing) return;
+  // 确认 / 清理弹层开着：页面是 inert 的，键盘不动方块图
+  if (report.value || execPhase.value !== "idle") return;
+  if (e.key === "Escape") {
+    if (lgPinned.value) lgPinned.value = false;
+    else void collapseAll();
+  } else if (e.key === "Backspace") {
     e.preventDefault();
-    void goUp();
+    void collapseOne(exploreView.value !== "list");
   }
 }
 onMounted(() => {
   window.addEventListener("keydown", onKey);
   document.addEventListener("mousedown", onDocDown);
+  if (crumbEl.value && typeof ResizeObserver === "function") {
+    crumbRo = new ResizeObserver(crumbEnd);
+    crumbRo.observe(crumbEl.value);
+  }
 });
 onBeforeUnmount(() => {
+  clearTimeout(rowTimer);
+  crumbRo?.disconnect();
   window.removeEventListener("keydown", onKey);
   document.removeEventListener("mousedown", onDocDown);
 });
@@ -169,7 +256,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="explore" :class="'v-' + exploreView">
     <div class="sub">
-      <nav ref="crumbEl" class="crumb" aria-label="位置">
+      <nav ref="crumbEl" class="crumb" :class="{ cut: crumbCut }" aria-label="位置" @scroll.passive="crumbFade">
         <template v-for="(c, i) in crumbs" :key="c.path + i">
           <span v-if="i > 0" class="sep">/</span>
           <b v-if="i === crumbs.length - 1" class="cur">{{ c.name }}</b>
@@ -197,26 +284,33 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="body">
-      <div v-if="exploreView !== 'list'" class="mapbox" :class="{ loading: tmLoading }">
+      <div v-if="exploreView !== 'list'" class="mapbox">
         <TreemapView
           v-if="summary"
           :data="tm"
           :summary="summary"
-          :is-scan-root="isScanRoot"
-          :focus-path="focusKey"
-          @select="setFocus"
-          @open="enterBlock"
+          :chain="chain"
+          :sel-key="selKey"
+          :sel-sig="selSig"
+          :loading="tmLoading"
+          :pin="exploreView === 'map'"
+          :clues="clueMap"
+          @hit="onHit"
+          @unsel="clearSel"
         />
       </div>
 
       <section v-if="exploreView !== 'map'" class="list">
-        <div class="lh">
-          <h2>{{ focus?.node.name.replace(/\\$/, "") ?? "" }}</h2>
-          <span class="m"><b class="num">{{ rows.length }}</b> 项 · <b class="num">{{ gbNum(focusTotal) }}</b> GB</span>
-          <span class="sort">按大小</span>
+        <div class="lh" :class="{ hasclue: !!pkClue }">
+          <div class="lt">
+            <h2>{{ focusName }}</h2>
+            <span class="m"><template v-if="listFresh"><b class="num">{{ rows.length }}</b> 项 · </template><b class="num">{{ gbNum(focusTotal) }}</b> GB</span>
+            <span class="sort">按大小</span>
+          </div>
+          <div v-if="pkClue" class="clue" :title="pkClue"><Lightbulb :size="13" :stroke-width="1.8" aria-hidden="true" /><span>{{ pkClue }}</span></div>
         </div>
-        <div class="rows">
-          <template v-for="n in rows" :key="n.path + n.kind">
+        <div ref="rowsEl" class="rows" :class="{ stale: !listFresh }">
+          <template v-for="n in shownRows" :key="n.path + n.kind">
             <div class="li" :class="{ tail: tone(n) === 'mix', open: openRow === n.path + n.kind }">
               <i class="dot" :class="tone(n)"></i>
               <span class="ic"><component :is="icon(n)" :size="16" :stroke-width="1.6" /></span>
@@ -224,7 +318,7 @@ onBeforeUnmount(() => {
               <span class="c">{{ catText(n) }}</span>
               <span class="br"><i :style="{ width: (n.allocated / maxRow) * 100 + '%' }"></i></span>
               <span class="s num">{{ rowSize(n.allocated)[0] }}<small>{{ rowSize(n.allocated)[1] }}</small></span>
-              <button v-if="n.kind === 'Dir' && n.child_count > 0 && !n.pseudo" class="go" :aria-label="'进入：' + n.name" @click="enterRow(n)">
+              <button v-if="n.kind === 'Dir' && n.child_count > 0 && !n.pseudo" class="go" :aria-label="'在方块图里展开：' + n.name" @click="digRow(n)">
                 <svg class="i" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" /></svg>
               </button>
               <span v-else></span>
@@ -294,6 +388,11 @@ onBeforeUnmount(() => {
 }
 .crumb::-webkit-scrollbar {
   display: none;
+}
+/* 面包屑太长、滚到了最右：左边被盖住的部分渐隐（不是硬切成半个字） */
+.crumb.cut {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 36px);
+  mask-image: linear-gradient(90deg, transparent 0, #000 36px);
 }
 .crumb .cr {
   flex: none;
@@ -485,10 +584,6 @@ onBeforeUnmount(() => {
 .mapbox {
   flex: 1;
   min-width: 0;
-  transition: opacity var(--dur-2) var(--ease);
-}
-.mapbox.loading {
-  opacity: 0.55;
 }
 .list {
   width: 484px;
@@ -505,10 +600,36 @@ onBeforeUnmount(() => {
   height: 64px;
   flex: none;
   display: flex;
-  align-items: baseline;
-  gap: 12px;
+  flex-direction: column;
   padding: 10px 4px 0;
   border-bottom: 1px solid var(--line2);
+  min-width: 0;
+}
+.lh .lt {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+/* 当前展开的文件夹自己认不出来：标题下面一行灰色小字写它的第一条线索 */
+.lh .clue {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 1px;
+  min-width: 0;
+  font-size: var(--fs-meta);
+  line-height: 18px;
+  color: var(--ink3);
+  white-space: nowrap;
+}
+.lh .clue svg {
+  flex: none;
+}
+.lh .clue span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .lh h2 {
   font-family: var(--heading);
@@ -534,11 +655,16 @@ onBeforeUnmount(() => {
   color: var(--ink3);
 }
 .rows {
+  transition: opacity var(--dur-1) var(--ease);
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--line2) transparent;
+}
+/* 链变了、列表数据还没回来：旧的行先淡一点 */
+.rows.stale {
+  opacity: 0.5;
 }
 .li {
   height: 44px;
@@ -678,7 +804,7 @@ onBeforeUnmount(() => {
   font-size: var(--fs-meta);
 }
 
-/* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：方块图约 45% 高在上，列表在下 ───────── */
+/* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：方块图至少约 58% 高在上，列表在下；列表行少时列表变矮，空出来的给方块图 ───────── */
 @media (max-width: 1099px), (max-aspect-ratio: 1/1) {
   .explore {
     padding: 52px var(--gutter) 16px;
@@ -688,16 +814,26 @@ onBeforeUnmount(() => {
     gap: 14px;
   }
   .v-split .mapbox {
-    flex: 0 0 45%;
-    min-height: 0;
+    flex: 1 1 0;
+    min-height: 58%;
   }
   .list {
     width: auto;
     flex: 1;
   }
+  .v-split .list {
+    flex: 0 1 auto;
+    max-height: calc(42% - 14px);
+  }
+  .v-split .rows {
+    flex: 0 1 auto;
+  }
   .lh {
     height: 48px;
     padding-top: 4px;
+  }
+  .lh.hasclue {
+    height: 66px;
   }
 }
 /* 更窄：副栏换行，面包屑独占一行 */

@@ -311,7 +311,7 @@ describe("boost：展开链上的块至少占父块内容区的 60%", () => {
     expect(boosted.map((i) => i.rect)).toEqual(plain.map((i) => i.rect));
   });
 
-  it("放大的块再小也不会被并进“其他”；它的兄弟太小照样并进“其他”", () => {
+  it("放大的块再小也不会被并进“其他”；它的兄弟太小照样并进“其他”；被挤细的尾巴不画成细条", () => {
     const vals = [5000, 3000, 2000, ...Array.from({ length: 40 }, () => 1)];
     const r = { x: 0, y: 0, w: 300, h: 200 };
     // 不放大时 k20（值 1）会被并掉
@@ -320,15 +320,36 @@ describe("boost：展开链上的块至少占父块内容区的 60%", () => {
     const b = items.find((i) => i.key === "k20")!;
     expect(b).toBeTruthy();
     expect(area(b.rect) / (300 * 200)).toBeGreaterThanOrEqual(BOOST - 1e-9);
-    // 其余值为 1 的兄弟都还在「其他」里（不会为了露出 k20 把一串细条画出来）；k20 单独拿出来，排在留下的块后面
+    // 其余值为 1 的兄弟都不单独画（不会为了露出 k20 把一串细条画出来）
     expect(items.filter((i) => i.kind === "node" && i.value === 1 && i.key !== "k20")).toHaveLength(0);
-    const other = items.find((i) => i.kind === "other")!;
-    expect(other.mergedCount).toBe(39 + 9);
-    // 不放大时就够大的块都还在，而且都 ≥ minPx；被放大挤小的只有「其他」（仍然看得见，≥ 2px）
-    for (const it of items) if (it.kind === "node") expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(DEFAULT_LAYOUT.minPx - EPS);
-    expect(Math.min(other.rect.w, other.rect.h)).toBeGreaterThanOrEqual(2);
+    // 画出来的块（包括「其他」）最短边都 ≥ minPx：被放大挤细的尾巴要么是一块够大的「其他」，要么交给前一格
+    for (const it of items) expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(DEFAULT_LAYOUT.minPx - EPS);
+    const other = items.find((i) => i.kind === "other");
+    if (other) expect(other.mergedCount).toBe(39 + 9);
     // 面积不留洞
     expect(items.reduce((s, i) => s + area(i.rect), 0)).toBeCloseTo(300 * 200, 6);
+  });
+
+  it("第 4 轮：被挤小的尾部太薄时接到最后一行末尾成「其他」——回收站这类小项不会从图上消失，前一块也不会被悄悄撑大", () => {
+    // 盘根：Users 92.3 / Windows 31.6（展开）/ Program Files 19.3 / hiberfil 12.7 / ProgramData 10.2 / pagefile 8.0 / Program Files (x86) 4.6 /
+    // $Recycle.Bin 1.2 / swapfile 0.25 / DumpStack 0.0001（GB）
+    const names = ["Users", "Windows", "PF", "hiberfil", "ProgramData", "pagefile", "PF86", "Recycle", "swapfile", "DumpStack"];
+    const vals = [92.3, 31.6, 19.3, 12.7, 10.2, 8.0, 4.6, 1.2, 0.25, 0.0001];
+    const ch = vals.map((v, i) => ({ key: names[i], name: names[i], value: v, boost: i === 1 ? BOOST : undefined }));
+    const items = layoutTreemap(root(ch), { x: 0, y: 0, w: 888, h: 772 }, { ...DEFAULT_LAYOUT, minPx: 24 });
+    const by = new Map(items.map((i) => [i.key, i]));
+    // 回收站：要么自己画出来，要么在一块「其他」里（写着它的大小）
+    const other = items.find((i) => i.kind === "other");
+    expect(by.has("Recycle") || !!other?.merged?.includes("Recycle")).toBe(true);
+    if (other) {
+      expect(Math.min(other.rect.w, other.rect.h)).toBeGreaterThanOrEqual(24 - EPS);
+      expect(other.value).toBeCloseTo(1.2 + 0.25 + 0.0001, 6);
+    }
+    // 没被放大的块：面积 / 值处处一样（Program Files (x86) 不再多吃回收站那 30%）
+    const dens = ["PF", "hiberfil", "ProgramData", "pagefile", "PF86"].map((k) => area(by.get(k)!.rect) / by.get(k)!.value);
+    for (const d of dens) expect(d / dens[0]).toBeCloseTo(1, 6);
+    // 面积不留洞
+    expect(items.reduce((s, i) => s + area(i.rect), 0)).toBeCloseTo(888 * 772, 6);
   });
 
   it("链上的块下面再画两层（pk 的子项和孙项），链外的兄弟照旧只画一层子项", () => {
@@ -449,19 +470,48 @@ describe("结构稳定：容器的行 / 列结构只按数据和基础参照矩�
     expect(containersChecked).toBeGreaterThan(100);
   });
 
-  it("尾巴按不放大的布局判断：被放大的块挤成细条的兄弟不会因此被并进「其他」", () => {
+  it("伸缩后不画细条（F2）：任何状态下画出来的块（包括「其他」）最短边都 ≥ minPx，每个容器里不留洞", () => {
     const rect = { x: 0, y: 0, w: 900, h: 640 };
+    const o2 = { ...opt, minPx: 20, minPxDeep: 26 };
+    let squeezedMerged = 0;
     for (let t = 0; t < 300; t++) {
-      const T = tree("r", 1);
-      const plain = layoutTreemap(T, rect, opt);
-      const ch = pickChain(T, 1);
-      const boosted = layoutTreemap(withChain(T, ch), rect, opt);
-      const top = (L: TmItem[]) => L.filter((i) => i.depth === 1);
-      const mergedA = top(plain).find((i) => i.kind === "other")?.mergedCount ?? 0;
-      const mergedB = top(boosted).find((i) => i.kind === "other")?.mergedCount ?? 0;
-      // 放大以后「其他」里的项只会更少（被放大的那块如果本来在「其他」里，会被单独拿出来）
-      expect(mergedB).toBeLessThanOrEqual(mergedA);
+      const T = tree("r", 3);
+      for (const ch of [[], pickChain(T, 1), pickChain(T, 2), pickChain(T, 3)]) {
+        const L = layoutTreemap(withChain(T, ch), rect, o2);
+        const byKey = new Map(L.map((i) => [i.key, i]));
+        const kidsArea = new Map<string, number>();
+        for (const it of L) {
+          const need = it.depth >= 2 ? 26 : 20;
+          expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(need - EPS);
+          const pk = it.parentKey ?? "";
+          kidsArea.set(pk, (kidsArea.get(pk) ?? 0) + area(it.rect));
+          if (it.kind === "other" && ch.length) squeezedMerged++;
+        }
+        // 子块合起来正好铺满父块的内容区（被挤掉的行挪进了「其他」/ 交给了前一格，不留空洞）
+        for (const [pk, a] of kidsArea) {
+          const box = pk ? contentBox(byKey.get(pk)!.rect, o2) : rect;
+          expect(a / area(box)).toBeCloseTo(1, 4);
+        }
+      }
     }
+    expect(squeezedMerged).toBeGreaterThan(100);
+  });
+
+  it("「其他」的 key 不带项数：同一个容器的尾巴在放大 / 不放大两种状态下是同一块（过渡连续）", () => {
+    const vals = [400, 250, 180, 120, 90, ...Array.from({ length: 30 }, (_, i) => 40 / (i + 1))];
+    const kids2: TmInput[] = vals.map((v, i) => ({ key: `k${i}`, name: `k${i}`, value: v, boost: undefined }));
+    const T: TmInput = { key: "r", name: "r", value: vals.reduce((a, b) => a + b, 0), children: kids2 };
+    const rect = { x: 0, y: 0, w: 800, h: 500 };
+    const o2 = { ...opt, minPx: 20 };
+    const A = layoutTreemap(T, rect, o2).filter((i) => i.kind === "other");
+    const B = layoutTreemap({ ...T, children: kids2.map((c) => (c.key === "k1" ? { ...c, boost: BOOST } : c)) }, rect, o2).filter((i) => i.kind === "other");
+    expect(A.map((i) => i.key)).toContain("r|其他");
+    expect(B.map((i) => i.key)).toContain("r|其他");
+    // 放大以后被挤细的兄弟也并进来了：项数变多，key 不变
+    const a = A.find((i) => i.key === "r|其他")!;
+    const b = B.find((i) => i.key === "r|其他")!;
+    expect(b.mergedCount).toBeGreaterThan(a.mergedCount);
+    for (const it of [...A, ...B]) expect(it.key).toMatch(/^r\|其他(\|\d+)?$/);
   });
 
   it("数据变细（懒加载取回更多子项、尾巴变小）：大块的位置一点不动，新块出现在原来「其他」的地方", () => {
@@ -488,23 +538,22 @@ describe("结构稳定：容器的行 / 列结构只按数据和基础参照矩�
     for (const [k, r] of B) if (!A.has(k) && !k.startsWith("r|其他")) expect(inside(r, other)).toBe(true);
   });
 
-  it("被挤得变形的链外容器：子块会成细条时整体不画（只剩带名字的块），不会画一片细条", () => {
+  it("被挤小的链外容器照样画出够大的行（不再整块不画），里面没有细条", () => {
     const rect = { x: 0, y: 0, w: 900, h: 640 };
-    let hidden = 0;
+    let kept = 0;
     for (let t = 0; t < 200; t++) {
       const T = tree("r", 2);
       const ch = pickChain(T, 1);
       const L = layoutTreemap(withChain(T, ch), rect, opt);
       const byKey = new Map(L.map((i) => [i.key, i]));
-      // 链外容器里画出来的子块都 ≥ minPx（被挤成细条的只可能是链上块的兄弟）
       for (const it of L) {
         const parent = it.parentKey ? byKey.get(it.parentKey) : undefined;
-        if (parent && !parent.chain && it.kind === "node") expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(opt.minPx - EPS);
+        if (parent && !parent.chain) expect(Math.min(it.rect.w, it.rect.h)).toBeGreaterThanOrEqual(opt.minPx - EPS);
       }
-      const plain = new Map(layoutTreemap(T, rect, opt).map((i) => [i.key, i]));
-      for (const it of L) if (!it.chain && !it.container && plain.get(it.key)?.container) hidden++;
+      // 链外的容器（被放大的兄弟挤小了）还画着子块
+      kept += L.filter((i) => i.depth === 1 && !i.chain && i.container).length;
     }
-    expect(hidden).toBeGreaterThan(0);
+    expect(kept).toBeGreaterThan(50);
   });
 });
 

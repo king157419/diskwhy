@@ -2,7 +2,7 @@
 // 方块图的根始终是扫描根；单击往里挖时，链上每一级都按它自己做根单独取一次子树（各自的阈值，细节和历史无关），
 // 显示树 = 盘根的数据 + 链上每一级自己的子树依次拼上去（只复制从根到它的那一串节点，其余原样共享）。
 import { tmKey, type TreemapNode } from "./api";
-import { BOOST, collapseChain, samePath, type TmInput, type TmItem, type TmItemKind } from "./treemap";
+import { BOOST, canonPath, collapseChain, layoutTreemap, samePath, type HiddenSlot, type LayoutOptions, type Rect, type TmInput, type TmItem, type TmItemKind } from "./treemap";
 
 /**
  * “外壳”合并（Users \ king）。展开链停在外壳这一级（链的最后一级就是 Users），或者从外壳拐进别的子文件夹
@@ -198,6 +198,9 @@ export function toInput(root: TreemapNode, chain: readonly string[], o: InputOpt
       key: tmKey(n),
       name,
       value: n.allocated,
+      // 外壳合并块写的数：链已经走进内层（合并块在链上 ⇒ 链穿过了每一层）时写内层的大小（和面包屑、列表一致），
+      // 否则写外层的（和上一级列表一致）。面积始终按外层
+      size: boosted && hops.length > 1 ? node.allocated : n.allocated,
       children: inner >= 1 && node.children.length ? node.children.map((c) => conv(c, inner)) : undefined,
       hidden: node.hidden_bytes,
       hiddenCount,
@@ -220,6 +223,54 @@ export function toInput(root: TreemapNode, chain: readonly string[], o: InputOpt
     r.value += x.value;
   }
   return r;
+}
+
+/**
+ * 自动缩放后图的根（rootPath）在上一级图里是哪一块：外壳合并块（DriverStore \ FileRepository）用外层的 key 和合并的名字，
+ * 大小写内层的（链穿过了它）。缩放时它画成铺满整张图、顶上一条标题栏的容器，和上一级图里那一块是同一个 key。
+ */
+export function rootHead(tree: TreemapNode | null, chain: readonly string[], rootPath: string): { key: string; name: string; size: number } | null {
+  const node = findTm(tree, rootPath);
+  if (!tree || !node) return null;
+  const starts = chainLevelStarts(tree, chain);
+  const at = chain.findIndex((c) => samePath(c, rootPath));
+  // rootPath 所在的那一层（合并块）从链的哪一级开始
+  let s = at;
+  for (const st of starts) if (st <= at) s = st;
+  const outer = s >= 0 ? findTm(tree, chain[s]) : null;
+  if (outer && s < at) {
+    const { name, hops } = collapseFor(outer, chain);
+    if (samePath(hops[hops.length - 1].path, rootPath)) return { key: tmKey(outer), name, size: node.allocated };
+  }
+  return { key: tmKey(node), name: node.name, size: node.allocated };
+}
+
+/**
+ * 以 rootPath 为图的根铺一次（TreemapView 用；纯函数，方便测）。参照矩形从扫描根沿原始的层走下来：缩放前后同一套行 / 列结构。
+ * 根不是扫描根时，根自己画成铺满整张图的容器（顶上一条和链上祖先同样式的标题栏），没有伪块。
+ */
+export function layoutMap(
+  data: TreemapNode | null,
+  chain: readonly string[],
+  rootPath: string,
+  frame: Rect,
+  opt: LayoutOptions,
+  extra: readonly TmInput[] = [],
+): { root: string; items: TmItem[]; hidden: Map<string, HiddenSlot> } | null {
+  if (!data) return null;
+  const node = findTm(data, rootPath);
+  if (!node) return null;
+  const scan = samePath(node.path, data.path);
+  const input = toInput(node, chain, { maxDepth: opt.maxDepth, boostDepth: opt.boostDepth ?? 2, extra: scan ? [...extra] : [] });
+  /** 没有单独画出来的子项结构上的位置（下一次它们出现时从这里长出来） */
+  const hidden = new Map<string, HiddenSlot>();
+  if (scan) return { root: node.path, items: layoutTreemap(input, frame, opt, frame, frame, undefined, hidden), hidden };
+  const nodes = pathInputs(data, node.path, [...extra]);
+  const canon = nodes ? canonPath(nodes, frame, opt) : frame;
+  const head = rootHead(data, chain, node.path) ?? { key: tmKey(node), name: node.name, size: node.allocated };
+  // 根的 key 用它在上一级图里那一块的 key（外壳合并块 = 外层）：它的子块、「其他」的 key（父 key|其他）缩放前后都一样
+  input.key = head.key;
+  return { root: node.path, items: layoutTreemap(input, frame, opt, canon, frame, head, hidden), hidden };
 }
 
 // ───── 单击翻译（TreemapView 把 DOM 事件翻译成 MapHit，store.mapClick 执行） ─────
@@ -263,10 +314,15 @@ export function tileHit(it: { key: string; kind: TmItemKind; ref?: unknown; merg
   return { kind: "leaf", key: it.key, parent, row: n.path + n.kind };
 }
 
-/** 单击容器的标题栏：path = 内层（往里挖），outer = 块的 key（外层路径，收起按它算） */
-export function headHit(it: Pick<TmItem, "key" | "ref">): MapHit | null {
+/**
+ * 单击容器的标题栏：path = 内层（往里挖），outer = 块的 key（外层路径，收起按它算）。
+ * 自动缩放后图顶上的根标题条（depth 0）：收起到这个根这一级（和点面包屑上它那一级一样：链停在它这里）。
+ */
+export function headHit(it: Pick<TmItem, "key" | "ref"> & { depth?: number }): MapHit | null {
   const n = tileNode(it);
-  return n ? { kind: "head", path: n.path, outer: it.key } : null;
+  if (!n) return null;
+  if (it.depth === 0) return { kind: "dir", path: n.path };
+  return { kind: "head", path: n.path, outer: it.key };
 }
 
 /**
@@ -340,6 +396,190 @@ export function fitHead(
   // 窄到名字只露得出一两个字（「W…」猜不出是什么）：只写大小（全名在标题栏的提示里）
   if (n < 3 && sizeW - m.gap <= avail) return { name: "", cut: false, size: true };
   return { name: head(n), cut: true, size: false };
+}
+
+// ───── 叶子块上的字（F3）：按实际量出来的字宽 / 行高决定写法，永不硬裁 ─────
+
+/** 块上的写法：名字 + 大小两行 / 竖排 / 一行 / 只写短大小 / 不写 */
+export type LabelMode = "full" | "vert" | "line" | "size" | "none";
+
+/** 量字：块上实际用的字体（TreemapView 用 canvas 按探针元素的计算样式量；测试用假字体） */
+export interface LabelMetrics {
+  /** 名字（两行写法的第一行；big = 大块的大字号） */
+  name(s: string, big: boolean): number;
+  /** 两行写法第二行的大小 / 只写大小时的短大小（数字等宽：调用方把数字当成「0」量） */
+  size(s: string, big: boolean): number;
+  /** 一行写法的名字 / 大小 */
+  lname(s: string): number;
+  lsize(s: string): number;
+  /** 竖排的名字 / 大小（竖着的长度） */
+  vname(s: string): number;
+  vsize(s: string): number;
+  /** 小块只写大小时用的小一号的字 */
+  tiny(s: string): number;
+  /** 再小一号（10px）：30 px 上下的小块只写大小 */
+  micro(s: string): number;
+  /** 省略号「…」（名字的字体） */
+  ell(big: boolean): number;
+  ellLine: number;
+  ellV: number;
+  /** 行高（px）：名字 / 大小（两行写法）、一行写法、竖排（横向占的宽度；uv = 10px 竖排）、只写大小（行高 = 字号；t 小一号、u 再小一号） */
+  lh: { a: number; aBig: number; b: number; bBig: number; ln: number; v: number; s: number; t: number; u: number; uv: number };
+}
+
+export interface LabelIn {
+  /** 块面（tileBox）的宽高、描边 */
+  w: number;
+  h: number;
+  bw: number;
+  name: string;
+  /** 「其他 410 项」这类：整段放不下就只写「410 项」，再放不下就不写名字 */
+  count?: { pre: string; num: string; post: string } | null;
+  /** 两行 / 一行写法里的大小（「27.5 MB」）和只写大小时的短大小（「27M」「1.2」） */
+  full: string;
+  short: string;
+  /** C 主题扫不到的伪块：字放在白底小标签里（多出左右 5 + 上下 1 的内边距、两行之间 4） */
+  pill?: boolean;
+  /** 块大（> 150 × 70）：名字 / 大小用大一号的字 */
+  big?: boolean;
+}
+
+export interface LabelFit {
+  mode: LabelMode;
+  big: boolean;
+  /** 只写大小、用小一号的字（30 多 px 的小块） */
+  tiny?: boolean;
+  /** 只写大小、再小一号（10px：30 px 上下的小块贴边 2px 横着写；20 px 宽的细高条竖着写） */
+  micro?: boolean;
+  /** 实际写的名字（截断时不含省略号，cut = 要在后面画「…」）；只写大小 / 不写时为 "" */
+  name: string;
+  cut: boolean;
+  /** 字那一层四周的留白（px）：上下 iy、左右 ix */
+  ix: number;
+  iy: number;
+}
+
+const NONE: LabelFit = { mode: "none", big: false, name: "", cut: false, ix: 0, iy: 0 };
+/** 量字和浏览器排版之间的误差留量（亚像素、字距） */
+const SLACK = 1.5;
+
+/** 名字截到 room 里：放得下就整个；放不下就截断加「…」，至少要露出 minChars 个字（名字本身更短就要整个），不然返回 null */
+function fitName(name: string, room: number, w: (s: string) => number, ell: number, minChars: number): { name: string; cut: boolean } | null {
+  if (room <= 0) return null;
+  if (w(name) <= room) return { name, cut: false };
+  const chars = Array.from(name);
+  let lo = 0;
+  let hi = chars.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (w(chars.slice(0, mid).join("")) + ell <= room) lo = mid;
+    else hi = mid - 1;
+  }
+  if (lo < Math.min(minChars, chars.length)) return null;
+  const head = chars.slice(0, lo).join("").replace(/[\s\\]+$/, "");
+  return head ? { name: head, cut: true } : null;
+}
+
+/** 一行标题截到 room 宽：放得下就整个，放不下截断（调用方在后面用界面字体画「…」）。至少留一个字 */
+export function fitTitle(name: string, room: number, w: (s: string) => number, ell: number): { name: string; cut: boolean } {
+  return fitName(name, room, w, ell, 1) ?? { name: Array.from(name)[0] ?? "", cut: name.length > 1 };
+}
+
+/** 「其他 410 项」：整段 → 「410 项」→ 放不下（数字不截） */
+function fitCount(c: { pre: string; num: string; post: string }, room: number, w: (s: string) => number): string | null {
+  const all = `${c.pre} ${c.num} ${c.post}`;
+  if (w(all) <= room) return all;
+  const short = `${c.num} ${c.post}`;
+  return w(short) <= room ? short : null;
+}
+
+/**
+ * 叶子块上写什么（F3）：依次试 两行（名字 + 大小）→ 竖排（细高条）→ 一行 → 只写短大小 → 不写。
+ * 每种写法都按量出来的字宽 / 行高、扣掉描边和留白算：放得下才写，绝不出现被裁掉半行、「27N」这种字。
+ */
+export function fitLabel(t: LabelIn, m: LabelMetrics, minChars = 3): LabelFit {
+  const { w, h, bw } = t;
+  if (w <= 2 * bw + 8 || h <= 2 * bw + 8) return NONE;
+  const pill = t.pill ? 10 : 0;
+  const pillY = t.pill ? 2 : 0;
+  const nameOf = (room: number, wn: (s: string) => number, ell: number) =>
+    t.count ? ((s) => (s ? { name: s, cut: false } : null))(fitCount(t.count, room, wn)) : fitName(t.name, room, wn, ell, minChars);
+
+  // 两行：名字 / 大小（大块用大一号的字，放不下再试普通字号）
+  for (const big of t.big ? [true, false] : [false]) {
+    const ix = t.pill ? 9 : 8;
+    const iy = t.pill ? 8 : 7;
+    const cw = w - 2 * bw - 2 * ix - SLACK;
+    const ch = h - 2 * bw - 2 * iy;
+    const need = (big ? m.lh.aBig + m.lh.bBig : m.lh.a + m.lh.b) + (t.pill ? 2 * pillY + 4 : 0);
+    if (ch < need || m.size(t.full, big) + pill > cw) continue;
+    const nm = nameOf(cw - pill, (s) => m.name(s, big), m.ell(big));
+    if (nm) return { mode: "full", big, name: nm.name, cut: nm.cut, ix, iy };
+  }
+  // 竖排：细高条（展开旁边的块时常见）
+  if (w >= 24 && h >= 96 && h >= w * 2.5) {
+    const ix = 4;
+    const iy = 8;
+    const cw = w - 2 * bw - 2 * ix;
+    const len = h - 2 * bw - 2 * iy - SLACK;
+    if (cw >= m.lh.v + pill && !t.pill) {
+      const room = len - 6 - m.vsize(t.short);
+      const nm = nameOf(room, (s) => m.vname(s), m.ellV);
+      if (nm) return { mode: "vert", big: false, name: nm.name, cut: nm.cut, ix, iy };
+    }
+  }
+  // 一行：名字 + 大小，垂直居中
+  {
+    const ix = t.pill ? 9 : 8;
+    const cw = w - 2 * bw - 2 * ix - SLACK;
+    const ch = h - 2 * bw;
+    if (ch >= m.lh.ln + 4 + 2 * pillY) {
+      const room = cw - pill - 6 - m.lsize(t.full);
+      const nm = nameOf(room, (s) => m.lname(s), m.ellLine);
+      if (nm) return { mode: "line", big: false, name: nm.name, cut: nm.cut, ix, iy: 0 };
+    }
+  }
+  // 只写短大小（整串放得下才写）：放得下时和别的块一样贴左上（7 / 8），小块收紧到 5 / 居中
+  {
+    const sw = m.size(t.short, false) + pill;
+    const inner = w - 2 * bw - SLACK;
+    const ch = h - 2 * bw - 2 * pillY;
+    const ix = inner - 16 >= sw ? 8 : inner - 10 >= sw ? 5 : -1;
+    if (ix >= 0 && ch >= m.lh.s + 4) {
+      const iy = Math.max(2, Math.min(7, Math.floor((ch - m.lh.s) / 2)));
+      return { mode: "size", big: false, name: "", cut: false, ix, iy };
+    }
+    // 再小一点的块：小一号的字、贴边 3px（仍然整串放得下才写）
+    const tw = m.tiny(t.short) + pill;
+    if (!t.pill && inner - 6 >= tw && ch >= m.lh.t + 4) {
+      const iy = Math.max(2, Math.min(5, Math.floor((ch - m.lh.t) / 2)));
+      return { mode: "size", big: false, tiny: true, name: "", cut: false, ix: 3, iy };
+    }
+    // 30 px 上下的小块：再小一号（10px）、贴边 2px（C 主题墨框里一排没字的小格子看上去像没画完）
+    const uw = m.micro(t.short);
+    if (!t.pill && inner - 4 >= uw && ch >= m.lh.u + 4) {
+      const iy = Math.max(2, Math.min(5, Math.floor((ch - m.lh.u) / 2)));
+      return { mode: "size", big: false, tiny: true, micro: true, name: "", cut: false, ix: 2, iy };
+    }
+  }
+  // 窄高的小块（横着写不下「27M」）：大小竖着写；再窄用 10px 竖着写
+  if (!t.pill && h >= w * 1.3) {
+    const cw = w - 2 * bw;
+    const len = h - 2 * bw - SLACK;
+    const sl = m.vsize(t.short);
+    if (cw >= m.lh.v + 4 && len >= sl + 10) {
+      const iy = Math.min(8, Math.floor((len - sl) / 2));
+      const ix = Math.max(2, Math.min(4, Math.floor((cw - m.lh.v) / 2)));
+      return { mode: "vert", big: false, name: "", cut: false, ix, iy };
+    }
+    const su = m.micro(t.short);
+    if (cw >= m.lh.uv + 3 && len >= su + 8) {
+      const iy = Math.min(8, Math.floor((len - su) / 2));
+      const ix = Math.max(1, Math.min(4, Math.floor((cw - m.lh.uv) / 2)));
+      return { mode: "vert", big: false, micro: true, name: "", cut: false, ix, iy };
+    }
+  }
+  return NONE;
 }
 
 // ───── 键盘：只有一块在 Tab 序列里，方向键按画面位置在块之间走 ─────

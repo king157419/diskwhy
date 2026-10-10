@@ -88,8 +88,10 @@
   --tm-g-r: 4px;
   --tm-g-bw: 1px;
   --tm-head: 26px;
-  /* 块的最短边小于这个就并进「其他」 */
-  --tm-min: 12px;
+  /* 块的最短边小于这个就并进「其他」（--tm-min2：第 2 层及更深）。不小于平块门槛 16px：不画没有圆角的细条。
+     第 2 层起 22px：10px 的「27M」写得下（第 4 轮实测：18 → 22 没字的块从 16 个降到 3 个，少画约 14% 的小块） */
+  --tm-min: 16px;
+  --tm-min2: 22px;
   --stroke: var(--line);
   --shadow: none;
   --shadow-hard: none;
@@ -148,7 +150,8 @@
   --tm-g-r: 6px;
   --tm-g-bw: 1px;
   --tm-head: 26px;
-  --tm-min: 12px;
+  --tm-min: 16px;
+  --tm-min2: 22px;
   --stroke: var(--line);
   --shadow: none;
   --shadow-hard: none;
@@ -210,6 +213,9 @@
   --tm-head: 26px;
   /* 2px 描边 + 4px 间隙：再小的块只剩一圈边框（一片没字的小格子），并进「其他」 */
   --tm-min: 20px;
+  /* 第 2 层起：墨框 + 留白以后，小于这个的块连 10px 的「27M」都写不下，成片的空格子不如并进「其他」
+     （第 4 轮实测：28 → 32 在 9 个常用视图里少画约 12% 的小块，没字的块从 7 个降到细高条那几个，细高条改竖写） */
+  --tm-min2: 32px;
   --stroke: #141412;
   --shadow: 4px 4px 0 #141412;
   --shadow-hard: 6px 6px 0 #141412;

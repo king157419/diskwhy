@@ -26,7 +26,7 @@ import { askAi, type Category, type Explanation, type NodeView } from "../api";
 import { sizeParts, gbNum } from "../capacity";
 import { advice, CATEGORY_LABEL, clipWidth, isHardTag, loseTag } from "../labels";
 import { samePath } from "../treemap";
-import { pathKey } from "../tmtree";
+import { fitTitle, pathKey } from "../tmtree";
 import {
   chain,
   collapseAll,
@@ -43,6 +43,7 @@ import {
   mapClick,
   openRow,
   pkInfo,
+  prefetchFor,
   report,
   selKey,
   selSig,
@@ -67,6 +68,10 @@ function crumbGo(i: number) {
 }
 function onHit(h: MapHit, ev: TapInfo) {
   void mapClick(h, ev);
+}
+/** 鼠标在一个还没取过的文件夹块上停了一会儿：后台预取它的子树（不改任何状态） */
+function onPeek(path: string) {
+  prefetchFor(path);
 }
 // 路径很长时面包屑横向滚动，总是露出最后一段；左边被盖住的部分渐隐（不会把「C:」切成「:」）
 const crumbEl = ref<HTMLElement | null>(null);
@@ -157,6 +162,43 @@ const listFresh = computed(() => !pkInfo.value || (!!focus.value && samePath(foc
 const focusTotal = computed(() => pkInfo.value?.size ?? focus.value?.node.allocated ?? 0);
 const focusName = computed(() => (listFresh.value ? focus.value?.node.name.replace(/\\$/, "") : pkInfo.value?.name) ?? "");
 
+// ── 列表标题放不下：按量出来的字宽截断，省略号用界面字体的「…」（标题字体里的「···」是居中的，和方块图标题栏不一致） ──
+const h2El = ref<HTMLElement | null>(null);
+const ltEl = ref<HTMLElement | null>(null);
+const ltW = ref(0);
+const fontTick = ref(0);
+let ltRo: ResizeObserver | null = null;
+let titleCtx: CanvasRenderingContext2D | null = null;
+const titleFit = computed(() => {
+  void fontTick.value;
+  const name = focusName.value;
+  const el = h2El.value;
+  if (!el || !ltW.value) return { name, cut: false };
+  const cs = getComputedStyle(el);
+  titleCtx ??= document.createElement("canvas").getContext("2d");
+  if (!titleCtx) return { name, cut: false };
+  const ctx = titleCtx;
+  const font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  const ui = getComputedStyle(document.documentElement).getPropertyValue("--ui").trim() || "sans-serif";
+  const ellFont = `${cs.fontWeight} ${cs.fontSize} ${ui}`;
+  const w = (t: string) => {
+    ctx.font = font;
+    return ctx.measureText(t).width;
+  };
+  ctx.font = ellFont;
+  const ell = ctx.measureText("…").width;
+  // 标题最多占这一行的 60%（和 CSS 的 max-width 一致），留 2px 误差
+  return fitTitle(name, ltW.value * 0.6 - 2, w, ell);
+});
+watch(ltEl, (el) => {
+  ltRo?.disconnect();
+  ltRo = null;
+  if (!el || typeof ResizeObserver !== "function") return;
+  ltRo = new ResizeObserver(() => (ltW.value = el.clientWidth));
+  ltRo.observe(el);
+  ltW.value = el.clientWidth;
+});
+
 /** 认不出来的东西的第一条线索（列表数据里才有）：方块图的悬停卡片直接写它 */
 const firstClue = (n: NodeView | undefined) => (n?.explanation?.source.kind === "unknown" ? n.explanation.clues[0] : undefined);
 const clueMap = computed(() => {
@@ -244,10 +286,12 @@ onMounted(() => {
     crumbRo = new ResizeObserver(crumbEnd);
     crumbRo.observe(crumbEl.value);
   }
+  document.fonts?.ready.then(() => fontTick.value++);
 });
 onBeforeUnmount(() => {
   clearTimeout(rowTimer);
   crumbRo?.disconnect();
+  ltRo?.disconnect();
   window.removeEventListener("keydown", onKey);
   document.removeEventListener("mousedown", onDocDown);
 });
@@ -297,13 +341,14 @@ onBeforeUnmount(() => {
           :clues="clueMap"
           @hit="onHit"
           @unsel="clearSel"
+          @peek="onPeek"
         />
       </div>
 
       <section v-if="exploreView !== 'map'" class="list">
         <div class="lh" :class="{ hasclue: !!pkClue }">
-          <div class="lt">
-            <h2>{{ focusName }}</h2>
+          <div ref="ltEl" class="lt">
+            <h2 ref="h2El" :title="titleFit.cut ? focusName : undefined">{{ titleFit.name }}<span v-if="titleFit.cut" class="el">…</span></h2>
             <span class="m"><template v-if="listFresh"><b class="num">{{ rows.length }}</b> 项 · </template><b class="num">{{ gbNum(focusTotal) }}</b> GB</span>
             <span class="sort">按大小</span>
           </div>
@@ -637,8 +682,11 @@ onBeforeUnmount(() => {
   font-weight: var(--heading-w);
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  text-overflow: clip;
   max-width: 60%;
+}
+.lh h2 .el {
+  font-family: var(--ui);
 }
 .lh .m {
   font-size: var(--fs-sub);
@@ -804,7 +852,8 @@ onBeforeUnmount(() => {
   font-size: var(--fs-meta);
 }
 
-/* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：方块图至少约 58% 高在上，列表在下；列表行少时列表变矮，空出来的给方块图 ───────── */
+/* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：方块图在上、列表在下。方块图的高度固定（约可用高度的 58%，有下限），
+   不随列表行数变（K 第 3 轮 F1：图一变高变矮，整棵树就按新的宽高比重排，和展开的过渡叠在一起就是块乱飞） ───────── */
 @media (max-width: 1099px), (max-aspect-ratio: 1/1) {
   .explore {
     padding: 52px var(--gutter) 16px;
@@ -814,19 +863,17 @@ onBeforeUnmount(() => {
     gap: 14px;
   }
   .v-split .mapbox {
-    flex: 1 1 0;
-    min-height: 58%;
+    flex: 0 0 auto;
+    height: 58%;
+    min-height: 280px;
   }
   .list {
     width: auto;
     flex: 1;
   }
   .v-split .list {
-    flex: 0 1 auto;
-    max-height: calc(42% - 14px);
-  }
-  .v-split .rows {
-    flex: 0 1 auto;
+    flex: 1 1 0;
+    min-height: 0;
   }
   .lh {
     height: 48px;

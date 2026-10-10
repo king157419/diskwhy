@@ -143,6 +143,8 @@ export interface TmInput {
   key: string;
   name: string;
   value: number;
+  /** 块上写的大小（默认 = value）。外壳合并块：链走进内层时写内层的大小，面积仍按外层 */
+  size?: number;
   children?: TmInput[];
   /** 没有展开发过来的子项合计（画进“其他”） */
   hidden?: number;
@@ -168,12 +170,17 @@ export interface TmItem {
   kind: TmItemKind;
   name: string;
   value: number;
+  /** 块上写的大小（外壳合并块见 TmInput.size） */
+  size: number;
   rect: Rect;
+  /** 1 = 图的根下面那一层；0 = 自动缩放后图顶上的根标题条（整张图就是它的内容区） */
   depth: number;
   /** 有子块画在里面（画成带标题的容器） */
   container: boolean;
   /** “其他”块合并了几个子项 */
   mergedCount: number;
+  /** “其他”块里合并了哪些子项（只有画得出来的那些有 key 的；过渡时它们从这块里分出来 / 缩进这块里） */
+  merged?: string[];
   /** 在展开链上（输入带 boost） */
   chain: boolean;
   ref?: unknown;
@@ -183,6 +190,8 @@ export interface TmItem {
 export interface LayoutOptions {
   /** 最短边小于这个像素就合并进“其他” */
   minPx: number;
+  /** 第 2 层及更深的块用的最小边（默认 = minPx；C 主题墨框粗，小块写不下字，提高一点） */
+  minPxDeep?: number;
   /** 最多嵌套几层（1 = 只画根的子项）；展开链上的块下面另算（boostDepth） */
   maxDepth: number;
   /** 展开链上的块（带 boost）下面最多再画几层（默认 2 = 子项和孙项） */
@@ -202,6 +211,11 @@ export const DEFAULT_LAYOUT: LayoutOptions = { minPx: 6, maxDepth: 3, headerPx: 
 /** 展开链上的文件夹至少占父块内容区的这么多 */
 export const BOOST = 0.6;
 
+/** 深度为 depth 的块（1 = 图的根下面那一层）至少要这么大，小了就并进「其他」 */
+export function minPxAt(opt: LayoutOptions, depth: number): number {
+  return depth >= 2 && opt.minPxDeep ? Math.max(opt.minPx, opt.minPxDeep) : opt.minPx;
+}
+
 /** 容器的内容区（子块铺在这里）：扣掉标题栏和内边距 */
 export function contentBox(r: Rect, opt: LayoutOptions): Rect {
   const pe = opt.padEnd ?? opt.pad;
@@ -218,12 +232,43 @@ export function contentBox(r: Rect, opt: LayoutOptions): Rect {
  * - 链上的块在它的容器里用有效权重 eff（≥ BOOST 的面积），兄弟块按原来的比例挤在剩下的地方；
  * - 「其他」= 从第一个出现细条（最短边 < minPx，按**不放大**的布局判断）的那一行起的所有行，正好是一个矩形：
  *   容器变大就多露几行，变小就少露几行，大块的位置不受影响；
- * - 不在链上的容器被挤得变形（按基础形状铺还够大的子块现在成了细条）：子块整体不画，只剩带名字的块。
+ * - 伸缩以后（放大的块把兄弟挤小、容器被挤变形）只改画法、不改结构（squeeze）：厚度 < minPx 的行 / 列
+ *   （小的在后面，是连续的尾部）合成一块「其他」铺满这几行合起来的矩形；一行里沿行方向 < minPx 的尾部几块
+ *   在这一行的末端合成一小块「其他」。画出来的块（包括「其他」）最短边都 ≥ minPx，不再有细条。
  * canon = root 的参照矩形（默认 = rect，即根就是扫描根）；frame = 扫描根的整张图（放大形状的面积归一化用，默认 = rect）。
+ * head：自动缩放后图的根不是扫描根——根自己画成一块铺满整张图的容器（深度 0，顶上一条标题栏），子块铺在它的内容区里；
+ * 它的 key / 名字和它在上一级图里那一块一样（外壳合并块用外层的 key），镜头推近 / 拉远时就是同一块在长大 / 缩小。
  */
-export function layoutTreemap(root: TmInput, rect: Rect, opt: LayoutOptions = DEFAULT_LAYOUT, canon?: Rect, frame?: Rect): TmItem[] {
+export function layoutTreemap(
+  root: TmInput,
+  rect: Rect,
+  opt: LayoutOptions = DEFAULT_LAYOUT,
+  canon?: Rect,
+  frame?: Rect,
+  head?: { key: string; name: string; size: number },
+  hid?: Map<string, HiddenSlot>,
+): TmItem[] {
   const out: TmItem[] = [];
-  place(root, rect, canon ?? rect, 1, null, opt, out, opt.maxDepth, frame ?? rect, true);
+  if (head) {
+    out.push({
+      key: head.key,
+      kind: "node",
+      name: head.name,
+      value: root.value,
+      size: head.size,
+      rect,
+      depth: 0,
+      container: true,
+      mergedCount: 0,
+      chain: true,
+      ref: root.ref,
+      parentKey: null,
+    });
+    const box = contentBox(rect, opt);
+    if (box.w > 0 && box.h > 0) place(root, box, canon ?? box, 1, head.key, opt, out, opt.maxDepth, frame ?? rect, true, hid);
+    return out;
+  }
+  place(root, rect, canon ?? rect, 1, null, opt, out, opt.maxDepth, frame ?? rect, true, hid);
   return out;
 }
 
@@ -396,6 +441,227 @@ export function squarifyBoosted<T>(items: Weighted<T>[], rect: Rect, isBoosted: 
 }
 
 /**
+ * 伸缩以后怎么画（结构不变，只改画法）。
+ * w0 = 实际权重（已经放大、已经扣掉不画的尾巴）；cut0 = 按不放大的布局并成「其他」的那一行。
+ * - 厚度（这一行 / 列的最短边）< minPx 的行：在放大的那一项（bi）后面 → 从它起的所有行并成尾部的「其他」；
+ *   在 bi 前面（放大的块把前面的兄弟挤细了，不是连续的尾部）→ 这一行整个不画，权重挪进尾部的「其他」
+ *   （没有尾部就挪给 bi）。面积和值成正比的性质不变：「其他」的面积 = 它合并的那些项的大小。
+ * - 尾部的「其他」自己太薄：接到最后画出来的那一行的末尾，合成行末的「其他」（前面各行的位置一点不动）；合起来还是太短才交给前一格。
+ * - 画出来的每一行里：沿行方向 < minPx 的尾部几块合成这一行末端的一小块「其他」（合起来也太短就交给前一块）；
+ *   bi 所在那一行里排在 bi 前面、被挤短的块交给 bi（同一行里挪，行的厚度不变）。
+ * 任何权重都只在固定的行 / 列结构里分配：两块之间的先后（左右 / 上下）只由结构决定，过渡里不会横穿。
+ */
+interface Squeeze {
+  w: number[];
+  /** 实际用的分行：尾部太薄、接到了最后一行末尾时，那一行延长到最后一格（其余和输入一样） */
+  rows: Strip[];
+  cut: number;
+  /** 每一行从哪一格起并成行末的「其他」（= row.to 表示没有） */
+  ends: number[];
+  /** 整行不画的行（权重挪走了） */
+  drop: Set<number>;
+  /** 被挪走的行去了哪里：尾部「其他」（或接到最后一行末尾的「其他」）/ 放大的那一项 / 尾部太小交给前一格 */
+  movedTo: "tail" | "boost" | "none";
+  /** 尾部太薄、接到了这一行的末尾（-1 = 没有） */
+  appended: number;
+  /** 接上来的尾部原来的那条细框（结构上它被挤成了这个框远端的一条线）和它是从哪一格开始的 */
+  thin: { rect: Rect; from: number; column: boolean } | null;
+  rects: (Rect | null)[];
+  tail: Rect | null;
+}
+
+/** 一行 / 列（strip）在布局里占的矩形：它里面各格的外框 */
+function spanOf(rects: (Rect | null)[], r: Strip): Rect | null {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (let k = r.from; k < r.to; k++) {
+    const q = rects[k];
+    if (!q) continue;
+    x0 = Math.min(x0, q.x);
+    y0 = Math.min(y0, q.y);
+    x1 = Math.max(x1, q.x + q.w);
+    y1 = Math.max(y1, q.y + q.h);
+  }
+  return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+}
+
+function squeeze(rows: Strip[], w0: number[], rect: Rect, cut0: number, bi: number, minPx: number): Squeeze {
+  const bRow = bi >= 0 ? rows.findIndex((r) => bi >= r.from && bi < r.to) : -1;
+  let cut = cut0;
+  const drop = new Set<number>();
+  const mv: { to: Squeeze["movedTo"] } = { to: "none" };
+  const weights = () => {
+    const w = w0.slice();
+    let moved = 0;
+    for (const r of drop)
+      for (let k = rows[r].from; k < rows[r].to; k++) {
+        moved += w[k];
+        w[k] = 0;
+      }
+    mv.to = "none";
+    if (moved > 0) {
+      if (cut < rows.length) {
+        w[rows[cut].from] += moved;
+        mv.to = "tail";
+      } else if (bi >= 0) {
+        w[bi] += moved;
+        mv.to = "boost";
+      }
+    }
+    return w;
+  };
+  let w = weights();
+  for (let iter = 0; iter < 2 * rows.length + 2; iter++) {
+    const rects = fillRows(w, rows, rect, cut).rects;
+    let changed = false;
+    for (let r = 0; r < cut; r++) {
+      if (r === bRow || drop.has(r)) continue;
+      const s = spanOf(rects, rows[r]);
+      if (s && Math.min(s.w, s.h) >= minPx) continue;
+      if (r < bRow) drop.add(r);
+      else cut = r;
+      changed = true;
+      break;
+    }
+    if (!changed) break;
+    w = weights();
+  }
+  // 尾部的「其他」自己太薄（画不出来）：接到前面那一行（最后画出来的一行）的末尾，合成行末的「其他」——那一行吃掉剩下的全部空间，
+  // 前面各行一点不动；被挤小的项（回收站之类）还在图上，不会悄悄算进前一块、把它撑大（F2）。合起来还是太短才交给前一格
+  let { tail } = fillRows(w, rows, rect, cut);
+  let rowsOut = rows;
+  let appended = -1;
+  let tailFrom = -1;
+  let thin: Squeeze["thin"] = null;
+  if (cut < rows.length && tail && tooSmall(tail, minPx)) {
+    let r0 = cut - 1;
+    while (r0 >= 0 && drop.has(r0)) r0--;
+    if (r0 >= 0 && r0 === cut - 1) {
+      tailFrom = rows[cut].from;
+      thin = { rect: tail, from: tailFrom, column: rows[r0].column };
+      rowsOut = rows.slice(0, cut);
+      rowsOut[r0] = { ...rows[r0], to: w.length };
+      appended = r0;
+      cut = rowsOut.length;
+    } else if (r0 >= 0) {
+      const to = rows[r0].to - 1;
+      for (let k = rows[cut].from; k < w.length; k++) {
+        w[to] += w[k];
+        w[k] = 0;
+      }
+      if (mv.to === "tail") mv.to = "none";
+      cut = rows.length;
+    }
+  }
+  let rects = fillRows(w, rowsOut, rect, cut).rects;
+  // 每一行的行末：沿行方向太短的尾部几块
+  const ends = rowsOut.map((r) => r.to);
+  for (let r = 0; r < Math.min(cut, rowsOut.length); r++) {
+    if (drop.has(r)) continue;
+    const row = rowsOut[r];
+    const len = (k: number) => {
+      const q = rects[k];
+      return q && w[k] > 0 ? (row.column ? q.h : q.w) : 0;
+    };
+    const L = Array.from({ length: row.to - row.from }, (_, i) => len(row.from + i));
+    const short = (k: number) => k !== bi && L[k - row.from] < minPx;
+    let k0 = row.to;
+    while (k0 - 1 >= row.from && short(k0 - 1)) k0--;
+    // 接上来的尾部整个并成一块（被挤掉的行挪过来的权重也在里面）
+    if (r === appended) k0 = Math.min(k0, tailFrom);
+    if (k0 < row.to) {
+      let tot = 0;
+      let any = false;
+      for (let k = k0; k < row.to; k++) {
+        tot += L[k - row.from];
+        if (w[k] > 0) any = true;
+      }
+      if (any && (tot >= minPx || k0 === row.from)) ends[r] = k0;
+      else if (any) {
+        for (let k = k0; k < row.to; k++) {
+          w[k0 - 1] += w[k];
+          w[k] = 0;
+        }
+        if (r === appended && mv.to === "tail") mv.to = "none";
+      }
+    }
+    // 不在行尾、却被挤短的块（bi 前面的兄弟；或者后一格吃了尾巴变长了）：交给同一行里离它最近的够长的块
+    // （同一行里挪，行的厚度不变，别的块的长短也不变）
+    for (let k = row.from; k < k0; k++) {
+      if (w[k] <= 0 || !short(k)) continue;
+      let j = -1;
+      for (let d = 1; d < row.to - row.from && j < 0; d++) {
+        if (k - d >= row.from && !short(k - d) && w[k - d] > 0) j = k - d;
+        else if (k + d < k0 && !short(k + d) && w[k + d] > 0) j = k + d;
+      }
+      if (j < 0) continue;
+      w[j] += w[k];
+      w[k] = 0;
+    }
+  }
+  ({ rects, tail } = fillRows(w, rowsOut, rect, cut));
+  return { w, rows: rowsOut, cut, ends, drop, movedTo: mv.to, appended, thin, rects, tail };
+}
+
+/**
+ * 每一格在这次布局里「结构上」的位置（过渡用：上一次没有单独画出来的块，这一次出现时从这里长出来，沿原来的行 / 列撑开，不横穿）：
+ * - 画出来的行：按实际权重沿行铺（权重 0 的格子 = 它原来位置上一条长度为 0 的线）；整行权重为 0（被挤掉的行）= 厚度为 0 的一条，
+ *   沿行按真实值分开；
+ * - 并成尾部「其他」的行：在尾部「其他」的框里按真实值铺（它们就在那块「其他」里面）。
+ */
+function structRects(sq: Squeeze, values: number[], rect: Rect): (Rect | null)[] {
+  const { rows, w, cut, tail } = sq;
+  const out = fillRows(w, rows, rect, cut).rects;
+  for (let r = 0; r < Math.min(cut, rows.length); r++) {
+    const row = rows[r];
+    let s = 0;
+    let vs = 0;
+    for (let k = row.from; k < row.to; k++) {
+      s += w[k];
+      vs += values[k];
+    }
+    if (s > 0) continue;
+    const a = out[row.from];
+    const b = out[row.to - 1];
+    if (!a || !b) continue;
+    const len = row.column ? b.y + b.h - a.y : b.x + b.w - a.x;
+    let pos = 0;
+    for (let k = row.from; k < row.to; k++) {
+      const l = vs > 0 ? (len * values[k]) / vs : len / (row.to - row.from);
+      out[k] = row.column ? { x: a.x, y: a.y + pos, w: 0, h: l } : { x: a.x + pos, y: a.y, w: l, h: 0 };
+      pos += l;
+    }
+  }
+  if (cut < rows.length && tail) {
+    const from = rows[cut].from;
+    const sub = rows.slice(cut).map((r) => ({ from: r.from - from, to: r.to - from, column: r.column }));
+    fillRows(values.slice(from), sub, tail).rects.forEach((q, i) => (out[from + i] = q));
+  }
+  if (sq.thin) {
+    // 太薄、接到最后一行末尾的尾部：结构上它们被挤成了原来那条细框远端的一条线（最后一行把那条细框也占了），沿着线按真实值分开
+    const { rect: t, from, column } = sq.thin;
+    let vs = 0;
+    for (let k = from; k < values.length; k++) vs += values[k];
+    const len = column ? t.h : t.w;
+    let pos = 0;
+    for (let k = from; k < values.length; k++) {
+      const l = vs > 0 ? (len * values[k]) / vs : 0;
+      out[k] = column ? { x: t.x + t.w, y: t.y + pos, w: 0, h: l } : { x: t.x + pos, y: t.y + t.h, w: l, h: 0 };
+      pos += l;
+    }
+  }
+  return out;
+}
+
+/** 这次布局里没有单独画出来的子项（并进了「其他」、被挤掉、权重交给了邻居）：结构上的位置（布局坐标）和父块 */
+export interface HiddenSlot {
+  rect: Rect;
+  parentKey: string | null;
+}
+
+/**
  * 铺 p 的子项到 rect（canon = p 的参照矩形）。budget = 这一层往下还能画几层（≥ 1 才铺子项）；
  * 子项是展开链上的块时重新给 boostDepth 层。返回 false = 一个子块都不画（调用方把 p 画成叶子）。
  */
@@ -410,23 +676,15 @@ function place(
   budget: number,
   frame: Rect,
   top: boolean,
-  inFocus = false,
+  hid?: Map<string, HiddenSlot>,
 ): boolean {
   const st = structOf(p, canon.w > 0 && canon.h > 0 ? canon : rect);
   let { slots, values, rows } = st;
   if (!slots.length || rect.w <= 0 || rect.h <= 0) return false;
+  const minPx = minPxAt(opt, depth);
+  const boosted = (p.boost ?? 0) > 0;
   const plain = fillRows(values, rows, rect).rects;
-  let cut = firstThin(slots, rows, plain, opt.minPx);
-  // 被挤得变形的容器（链上块的兄弟这类「旁边」的容器）：按基础形状、同样面积铺时还够大的子块，现在成了细条 →
-  // 子块整体不画（淡出），只剩带名字的块。正在看的那个文件夹（pk；链为空时是图的根）里的子文件夹不算：
-  // 形状变了也照样画（细节正是要看的东西），放不下的行并进「其他」
-  if (!top && !((p.boost ?? 0) > 0) && !inFocus) {
-    const k = Math.sqrt((rect.w * rect.h) / (st.canon.w * st.canon.h));
-    if (Number.isFinite(k) && k > 0) {
-      const shaped = { x: 0, y: 0, w: st.canon.w * k, h: st.canon.h * k };
-      if (cut < firstThin(slots, rows, fillRows(values, rows, shaped).rects, opt.minPx)) return false;
-    }
-  }
+  let cut = firstThin(slots, rows, plain, minPx);
   /** 新顺序里的第 k 格原来是第几格（算子块的参照矩形用） */
   let orig: number[] | null = null;
   let bi = slots.findIndex((s) => (s.node?.boost ?? 0) > 0);
@@ -445,71 +703,137 @@ function place(
     bi = keepN;
     cut += 1;
   } else if (bi >= 0) {
-    // 展开链上的那一项永远画出来；并不并只按不放大的布局判断，被它挤成细条的兄弟不算
+    // 展开链上的那一项永远画出来
     cut = Math.max(cut, rowOf(bi) + 1);
   }
-  // 图的根 / 链上的块：至少画第一行
-  if (cut === 0 && (top || (p.boost ?? 0) > 0)) cut = Math.min(1, rows.length);
+  // 图的根 / 链上的块：至少试着画第一行（放不下的块在行末并成「其他」）
+  if (cut === 0 && (top || boosted)) cut = Math.min(1, rows.length);
   if (cut === 0) return false;
-  const w = trimTail(slots, rows, values, rect, orig ? fillRows(values, rows, rect).rects : plain, cut, opt.minPx);
+  const w0 = trimTail(slots, rows, values, rect, orig ? fillRows(values, rows, rect).rects : plain, cut, minPx);
   // 「其他」那一块自己也太小（权重已交给前一格）：不画它，前面那一格吃掉这点空间
-  if (cut < rows.length && w[rows[cut].from] === 0) cut = rows.length;
-  if (bi >= 0) w[bi] = boostWeight(w[bi], sumExcept(w, bi), slots[bi].node!.boost!);
-  const { rects, tail } = fillRows(w, rows, rect, cut);
-  /** p 就是正在看的文件夹（链的最后一级；链为空时是图的根）：它的子文件夹不按「被挤变形」藏起来 */
-  const focusHere = bi < 0 && (top || (p.boost ?? 0) > 0);
-
-  for (let k = 0; k < slots.length; k++) {
-    const r = rects[k];
-    // 在「其他」里 / 不画的尾巴 / 被放大的块挤到不足 2px 的兄弟：画不出来，也不占命中
-    if (!r || tooSmall(r, 2)) continue;
-    const s = slots[k];
-    if (!s.node) {
-      out.push(otherItem(p, s.value, s.merged, r, depth, parentKey));
-      continue;
-    }
-    const n = s.node;
-    const onChain = (n.boost ?? 0) > 0;
-    const inner = onChain ? Math.max(opt.boostDepth ?? 2, budget - 1) : budget - 1;
-    const canNest = inner >= 1 && !!n.children?.length && r.w >= opt.minContainerPx && r.h >= opt.minContainerPx;
-    const item: TmItem = {
-      key: n.key,
-      kind: "node",
-      name: n.name,
-      value: n.value,
-      rect: r,
-      depth,
-      container: canNest,
-      mergedCount: 0,
-      chain: onChain,
-      ref: n.ref,
-      parentKey,
+  if (cut < rows.length && w0[rows[cut].from] === 0) cut = rows.length;
+  if (bi >= 0) w0[bi] = boostWeight(w0[bi], sumExcept(w0, bi), slots[bi].node!.boost!);
+  const sq = squeeze(rows, w0, rect, cut, bi, minPx);
+  cut = sq.cut;
+  // 一行都画不出来：不在链上的容器画成叶子（链上的 / 图的根：整个内容区是一块「其他」）
+  if (cut === 0 && !(top || boosted)) return false;
+  const { rects, tail, ends } = sq;
+  rows = sq.rows;
+  const last = slots.length - 1;
+  if (hid) {
+    // 没有单独画出来的子项：记下它们结构上的位置（下一次它们出现时从这里长出来）
+    const sr = structRects(sq, values, rect);
+    const drawn = (k: number) => {
+      const r = rows.findIndex((x) => k >= x.from && k < x.to);
+      const q = rects[k];
+      return r >= 0 && r < cut && k < ends[r] && !!q && sq.w[k] > 0 && !tooSmall(q, 2);
     };
-    out.push(item);
-    if (canNest) {
-      const box = contentBox(r, opt);
-      const cc = canonOf(st, orig ? orig[k] : k, n, opt, frame) ?? box;
-      if (!(box.w > opt.minPx && box.h > opt.minPx) || !place(n, box, cc, depth + 1, n.key, opt, out, inner, frame, false, focusHere)) item.container = false;
+    for (let k = 0; k < slots.length; k++) {
+      const n = slots[k].node;
+      const q = sr[k];
+      if (n && q && !drawn(k)) hid.set(n.key, { rect: q, parentKey });
     }
   }
-  if (tail && !tooSmall(tail, 2)) {
+  /** 「其他」的 key：含最后一格的那块（尾部 / 最后一行的行末）= 父 key|其他；别的行末 = 父 key|其他|行号。不带项数（项数变了还是同一块） */
+  const okey = (r: number, lastIn: boolean) => (lastIn && cut >= rows.length ? "" : `|${r}`);
+  const count = (k: number) => (slots[k].node ? 1 : slots[k].merged);
+  const keyOf = (k: number) => slots[k].node?.key;
+
+  for (let r = 0; r < Math.min(cut, rows.length); r++) {
+    const row = rows[r];
+    for (let k = row.from; k < ends[r]; k++) {
+      const q = rects[k];
+      // 并掉的 / 不画的尾巴 / 被挪走权重的：画不出来，也不占命中
+      if (!q || sq.w[k] <= 0 || tooSmall(q, 2)) continue;
+      const s = slots[k];
+      if (!s.node) {
+        out.push(otherItem(p, s.value, s.merged, q, depth, parentKey, okey(r, k === last), []));
+        continue;
+      }
+      const n = s.node;
+      const onChain = (n.boost ?? 0) > 0;
+      const inner = onChain ? Math.max(opt.boostDepth ?? 2, budget - 1) : budget - 1;
+      const canNest = inner >= 1 && !!n.children?.length && q.w >= opt.minContainerPx && q.h >= opt.minContainerPx;
+      const item: TmItem = {
+        key: n.key,
+        kind: "node",
+        name: n.name,
+        value: n.value,
+        size: n.size ?? n.value,
+        rect: q,
+        depth,
+        container: canNest,
+        mergedCount: 0,
+        chain: onChain,
+        ref: n.ref,
+        parentKey,
+      };
+      out.push(item);
+      if (canNest) {
+        const box = contentBox(q, opt);
+        const cc = canonOf(st, orig ? orig[k] : k, n, opt, frame) ?? box;
+        if (!(box.w > opt.minPx && box.h > opt.minPx) || !place(n, box, cc, depth + 1, n.key, opt, out, inner, frame, false, hid)) item.container = false;
+      }
+    }
+    if (ends[r] < row.to) {
+      // 行末的「其他」：这几格合起来的矩形
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      let v = 0;
+      let m = 0;
+      const ks: string[] = [];
+      for (let k = ends[r]; k < row.to; k++) {
+        v += slots[k].value;
+        m += count(k);
+        const nk = keyOf(k);
+        if (nk) ks.push(nk);
+        const q = rects[k];
+        if (!q || sq.w[k] <= 0) continue;
+        x0 = Math.min(x0, q.x);
+        y0 = Math.min(y0, q.y);
+        x1 = Math.max(x1, q.x + q.w);
+        y1 = Math.max(y1, q.y + q.h);
+      }
+      // 接到这一行末尾的尾部：被挤掉的前面几行（权重挪进了尾部）也算进来
+      if (r === sq.appended && sq.movedTo === "tail")
+        for (const d of sq.drop)
+          for (let k = rows[d].from; k < rows[d].to; k++) {
+            v += slots[k].value;
+            m += count(k);
+            const nk = keyOf(k);
+            if (nk) ks.push(nk);
+          }
+      if (x1 > x0 && y1 > y0) out.push(otherItem(p, v, m, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, depth, parentKey, okey(r, row.to - 1 === last), ks));
+    }
+  }
+  if (cut < rows.length && tail && !tooSmall(tail, minPx)) {
     let v = 0;
     let m = 0;
-    for (let k = rows[cut].from; k < slots.length; k++) {
+    const ks: string[] = [];
+    const add = (k: number) => {
       v += slots[k].value;
-      m += slots[k].node ? 1 : slots[k].merged;
-    }
-    out.push(otherItem(p, v, m, tail, depth, parentKey));
+      m += count(k);
+      const nk = keyOf(k);
+      if (nk) ks.push(nk);
+    };
+    for (let k = rows[cut].from; k < slots.length; k++) add(k);
+    // 被挤掉的前面几行：权重挪进了尾部，项数和大小也算进来
+    if (sq.movedTo === "tail") for (const r of sq.drop) for (let k = rows[r].from; k < rows[r].to; k++) add(k);
+    out.push(otherItem(p, v, m, tail, depth, parentKey, "", ks));
   }
   return true;
 }
 
-function otherItem(p: TmInput, value: number, merged: number, rect: Rect, depth: number, parentKey: string | null): TmItem {
+function otherItem(p: TmInput, value: number, merged: number, rect: Rect, depth: number, parentKey: string | null, suffix: string, keys: string[]): TmItem {
   return {
-    key: `${p.key}|其他|${merged}`,
+    merged: keys,
+    key: `${p.key}|其他${suffix}`,
     kind: "other",
     name: `其他 ${merged} 项`,
     value,
+    size: value,
     rect,
     depth,
     container: false,

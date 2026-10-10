@@ -49,7 +49,7 @@ import {
 } from "./api";
 import { cleanCat, type CleanCat } from "./labels";
 import { samePath } from "./treemap";
-import { ancestorsIn, buildDisplay, chainLevelStarts, findTm, isUnder, pathKey, type MapHit, type Stub } from "./tmtree";
+import { ancestorsIn, buildDisplay, chainLevelStarts, collapseFor, findTm, isUnder, pathKey, type MapHit, type Stub } from "./tmtree";
 
 export type Phase = "idle" | "scanning" | "done";
 export type Page = "home" | "cleanup" | "explore" | "quarantine" | "settings";
@@ -726,6 +726,8 @@ async function loading<T>(p: Promise<T>): Promise<T> {
   } finally {
     loads--;
     tmLoading.value = loads > 0;
+    // 用户要的数据都回来了：轮到后台预取
+    if (!loads) pump();
   }
 }
 
@@ -735,6 +737,7 @@ function resetExplore() {
   tmCache.clear();
   tmStubs.clear();
   tmInflight.clear();
+  clearPrefetch();
   tmVer.value++;
   listing.value = null;
   rootTm.value = null;
@@ -750,6 +753,8 @@ function fetchOwn(path: string, gen: number): Promise<void> {
   const k = pathKey(path);
   if (tmCache.has(k)) return Promise.resolve();
   let p = tmInflight.get(k);
+  // 正在后台预取：接着等它（这时算「正在取」，标题栏上有 loading 小点，别的预取先停一停）
+  if (p && pfReqs.has(p)) return loading(p);
   if (!p) {
     const req: Promise<void> = loading(getTreemap(path, 3))
       .then((sub) => {
@@ -764,6 +769,105 @@ function fetchOwn(path: string, gen: number): Promise<void> {
     p = req;
   }
   return p;
+}
+
+// ── 预取（K 第 3 轮 F8）：鼠标在一个还没取过的文件夹块上停 120 ms / 挖开一个文件夹后空闲时，在后台把子树取进缓存，
+// 下一次单击不用等数据（常见路径上单击到画面稳定约 300 ms）。只往缓存里放、不改任何状态（显示树只拼链上的，
+// 缓存里多了链外的子树，图一点不变）。同时最多 2 个；用户自己要的数据在取的时候先停；新扫描 / 换盘 / 清理之后清空。
+const PREFETCH_MAX = 2;
+const PREFETCH_QUEUE = 8;
+const pfQueue: string[] = [];
+/** 正在飞的预取请求（fetchOwn 碰到它时接着等，并算进 loading） */
+const pfReqs = new Set<Promise<void>>();
+let pfActive = 0;
+let pfIdle: { cancel: () => void } | null = null;
+/** 测试可以关掉「空闲时预取」（它用计时器，测别的东西时会多出请求） */
+export const prefetchCfg = { idle: true };
+
+const queued = (k: string) => pfQueue.findIndex((q) => pathKey(q) === k);
+function enqueue(path: string, urgent: boolean) {
+  const k = pathKey(path);
+  if (tmCache.has(k) || tmInflight.has(k)) return;
+  const i = queued(k);
+  if (i >= 0) {
+    if (!urgent) return;
+    pfQueue.splice(i, 1);
+  }
+  if (urgent) pfQueue.unshift(path);
+  else pfQueue.push(path);
+  if (pfQueue.length > PREFETCH_QUEUE) pfQueue.length = PREFETCH_QUEUE;
+}
+function pump() {
+  if (!rootTm.value) return;
+  while (pfActive < PREFETCH_MAX && !loads && pfQueue.length) {
+    const path = pfQueue.shift()!;
+    const k = pathKey(path);
+    if (tmCache.has(k) || tmInflight.has(k)) continue;
+    const gen = tmGen;
+    pfActive++;
+    const req: Promise<void> = getTreemap(path, 3)
+      .then((sub) => {
+        if (gen !== tmGen) return;
+        tmCache.set(k, sub);
+        // 取回来的时候用户已经挖进去了（它在链上）：显示树重拼；不在链上就什么都不变
+        if (chain.value.some((c) => pathKey(c) === k)) tmVer.value++;
+      })
+      .catch(() => {})
+      .finally(() => {
+        pfActive--;
+        pfReqs.delete(req);
+        if (tmInflight.get(k) === req) tmInflight.delete(k);
+        pump();
+      });
+    pfReqs.add(req);
+    tmInflight.set(k, req);
+  }
+}
+function clearPrefetch() {
+  pfQueue.length = 0;
+  pfIdle?.cancel();
+  pfIdle = null;
+}
+/** 鼠标停在方块图上某个文件夹块上：从图上的链往下到它，还没取过的每一级都排到队首（外壳合并块两层都要） */
+export function prefetchFor(path: string) {
+  if (!rootTm.value) return;
+  const anc = ancestorsIn(tm.value, path);
+  if (!anc) return;
+  const todo = anc.filter((p) => !tmCache.has(pathKey(p)));
+  for (let i = todo.length - 1; i >= 0; i--) enqueue(todo[i], true);
+  pump();
+}
+/** 挖开一个文件夹（或者回到盘根）以后，空闲时预取它里面最大的 3 个子文件夹 */
+function prefetchKids() {
+  pfIdle?.cancel();
+  pfIdle = null;
+  if (!prefetchCfg.idle || exploreView.value === "list") return;
+  const gen = tmGen;
+  const run = () => {
+    pfIdle = null;
+    if (gen !== tmGen) return;
+    const n = findTm(tm.value, focusKey.value ?? rootPath());
+    if (!n) return;
+    const dirs = n.children
+      .filter((c) => c.kind === "Dir" && c.can_open)
+      .sort((a, b) => b.allocated - a.allocated)
+      .slice(0, 3);
+    for (const d of dirs) for (const h of collapseFor(d, chain.value).hops) enqueue(h.path, false);
+    pump();
+  };
+  const ric = (globalThis as { requestIdleCallback?: (f: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+  const cic = (globalThis as { cancelIdleCallback?: (id: number) => void }).cancelIdleCallback;
+  if (ric && cic) {
+    const id = ric(run, { timeout: 1500 });
+    pfIdle = { cancel: () => cic(id) };
+  } else {
+    const id = setTimeout(run, 300);
+    pfIdle = { cancel: () => clearTimeout(id) };
+  }
+}
+/** 测试 / 调试：这个文件夹的子树取过了吗 */
+export function tmCached(path: string): boolean {
+  return tmCache.has(pathKey(path));
 }
 
 /** 往里挖时最多等数据这么久再动（超过就先用手上的数据动，数据回来再补一次） */
@@ -858,7 +962,10 @@ async function openRoot() {
   if (!root) return;
   const gen = tmGen;
   try {
-    if (await fetchRoot(root, gen)) focus.value = listing.value;
+    if (await fetchRoot(root, gen)) {
+      focus.value = listing.value;
+      prefetchKids();
+    }
   } catch (e) {
     message.value = String(e);
   }
@@ -883,6 +990,7 @@ export async function digTo(path: string | null, opts: { sel?: string | null; ro
     pick();
     chain.value = [];
     await loadFocus(null, seq);
+    if (seq === navSeq) prefetchKids();
     return;
   }
   let anc = ancestorsIn(tm.value, path);
@@ -915,6 +1023,7 @@ export async function digTo(path: string | null, opts: { sel?: string | null; ro
     chain.value = ok;
     await loadFocus(ok[ok.length - 1] ?? null, seq);
   }
+  if (seq === navSeq && gen === tmGen) prefetchKids();
 }
 
 /** 面包屑第 i 级 / 收起：链截到前 i 级（0 = 全部收起） */
@@ -1067,6 +1176,7 @@ export async function reloadViews() {
   tmCache.clear();
   tmStubs.clear();
   tmInflight.clear();
+  clearPrefetch();
   const gen = tmGen;
   const seq = navSeq;
   clearSel();

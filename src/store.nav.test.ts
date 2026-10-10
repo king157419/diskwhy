@@ -60,6 +60,9 @@ function tm(n: R, level: number, depth: number): TreemapNode {
 const view = (n: R) => ({ name: n.name, path: n.path, kind: n.kind, allocated: n.size, child_count: n.children.length }) as never;
 /** list_dir 的延迟（测快速连点时过期的结果） */
 const gates = new Map<string, Promise<void>>();
+/** get_treemap 的延迟（测预取）；正在飞的 get_treemap 个数 */
+const tmGates = new Map<string, Promise<void>>();
+const flying = { now: 0, max: 0 };
 
 vi.mock("./api", async (orig) => ({
   ...(await orig<typeof import("./api")>()),
@@ -77,6 +80,13 @@ vi.mock("./api", async (orig) => ({
     return { node: view(n), children: n.children.map(view), total_children: n.children.length, breadcrumb: bc };
   }),
   getTreemap: vi.fn(async (path: string, depth = 3) => {
+    flying.now++;
+    flying.max = Math.max(flying.max, flying.now);
+    try {
+      await tmGates.get(path.toLowerCase());
+    } finally {
+      flying.now--;
+    }
     const n = find(path);
     if (!n) throw `找不到 ${path}`;
     return tm(n, 0, depth);
@@ -90,6 +100,9 @@ const getTreemap = vi.mocked(api.getTreemap);
 beforeEach(async () => {
   build();
   gates.clear();
+  tmGates.clear();
+  // 「空闲时预取」用计时器：测别的东西时关掉，免得多出请求（预取的测试里单独打开）
+  store.prefetchCfg.idle = false;
   store.summary.value = { root: "C:\\", buckets: {} } as never;
   store.listing.value = null;
   await store.goExplore();
@@ -343,5 +356,76 @@ describe("reloadViews：清理之后", () => {
     await store.reloadViews();
     expect(paths()).toEqual(["Windows", "System32"]);
     expect(store.focus.value?.children.map((c) => c.name)).toContain("new.dll");
+  });
+});
+
+describe("F7：缩放后图顶上的根标题条", () => {
+  it("单击它 = 收起到这个根这一级（链停在它这里，和点面包屑上它那一级一样）", async () => {
+    await store.digTo("C:\\Users\\king\\AppData\\Local\\Temp");
+    // 根标题条（图的根 = AppData）发出的是「往里挖到 AppData」：链截到 AppData
+    await store.mapClick({ kind: "dir", path: "C:\\Users\\king\\AppData" }, { at: 1000, detail: 1 });
+    expect(paths()).toEqual(["Users", "king", "AppData"]);
+    expect(store.crumbs.value.map((c) => c.name)).toEqual(["C:", "Users", "king", "AppData"]);
+  });
+});
+
+describe("F8：预取（不改任何状态、同时最多 2 个、扫描结果变了就清掉）", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  it("鼠标停在文件夹块上：后台取它（外壳合并块两层都取），链 / 列表 / 方块图数据都不变；之后挖进去不用再取", async () => {
+    const tmBefore = store.tm.value;
+    const focusBefore = store.focus.value;
+    store.prefetchFor("C:\\Users\\king");
+    await vi.waitFor(() => expect(store.tmCached("C:\\Users\\king")).toBe(true));
+    expect(getTreemap.mock.calls.map((c) => c[0])).toEqual(["C:\\Users", "C:\\Users\\king"]);
+    expect(store.chain.value).toEqual([]);
+    expect(store.focus.value).toBe(focusBefore);
+    expect(store.tm.value).toBe(tmBefore);
+    expect(store.tmLoading.value).toBe(false);
+    getTreemap.mockClear();
+    await store.digTo("C:\\Users\\king");
+    expect(getTreemap).not.toHaveBeenCalled();
+    expect(paths()).toEqual(["Users", "king"]);
+  });
+
+  it("同时最多 2 个请求；挖进一个正在预取的文件夹时接着等它（不重发）", async () => {
+    const open: (() => void)[] = [];
+    for (const p of ["c:\\users", "c:\\windows", "c:\\windows\\winsxs", "c:\\windows\\system32"]) tmGates.set(p, new Promise<void>((r) => open.push(r)));
+    flying.max = 0;
+    store.prefetchFor("C:\\Users");
+    store.prefetchFor("C:\\Windows");
+    store.prefetchFor("C:\\Windows\\WinSxS");
+    store.prefetchFor("C:\\Windows\\System32");
+    await sleep(10);
+    expect(flying.now).toBe(2);
+    open.forEach((f) => f());
+    await vi.waitFor(() => expect(store.tmCached("C:\\Windows\\System32")).toBe(true));
+    expect(flying.max).toBeLessThanOrEqual(2);
+    expect(new Set(getTreemap.mock.calls.map((c) => c[0])).size).toBe(getTreemap.mock.calls.length);
+  });
+
+  it("挖开一个文件夹后，空闲时预取它里面最大的 3 个子文件夹", async () => {
+    store.prefetchCfg.idle = true;
+    await store.digTo("C:\\Windows");
+    getTreemap.mockClear();
+    await vi.waitFor(() => expect(store.tmCached("C:\\Windows\\WinSxS")).toBe(true), { timeout: 2000 });
+    await vi.waitFor(() => expect(store.tmCached("C:\\Windows\\System32")).toBe(true), { timeout: 2000 });
+    expect(paths()).toEqual(["Windows"]);
+  });
+
+  it("扫描结果变了（清理后重新读 / 新扫描）：排队的预取清掉，飞着的结果回来也不用", async () => {
+    let open!: () => void;
+    tmGates.set("c:\\windows", new Promise<void>((r) => (open = r)));
+    tmGates.set("c:\\users", new Promise<void>(() => {}));
+    store.prefetchFor("C:\\Windows");
+    store.prefetchFor("C:\\Users");
+    store.prefetchFor("C:\\Windows\\WinSxS");
+    await sleep(10);
+    await store.reloadViews();
+    getTreemap.mockClear();
+    open();
+    await sleep(20);
+    expect(store.tmCached("C:\\Windows")).toBe(false);
+    // 排在队里的 WinSxS 没有再发
+    expect(getTreemap.mock.calls.map((c) => c[0])).not.toContain("C:\\Windows\\WinSxS");
   });
 });

@@ -332,3 +332,157 @@ describe("键盘：roving tabindex 的走法", () => {
     expect(navStep(boxes, "nope", "left")).toBeNull();
   });
 });
+
+// ───── 第 3 轮：外壳合并块的数字（F6）、缩放后的根标题条（F7）、块上的字按量字决定写法（F3） ─────
+import { fitLabel, layoutMap, rootHead, type LabelMetrics } from "./tmtree";
+import { DEFAULT_LAYOUT } from "./treemap";
+
+describe("F6：外壳合并块写哪一层的大小", () => {
+  const opts = { maxDepth: 2, boostDepth: 2 };
+  it("链停在外层 / 不在链上：写外层（和上一级列表一致）；链走进内层：写内层（和面包屑、列表一致）；面积始终按外层", () => {
+    const off = toInput(TREE, [], opts).children!.find((c) => c.key === "C:\\Users")!;
+    expect(off.name).toBe("Users \\ king");
+    expect(off.size).toBe(98);
+    expect(off.value).toBe(98);
+    const at = toInput(TREE, ["C:\\Users"], opts).children!.find((c) => c.key === "C:\\Users")!;
+    expect(at.name).toBe("Users");
+    expect(at.size).toBe(98);
+    for (const ch of [
+      ["C:\\Users", "C:\\Users\\king"],
+      ["C:\\Users", "C:\\Users\\king", "C:\\Users\\king\\AppData"],
+    ]) {
+      const inn = toInput(TREE, ch, opts).children!.find((c) => c.key === "C:\\Users")!;
+      expect(inn.name).toBe("Users \\ king");
+      expect(inn.size).toBe(97);
+      expect(inn.value).toBe(98);
+    }
+  });
+});
+
+describe("F7：自动缩放后图顶上的根标题条", () => {
+  const deep = (p: string, d: number, k = 4): TreemapNode => n(p, 0, d ? Array.from({ length: k }, (_, i) => deep(`${p}\\d${i}`, d - 1, k)) : [file(`${p}\\f`, 10)]);
+  const fix = (t: TreemapNode): TreemapNode => {
+    t.children.forEach(fix);
+    if (t.children.length) t.allocated = t.children.reduce((s, c) => s + c.allocated, 0);
+    return t;
+  };
+  const T = fix(n("C:\\", 0, [deep("C:\\a", 4), deep("C:\\b", 3), n("C:\\Users", 0, [deep("C:\\Users\\king", 3), file("C:\\Users\\p", 1)])]));
+  const frame = { x: 0, y: 0, w: 900, h: 700 };
+  const opt = { ...DEFAULT_LAYOUT, minPx: 8, maxDepth: 2, boostDepth: 2, headerPx: 26, pad: 4, padEnd: 6, minContainerPx: 60 };
+  it("根是扫描根：没有标题条；根不是扫描根：根画成铺满整张图的容器（深度 0），子块的 parentKey = 它", () => {
+    const flat = layoutMap(T, [], "C:\\", frame, opt)!;
+    expect(flat.items.some((i) => i.depth === 0)).toBe(false);
+    const chain = ["C:\\a", "C:\\a\\d0", "C:\\a\\d0\\d1"];
+    const z = layoutMap(T, chain, "C:\\a\\d0", frame, opt)!;
+    const head = z.items.find((i) => i.depth === 0)!;
+    expect(head).toMatchObject({ key: "C:\\a\\d0", name: "d0", container: true, chain: true, parentKey: null });
+    expect(head.rect).toEqual(frame);
+    for (const it of z.items.filter((i) => i.depth === 1)) expect(it.parentKey).toBe(head.key);
+    // 单击标题条 = 收起到这个根这一级（链停在它这里，和点面包屑上它那一级一样）
+    expect(headHit(head)).toEqual({ kind: "dir", path: "C:\\a\\d0" });
+    // 链上别的容器的标题栏照旧 = 收起它
+    const pkBlock = z.items.find((i) => i.key === "C:\\a\\d0\\d1")!;
+    expect(headHit(pkBlock)).toEqual({ kind: "head", path: "C:\\a\\d0\\d1", outer: "C:\\a\\d0\\d1" });
+  });
+  it("缩放的根是外壳合并块的内层：标题条用外层的 key 和合并的名字（和上一级图里那一块是同一个 key），大小写内层", () => {
+    const chain = ["C:\\Users", "C:\\Users\\king", "C:\\Users\\king\\d0"];
+    expect(rootHead(T, chain, "C:\\Users\\king")).toEqual({ key: "C:\\Users", name: "Users \\ king", size: findTm(T, "C:\\Users\\king")!.allocated });
+    const z = layoutMap(T, chain, "C:\\Users\\king", frame, opt)!;
+    const head = z.items.find((i) => i.depth === 0)!;
+    expect(head.key).toBe("C:\\Users");
+    const flat = layoutMap(T, chain, "C:\\", frame, opt)!;
+    // 同一个 key：缩放前它是图里的一块（链上），缩放后它铺满整张图
+    expect(flat.items.find((i) => i.key === "C:\\Users")!.chain).toBe(true);
+    // 子块的 key 缩放前后一样（父 key 一样）
+    const kids = (L: typeof z.items) => new Set(L.filter((i) => i.parentKey === "C:\\Users").map((i) => i.key));
+    const a = kids(flat.items);
+    const b = kids(z.items);
+    expect([...b].filter((k) => a.has(k)).length).toBeGreaterThan(0);
+  });
+});
+
+describe("F3：块上的字按量出来的宽度 / 行高决定写法，永不硬裁", () => {
+  // 假字体：每个字 7px（数字也 7px）、省略号 6px；行高 15.6 / 一行写法 11.5 / 竖排 15 / 只写大小 12 / 小一号 11
+  const W = (k: number) => (s: string) => Array.from(s).length * k;
+  const M: LabelMetrics = {
+    name: (s, big) => W(big ? 9 : 7)(s),
+    size: (s, big) => W(big ? 8 : 7)(s),
+    lname: W(6.7),
+    lsize: W(6.7),
+    vname: W(7),
+    vsize: W(7),
+    tiny: W(6.4),
+    micro: W(5.8),
+    ell: (big) => (big ? 8 : 6),
+    ellLine: 6,
+    ellV: 6,
+    lh: { a: 15.6, aBig: 19.5, b: 15.6, bBig: 17, ln: 11.5, v: 15, s: 12, t: 11, u: 10, uv: 12.5 },
+  };
+  const base = { name: "Program Files (x86)", full: "4.6 GB", short: "4.6" };
+  it("两行写法要放得下：C 主题 2px 墨框 + 上下 7px 留白 + 两行字 ≈ 49.2px；不够高就降成一行", () => {
+    expect(fitLabel({ ...base, w: 200, h: 49, bw: 2 }, M).mode).toBe("line");
+    expect(fitLabel({ ...base, w: 200, h: 50, bw: 2 }, M).mode).toBe("full");
+    // 没有描边（A / B）：45.2px 就够
+    expect(fitLabel({ ...base, w: 200, h: 46, bw: 0 }, M).mode).toBe("full");
+  });
+  it("第二行的大小整串放得下才写两行；名字截断时至少露出 3 个字，截断用「…」", () => {
+    const f = fitLabel({ ...base, w: 80, h: 80, bw: 2 }, M);
+    // 可用宽 80 − 4 − 16 − 1.5 = 58.5：大小 6 × 7 = 42 放得下；名字截到 (58.5 − 6) / 7 = 7 个字
+    expect(f).toMatchObject({ mode: "full", name: "Program", cut: true });
+    // 再窄：名字露不出 3 个字 → 不写两行
+    expect(fitLabel({ ...base, w: 42, h: 80, bw: 2 }, M).mode).not.toBe("full");
+  });
+  it("只写短大小：整串放得下才写（不会出现「27N」），放不下就不写", () => {
+    const t = { name: "x", full: "27.5 MB", short: "27M" };
+    // 21px 的「27M」+ 左右 5 + 墨框 2 × 2 + 误差 1.5 = 35.5：36 宽写；更窄用小一号的字（19.2 + 6 + 4 + 1.5 = 30.7）
+    expect(fitLabel({ ...t, w: 36, h: 36, bw: 2 }, M)).toMatchObject({ mode: "size" });
+    expect(fitLabel({ ...t, w: 31, h: 31, bw: 2 }, M)).toMatchObject({ mode: "size", tiny: true });
+    // 再窄：10px、贴边 2px（17.4 + 4 + 4 + 1.5 = 26.9）——C 主题 30 px 上下的小格子不再一排空着
+    const u = fitLabel({ ...t, w: 29, h: 29, bw: 2 }, M);
+    expect(u).toMatchObject({ mode: "size", tiny: true, micro: true, ix: 2 });
+    expect(fitLabel({ ...t, w: 26, h: 26, bw: 2 }, M).mode).toBe("none");
+    // 窄高的小块：大小竖着写；再窄（20 px 宽）用 10px 竖着写
+    expect(fitLabel({ ...t, w: 26, h: 60, bw: 2 }, M)).toMatchObject({ mode: "vert", name: "" });
+    expect(fitLabel({ ...t, w: 21, h: 49, bw: 2 }, M)).toMatchObject({ mode: "vert", name: "", micro: true });
+    expect(fitLabel({ ...t, w: 18, h: 49, bw: 2 }, M).mode).toBe("none");
+  });
+  it("「其他 410 项」：整段 → 「410 项」→ 不写名字（数字不截）", () => {
+    const c = { name: "其他 410 项", count: { pre: "其他", num: "410", post: "项" }, full: "1.2 GB", short: "1.2" };
+    expect(fitLabel({ ...c, w: 120, h: 60, bw: 2 }, M)).toMatchObject({ mode: "full", name: "其他 410 项", cut: false });
+    expect(fitLabel({ ...c, w: 70, h: 60, bw: 2 }, M)).toMatchObject({ mode: "full", name: "410 项", cut: false });
+    const small = fitLabel({ ...c, w: 52, h: 60, bw: 2 }, M);
+    expect(["其他 410 项", "410 项", ""]).toContain(small.name);
+  });
+  it("随机 5000 个块：选中的写法里每一行字（按同一把尺子量）都在块里面，绝不超出", () => {
+    let seed = 3;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const names = ["Windows", "Program Files (x86)", "下载", "nv12.inf_amd64_172a4", "ubuntu-24.04.1-desktop-amd64.iso", "a"];
+    for (let i = 0; i < 5000; i++) {
+      const w = 8 + rnd() * 240;
+      const h = 8 + rnd() * 160;
+      const bw = rnd() < 0.5 ? 2 : 0;
+      const name = names[Math.floor(rnd() * names.length)];
+      const full = rnd() < 0.5 ? "312 MB" : "12.7 GB";
+      const short = full === "312 MB" ? "0.3" : "12.7";
+      const f = fitLabel({ name, full, short, w, h, bw, big: w > 150 && h > 70 }, M);
+      const iw = w - 2 * bw - 2 * f.ix;
+      const ih = h - 2 * bw - 2 * f.iy;
+      const nm = (big: boolean) => M.name(f.name, big) + (f.cut ? M.ell(big) : 0);
+      if (f.mode === "full") {
+        expect(Math.max(nm(f.big), M.size(full, f.big))).toBeLessThanOrEqual(iw);
+        expect(f.big ? M.lh.aBig + M.lh.bBig : M.lh.a + M.lh.b).toBeLessThanOrEqual(ih);
+      } else if (f.mode === "line") {
+        expect(M.lname(f.name) + (f.cut ? M.ellLine : 0) + 6 + M.lsize(full)).toBeLessThanOrEqual(iw);
+        expect(M.lh.ln).toBeLessThanOrEqual(h - 2 * bw);
+      } else if (f.mode === "size") {
+        expect(f.micro ? M.micro(short) : f.tiny ? M.tiny(short) : M.size(short, false)).toBeLessThanOrEqual(iw);
+        expect(f.micro ? M.lh.u : f.tiny ? M.lh.t : M.lh.s).toBeLessThanOrEqual(ih);
+      } else if (f.mode === "vert") {
+        expect(f.micro ? M.lh.uv : M.lh.v).toBeLessThanOrEqual(iw);
+        expect(M.vname(f.name) + (f.cut ? M.ellV : 0) + (f.name ? 6 : 0) + (f.micro ? M.micro(short) : M.vsize(short))).toBeLessThanOrEqual(ih);
+      }
+      if (f.mode !== "none" && f.mode !== "size" && f.name && !f.cut) expect(f.name).toBe(name);
+      if (f.cut) expect(Array.from(f.name).length).toBeGreaterThanOrEqual(3);
+    }
+  });
+});

@@ -7,14 +7,15 @@ id = "npm-cache"
 owner = "npm"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\npm-cache', '%APPDATA%\npm-cache']
 what = "npm 下载过的包缓存"
 why = "让下次安装同一个包不用重新下载；npx 临时运行的工具也放在这里（_npx）"
-lose = "删除后下次 npm install 会重新下载，慢一些，不丢数据。"
+lose = "不丢数据；下次 npm install 要联网重新下载。npx 跑过的工具（包括用 npx 启动的 MCP 服务）也在这里，删了下次启动要联网重下，断网时启动不了。"
 how = ["delete", "builtin_tool"]
 how_detail = "npm cache clean --force （或直接删这个文件夹）。"
 refs = ["https://docs.npmjs.com/cli/v10/commands/npm-cache"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "npm-global"
@@ -37,6 +38,7 @@ id = "pnpm-store"
 owner = "pnpm"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\pnpm\store', '%LOCALAPPDATA%\pnpm-store', '%USERPROFILE%\.pnpm-store']
 what = "pnpm 的全局包仓库"
 why = "pnpm 把所有项目用到的包只存一份，项目里用硬链接指过来"
@@ -48,23 +50,41 @@ verified_on = "2026-09-23"
 
 [[rule]]
 id = "yarn-cache"
-owner = "Yarn"
+owner = "Yarn 1"
 category = "cache"
 tier = "safe"
-match = ['%LOCALAPPDATA%\Yarn\Cache', '%LOCALAPPDATA%\Yarn\Berry\cache']
-what = "Yarn 下载过的包缓存"
-why = "让下次安装同一个包不用重新下载"
-lose = "删除后下次安装会重新下载，不丢数据。"
+lose_kind = "redownload"
+match = ['%LOCALAPPDATA%\Yarn\Cache']
+what = "Yarn 1 下载过的包缓存"
+why = "让下次安装同一个包不用重新下载；项目里的 node_modules 是从这里复制过去的"
+lose = "不丢数据；下次 yarn install 要联网重新下载。"
 how = ["delete", "builtin_tool"]
 how_detail = "yarn cache clean"
 refs = ["https://classic.yarnpkg.com/en/docs/cli/cache"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
+
+[[rule]]
+id = "yarn-berry-cache"
+owner = "Yarn 2+（Berry）"
+category = "cache"
+tier = "review"
+lose_kind = "reinstall"
+lose_short = "项目要重装依赖"
+match = ['%LOCALAPPDATA%\Yarn\Berry\cache']
+what = "Yarn 2 及以上的全局包缓存（zip 包）"
+why = "新版 Yarn 默认让所有项目共用这一份缓存（enableGlobalCache）；用 PnP 的项目运行时直接从这里的 zip 读包，不再复制到项目里"
+lose = "删了以后，用 PnP 的项目在重新 yarn install 之前都跑不起来，要一个个项目联网重装；用 node_modules 的项目只是下次安装要重新下载。"
+how = ["builtin_tool", "delete"]
+how_detail = "确认没有在用的 PnP 项目后再删；删完在每个项目里运行 yarn install。"
+refs = ["https://yarnpkg.com/configuration/yarnrc#enableGlobalCache"]
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "bun-cache"
 owner = "Bun"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%USERPROFILE%\.bun\install\cache']
 what = "Bun 下载过的包缓存"
 why = "让下次安装同一个包不用重新下载"
@@ -79,6 +99,7 @@ id = "playwright-browsers"
 owner = "Playwright"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\ms-playwright']
 what = "Playwright 自动化测试下载的浏览器"
 why = "Playwright 跑网页自动化时用自己下载的 Chromium / Firefox / WebKit"
@@ -93,6 +114,7 @@ id = "electron-download-cache"
 owner = "Electron / node-gyp"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\electron\Cache', '%LOCALAPPDATA%\electron-builder\Cache', '%LOCALAPPDATA%\node-gyp\Cache']
 what = "Electron 和原生模块编译工具下载的文件缓存"
 why = "开发 Electron 应用或装需要编译的 npm 包时下载的运行时和头文件"
@@ -109,6 +131,7 @@ id = "pip-cache"
 owner = "pip"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\pip\cache', '%LOCALAPPDATA%\pip\Cache']
 what = "pip 下载过的 Python 包缓存"
 why = "让下次安装同一个包不用重新下载"
@@ -123,14 +146,15 @@ id = "uv-cache"
 owner = "uv"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\uv\cache']
 what = "uv 下载和解压过的 Python 包缓存"
-why = "uv 把包缓存起来，建虚拟环境时直接链接过去，所以特别快"
-lose = "不丢数据；已经建好的虚拟环境不受影响，下次安装新环境会重新下载。"
-how = ["builtin_tool", "delete"]
-how_detail = "uv cache clean （只清没用到的：uv cache prune）。"
+why = "uv 把包缓存起来，建虚拟环境时直接从这里链接过去，所以特别快；uvx 和 uv run --with 的临时环境也在这里"
+lose = "已经建好的虚拟环境一般不受影响；下次装包、跑 uvx 工具要联网重新下载。uv 官方说直接删缓存里的文件不安全（可能正好有 uv 在用），要用 uv 自己的命令清。"
+how = "builtin_tool"
+how_detail = "uv cache clean（全部清掉）或 uv cache prune（只清没用到的，官方说可以定期跑）。"
 refs = ["https://docs.astral.sh/uv/concepts/cache/"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "uv-root"
@@ -170,6 +194,7 @@ id = "conda-pkgs"
 owner = "conda（Anaconda / Miniconda）"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = [
   '%USERPROFILE%\miniconda3\pkgs', '%USERPROFILE%\anaconda3\pkgs', '%USERPROFILE%\miniforge3\pkgs',
   '%ProgramData%\miniconda3\pkgs', '%ProgramData%\anaconda3\pkgs',
@@ -222,14 +247,15 @@ id = "cargo-registry"
 owner = "Rust（cargo）"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%USERPROFILE%\.cargo\registry', '%USERPROFILE%\.cargo\git']
 what = "cargo 下载的依赖源码和压缩包"
-why = "编译 Rust 项目时下载的第三方库"
-lose = "不丢数据；下次编译会重新下载依赖。"
+why = "编译 Rust 项目时下载的第三方库；cargo 编译时直接读这里的源码"
+lose = "不丢数据；下次编译要联网重新下载依赖，离线时编译不了。"
 how = "delete"
 how_detail = "直接删；想只清旧的可以装 cargo-cache 工具。"
 refs = ["https://doc.rust-lang.org/cargo/guide/cargo-home.html"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "cargo-home"
@@ -268,28 +294,30 @@ id = "go-cache"
 owner = "Go"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\go-build', '%USERPROFILE%\go\pkg\mod']
 what = "Go 的编译缓存和下载的模块"
-why = "加快编译、避免重复下载依赖"
-lose = "不丢数据；下次编译更慢、要重新下载模块。"
+why = "go-build 是编译结果缓存，pkg\\mod 是下载的依赖源码"
+lose = "不丢数据；go-build 删了下次编译慢（重新编译）；pkg\\mod 删了要联网重新下载，离线时编译不了。"
 how = "builtin_tool"
 how_detail = "go clean -cache （编译缓存）和 go clean -modcache （模块缓存，里面文件是只读的，手动删会报权限错误）。"
 refs = ["https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "gradle-cache"
 owner = "Gradle"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%USERPROFILE%\.gradle\caches', '%USERPROFILE%\.gradle\wrapper\dists']
 what = "Gradle 的依赖缓存和下载的 Gradle 版本"
 why = "Android / Java 项目构建时下载的库和构建工具"
-lose = "不丢代码；下次构建会重新下载，可能要很久。"
+lose = "不丢代码；下次构建要联网重新下载依赖和 Gradle 本身，可能要很久，离线时构建不了。"
 how = "delete"
 how_detail = "关掉 Android Studio / IDE 和 Gradle 守护进程（gradle --stop）后删除。"
 refs = ["https://docs.gradle.org/current/userguide/directory_layout.html"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "maven-repo"
@@ -312,14 +340,15 @@ id = "nuget-cache"
 owner = "NuGet（.NET）"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%USERPROFILE%\.nuget\packages', '%LOCALAPPDATA%\NuGet\v3-cache', '%LOCALAPPDATA%\NuGet\plugins-cache', '%LOCALAPPDATA%\NuGet\Cache']
 what = "NuGet 下载的 .NET 包缓存"
-why = ".NET 项目还原依赖时下载的包"
-lose = "不丢代码；下次构建会重新下载。"
+why = ".NET 项目还原依赖时下载的包；.nuget\\packages 是项目编译时直接用的那一份，v3-cache 是 30 分钟就过期的下载缓存"
+lose = "不丢代码；下次还原、编译要联网重新下载，离线时编译不了。Visual Studio 里可能要重新加载解决方案。"
 how = ["builtin_tool", "delete"]
-how_detail = "dotnet nuget locals all --clear"
+how_detail = "dotnet nuget locals all --clear （先关掉 Visual Studio）。"
 refs = ["https://learn.microsoft.com/en-us/nuget/consume-packages/managing-the-global-packages-and-cache-folders"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 # ───────── Docker / WSL ─────────
 
@@ -455,6 +484,7 @@ id = "vscode-family-cached"
 owner = "VS Code 系编辑器"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 owner_from_path = true
 match = [
   '%APPDATA%\Code\CachedData', '%APPDATA%\Code\CachedExtensionVSIXs', '%APPDATA%\Code\logs', '%APPDATA%\Code\CachedProfilesData',
@@ -479,14 +509,14 @@ owner = "VS Code 系编辑器"
 category = "userdata"
 tier = "keep"
 owner_from_path = true
-match = ['%APPDATA%\Code\User', '%APPDATA%\Code - Insiders\User', '%APPDATA%\Cursor\User', '%APPDATA%\Trae\User', '%APPDATA%\Windsurf\User', '%APPDATA%\Antigravity\User', '%APPDATA%\VSCodium\User']
+match = ['%APPDATA%\Code\User', '%APPDATA%\Code - Insiders\User', '%APPDATA%\Cursor\User', '%APPDATA%\Trae\User', '%APPDATA%\Windsurf\User', '%APPDATA%\Antigravity\User', '%APPDATA%\VSCodium\User', '%APPDATA%\Kiro\User', '%APPDATA%\Qoder\User']
 what = "编辑器的个人设置、快捷键、代码片段和工作区记录"
-why = "你在编辑器里改过的所有设置都在这里"
-lose = "删了设置、快捷键、代码片段会丢（开了设置同步的可以同步回来）。里面的 workspaceStorage / History 比较大时可以单独考虑。"
+why = "你在编辑器里改过的所有设置都在这里；User\\History 是本地历史（Timeline 里的旧版本）"
+lose = "删了设置、快捷键、代码片段会丢（开了设置同步的可以同步回来），本地历史找不回来。里面的 workspaceStorage / History 比较大时可以单独考虑。"
 how = "none"
 how_detail = ""
 refs = ["https://code.visualstudio.com/docs/configure/settings"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "vscode-family-root"
@@ -496,14 +526,14 @@ tier = "review"
 lose_kind = "reinstall"
 lose_short = "编辑器设置会丢"
 owner_from_path = true
-match = ['%APPDATA%\Code', '%APPDATA%\Code - Insiders', '%APPDATA%\Cursor', '%APPDATA%\Trae', '%APPDATA%\Windsurf', '%APPDATA%\Antigravity', '%APPDATA%\VSCodium']
+match = ['%APPDATA%\Code', '%APPDATA%\Code - Insiders', '%APPDATA%\Cursor', '%APPDATA%\Trae', '%APPDATA%\Windsurf', '%APPDATA%\Antigravity', '%APPDATA%\VSCodium', '%APPDATA%\Kiro', '%APPDATA%\Qoder']
 what = "编辑器的数据文件夹（设置、扩展数据、缓存混在一起）"
-why = "VS Code 系编辑器把设置、扩展存的数据（globalStorage）、内置浏览器缓存都放在这里"
-lose = "整个删会丢设置和扩展数据。里面的 CachedData、CachedExtensionVSIXs、logs、Cache 类子文件夹可以清（会标成绿色）。"
+why = "VS Code 系编辑器把设置、扩展存的数据（globalStorage）、没保存文件的备份（Backups）、内置浏览器缓存都放在这里"
+lose = "整个删会丢设置、扩展数据和没保存的文件（Backups）。里面的 CachedData、CachedExtensionVSIXs、logs、Cache 类子文件夹可以清（会标成绿色）。"
 how = "manual"
 how_detail = "点进去只清缓存类子文件夹。"
-refs = []
-verified_on = "2026-09-23"
+refs = ["https://code.visualstudio.com/docs/editing/codebasics"]
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "vscode-family-extensions"
@@ -548,6 +578,7 @@ id = "jetbrains-caches"
 owner = "JetBrains IDE"
 category = "cache"
 tier = "safe"
+lose_kind = "slower"
 match = ['%LOCALAPPDATA%\JetBrains\*\caches', '%LOCALAPPDATA%\JetBrains\*\index', '%LOCALAPPDATA%\JetBrains\*\log', '%LOCALAPPDATA%\JetBrains\*\tmp']
 what = "JetBrains IDE（IntelliJ、PyCharm 等）的索引、缓存和日志"
 why = "IDE 为了代码提示和搜索建的索引"

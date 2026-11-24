@@ -1,5 +1,12 @@
 //! Tauri 壳：只做 IPC 转发，所有逻辑在 diskwhy-core。
 //!
+//! 测试实例（不碰用户自己的数据）：设环境变量 `DISKWHY_DATA_DIR=<scratch 文件夹>`。
+//! - DiskWhy 自己的文件（settings / ui / ai-cache / perf / last-run / actions.log / crash / rules / 暂存区登记）全放进去
+//!   （`diskwhy_core::explain::llm::app_data_dir`）；**%LOCALAPPDATA% 不用改**，规则照常按真实位置展开。
+//! - WebView2 的资料夹：Tauri 默认用 `%LOCALAPPDATA%\com.diskwhy.desktop\EBWebView`（tauri.conf.json 的 identifier）。
+//!   设了 `DISKWHY_DATA_DIR` 而没设 `WEBVIEW2_USER_DATA_FOLDER` 时，启动时把后者设成 `<DISKWHY_DATA_DIR>\WebView2`
+//!   （WebView2 优先用这个环境变量），所以测试实例不会和用户的实例共用一个 WebView2 资料夹。
+//!
 //! 命令一览（前端用 `invoke` 调用，见 src/api.ts）：
 //! - `get_env`            -> EnvInfo（是否管理员、规则库条数、规则警告、AI 是否可用）
 //! - `list_drives`        -> Vec<DriveInfo>（本机固定盘）
@@ -12,10 +19,35 @@
 //! - `open_snapshot`      (path?) -> ScanSummary（弹“打开”对话框读快照，替换当前结果；解释照常现算）
 //! - `startup_snapshot`   -> 启动参数里给的快照路径（`diskwhy.exe 某次扫描.dwsnap`，或双击关联的 .dwsnap）
 //! - `relaunch_as_admin`  以管理员身份重启（ShellExecuteW runas），成功后退出当前进程
-//! - `get_settings` / `save_settings(settings)` -> LLM 设置（%LOCALAPPDATA%\DiskWhy\settings.json）
-//! - `test_llm(settings)` -> 连接测试结果文本
-//! - `ask_ai(path)`       -> Explanation（source = Llm，tier = review），只在用户点“问 AI”时调用
+//! - `get_settings` / `save_settings(settings)` -> LLM 设置（%LOCALAPPDATA%\DiskWhy\settings.json）；
+//!   **先停掉**正在跑的自动识别再保存、换上新设置（旧设置的请求一个都不会再发出去）；AI 能用、当前结果是扫描出来的
+//!   （不是打开的快照）就按新设置重新跑一遍
+//! - `test_llm(settings)` -> 连接测试结果文本（出错时是“短中文（HTTP 状态码：服务器原话）”）；测的是自动识别正在用的
+//!   同一个账号时和自动识别排队（不同时发两个请求）
+//! - `ask_ai(path)`       -> AiNote：手动“问 AI”。答案存进 AI 缓存，并发 `ai-answer` 事件；出错时是短中文。
+//!   排队等请求锁时关了 AI → `AI 没打开` / `没填密钥`，换了服务商 / 模型 / 密钥 → `已取消`（都不发请求）；
+//!   排队时这一项已经被自动识别问到了 → 直接返回那个答案（不再发请求，也不再发 `ai-answer`）。快照里也能用
 //! - `get_ui_prefs` / `set_ui_prefs(prefs)` -> 界面偏好（主题 A / B / C），存在 %LOCALAPPDATA%\DiskWhy\ui.json
+//!
+//! 阶段 M（2026-10-11「免费智谱 + 自动识别」）：
+//! - 扫描完（`start_scan`）、保存了能用的 AI 设置（`save_settings`）后，在后台把
+//!   认不出来的大项（≥ 100 MB、解释是“未知”、还没问过，最多 40 项，`diskwhy_core::explain::ai_candidates`）
+//!   **一个一个**问 AI（`diskwhy_core::explain::ai_batch::run_batch`：可重试的错误等 3 / 8 秒再试、每项最多 3 次请求，
+//!   配置错误整批停下，连续 3 项失败停下）。主要装着文档 / 照片 / 视频 / 音乐的文件夹和这些类型的大文件不自动问
+//!   （`ai_store::personal_content`）。**打开的快照不自动问**（可能是别人电脑上的东西；`open_snapshot` 只停掉旧的那批，
+//!   之后保存设置、`ai_run_now` 也不会对快照跑），手动“问 AI”照样可以。答案存进 `%LOCALAPPDATA%\DiskWhy\ai-cache.json`，以后解释“未知”项时附在
+//!   `Explanation.ai` / `TreemapNode.ai` 上（档位、颜色、清理候选都不变）。新的扫描开始时停掉正在跑的这一批。
+//! - 事件 `ai-status`（payload AiStatus `{running, done, total, failed, error}`；`done` 含失败的）：每次进度变化都发；
+//! - 事件 `ai-answer`（payload `{path, note: AiNote}`）：每个答案（自动或手动）存好之后发；
+//! - `ai_status()` -> AiStatus：当前进度（界面重载后重新附着）；
+//! - `ai_run_now()`：对当前扫描结果重新跑一遍（界面上的“重试”）；AI 不能用、没有扫描结果或当前结果是快照时什么都不做（状态回到空闲）。
+//! - “能用” = 开关开着、填了地址和模型，云服务（非本机 / 局域网地址）还要填了密钥（`LlmSettings::usable`）。
+//! - 自动识别和手动“问 AI”共用一把锁：同一时间只有一个 AI 请求在路上（智谱免费账号并发很低）。排队等锁的批量线程
+//!   拿到锁后先看取消标记、再核对设置和缓存：期间换了设置 / 关了 AI / 开始了新扫描就一个请求都不发，这一项已经被问过了
+//!   就跳过（`ai_batch::ask_one` + `recheck_batch`；手动的是 `ai_batch::ask_manual`）。
+//! - 清理 / 还原后的刷新（`refresh_after`）会把扫描结果拿走几秒：这期间自动识别等它回来，不算失败；
+//!   回来后某一项已经不在了（被清理掉了）就跳过，也不算失败。
+//! - 代号 / 取消标记 / 进度放在 `ai_batch::BatchSlot` 里：每次开始 / 停止换代号，旧的那批的进度直接丢掉。
 //!
 //! 阶段 F：`ScanSummary.candidates` = 清理页的候选（按规则 / 启发式分组，见 `diskwhy_core::explain::candidates`），
 //! 扫描、打开快照、清理 / 还原后的刷新都会重新算。
@@ -53,15 +85,17 @@
 
 use diskwhy_core::action::guidance::{self, Guidance};
 use diskwhy_core::action::log::ActionLog;
-use diskwhy_core::action::protect::Protector;
+use diskwhy_core::action::protect::{self, Protector};
 use diskwhy_core::action::quarantine::{self, BatchInfo, DestStatus, PurgeReport, RestoreReport};
 use diskwhy_core::action::runstate::{self, Interrupted, RunState};
 use diskwhy_core::action::PerfModel;
 use diskwhy_core::action::refresh::RefreshReport;
 use diskwhy_core::action::{self, ExecOptions, ExecProgress, ExecReport, Plan, PlanRequest, PreflightOptions, PreflightReport, Progress, ProgressView, Strategy};
-use diskwhy_core::explain::llm::{self, LlmSettings};
-use diskwhy_core::explain::candidates::{cleanup_candidates, CandidateGroup};
-use diskwhy_core::explain::{tier_summary, ExplainCtx, Explanation, Target, TierSummary};
+use diskwhy_core::explain::ai_batch::{ask_manual, ask_one, recheck_batch, run_batch, AiStatus, BatchConfig, BatchSlot, ManualAnswer, RESULT_WAIT};
+use diskwhy_core::explain::ai_store::{AI_MAX_ITEMS, AI_MIN_BYTES};
+use diskwhy_core::explain::llm::{self, AskError, LlmSettings};
+use diskwhy_core::explain::candidates::{cleanup_candidates_with, node_hard, CandidateGroup};
+use diskwhy_core::explain::{ai_candidates, tier_summary, AiNote, ExplainCtx, Target, TierSummary};
 use diskwhy_core::scan::scan;
 use diskwhy_core::snapshot::{self, SnapshotMeta};
 use diskwhy_core::view::{self, find_dir, find_node, listing, node_view, DirListing, NodeView, TreemapNode};
@@ -69,7 +103,7 @@ use diskwhy_core::win::{is_elevated, list_fixed_drives, relaunch_as_admin as cor
 use diskwhy_core::{
     Attribution, InaccessibleDir, MappedDir, NodeKind, ScanOptions, ScanProgress, ScanResult, SizeMode,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -104,7 +138,21 @@ struct AppState {
     recreating: AtomicBool,
     /// 阶段 J：`log_frontend_error` 本次运行已经写了几条（防止刷屏）。
     frontend_errors: std::sync::atomic::AtomicUsize,
+    /// 阶段 M：AI 自动识别当前这一批（代号 + 取消标记 + 进度；旧的那批的进度丢掉，见 `BatchSlot`）。
+    ai: Mutex<BatchSlot>,
+    /// 阶段 M：同一时间只发一个 AI 请求（自动识别、手动“问 AI”、对同一个账号的测试连接共用）。
+    ai_http: Mutex<()>,
 }
+
+/// 事件 `ai-answer` 的内容。
+#[derive(Serialize, Clone)]
+struct AiAnswer {
+    path: String,
+    note: AiNote,
+}
+
+const AI_STATUS_EVENT: &str = "ai-status";
+const AI_ANSWER_EVENT: &str = "ai-answer";
 
 /// `acting` 的守卫：开始时置位，析构时（正常返回、提前 return、panic 展开都算）一定复位——
 /// `acting` 卡在 true 会让关窗永远被拦（PHASE_J_CRASH.md 第 3 条）。
@@ -211,7 +259,8 @@ struct ScanSummary {
 fn analyze(tree: &diskwhy_core::Node, ctx: &ExplainCtx) -> (TierSummary, Vec<CandidateGroup>) {
     let tiers = tier_summary(tree, ctx);
     let p = protector();
-    let candidates = cleanup_candidates(tree, ctx, &|path: &str| p.check(path).is_some());
+    // 保护路径拦下的候选带一个短原因（≤ 6 个字），清理页那一行显示为什么不能勾
+    let candidates = cleanup_candidates_with(tree, ctx, &|path: &str| p.check(path).map(|w| protect::short_reason(&w).to_string()));
     (tiers, candidates)
 }
 
@@ -261,11 +310,14 @@ fn list_drives() -> Vec<DriveInfo> {
 async fn start_scan(
     root: String,
     on_progress: Channel<ScanProgress>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanSummary, String> {
     if state.scanning.swap(true, Ordering::SeqCst) {
         return Err("已有扫描正在进行".into());
     }
+    // 新的扫描：停掉上一次结果的自动识别（正在路上的那个请求答完也会存下来，它是对的）
+    ai_stop(&app);
     let cancel = Arc::new(AtomicBool::new(false));
     *state.cancel.lock().unwrap() = cancel.clone();
     // 扫描期间释放旧结果，避免同时占两份内存
@@ -286,6 +338,7 @@ async fn start_scan(
     let (r, tiers) = res.map_err(|e| format!("扫描线程异常：{e}"))?.map_err(|e| e.to_string())?;
     let summary = summarize(&r, tiers, None);
     *state.result.lock().unwrap() = Some(Arc::new(r));
+    ai_start(&app);
     Ok(summary)
 }
 
@@ -313,6 +366,18 @@ async fn get_treemap(path: String, depth: Option<usize>, state: State<'_, AppSta
 }
 
 /// 任意节点（目录 / 文件 / “其余小文件”）的详情视图，带解释。
+/// 「看看都是什么」里「加入清理」之前：这个路径能不能删。返回硬拦的短原因（≤ 6 个字：保护路径 / 系统保留 /
+/// 映射 / 读不了 / 云占位），能删返回 None（keep / 认不出来的也返回 None，界面上二次确认后强制加入）。
+#[tauri::command]
+fn hard_block(path: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    if let Some(w) = protector().check(&path) {
+        return Ok(Some(protect::short_reason(&w).to_string()));
+    }
+    let r = state.result()?;
+    let (_, node) = find_node(&r.tree, &path).ok_or_else(|| format!("在扫描结果里找不到：{path}"))?;
+    Ok(node_hard(node).map(str::to_string))
+}
+
 #[tauri::command]
 fn node_info(path: String, kind: NodeKind, state: State<'_, AppState>) -> Result<NodeView, String> {
     let r = state.result()?;
@@ -377,6 +442,7 @@ async fn open_snapshot(path: Option<String>, app: AppHandle, state: State<'_, Ap
         return Err("正在扫描，先等扫描结束或取消".into());
     }
     let ctx = state.ctx();
+    let app2 = app.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
         let p: PathBuf = match path {
             Some(p) => PathBuf::from(p),
@@ -405,8 +471,11 @@ async fn open_snapshot(path: Option<String>, app: AppHandle, state: State<'_, Ap
     .map_err(|e| format!("读取线程异常：{e}"))??;
     let Some((r, tiers, info)) = res else { return Ok(None) };
     let summary = summarize(&r, tiers, Some(info.clone()));
-    *state.result.lock().unwrap() = Some(Arc::new(r));
+    // 快照可能是别人电脑上的东西：不自动问 AI（手动“问 AI”照样可以）。先记下“这是快照”再停掉旧结果的那一批、换上快照——
+    // 同时有人 ai_start（保存设置）时，它要么看到快照不开始，要么开始的那批被这里停掉
     *state.snapshot.lock().unwrap() = Some(info);
+    ai_stop(&app2);
+    *state.result.lock().unwrap() = Some(Arc::new(r));
     Ok(Some(summary))
 }
 
@@ -438,34 +507,199 @@ fn get_settings(state: State<'_, AppState>) -> LlmSettings {
 }
 
 #[tauri::command]
-fn save_settings(settings: LlmSettings, state: State<'_, AppState>) -> Result<String, String> {
-    let p = settings.save()?;
+fn save_settings(settings: LlmSettings, app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    // 先停掉正在跑的那一批（置取消标记），再保存、换设置：排队等请求锁的那个拿到锁后看到取消，不会用旧设置再发一个
+    ai_stop(&app);
+    let p = match settings.save() {
+        Ok(p) => p,
+        Err(e) => {
+            // 没存上：设置没变，按原来的设置接着跑
+            ai_start(&app);
+            return Err(e);
+        }
+    };
     state.set_settings(settings);
+    // 能用：按新设置对当前结果重新跑一遍；不能用（关了 / 没填全）：到此为止
+    ai_start(&app);
     Ok(p.display().to_string())
 }
 
+/// 测试连接。测的是自动识别正在用的同一个账号（同一个服务商、同一个密钥）时，和自动识别排队（免费账号并发很低，
+/// 同时发两个会被 1302 限流）；测别的服务商不用等。
 #[tauri::command]
-async fn test_llm(settings: LlmSettings) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || llm::test_connection(&settings))
-        .await
-        .map_err(|e| format!("测试线程异常：{e}"))?
+async fn test_llm(settings: LlmSettings, app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let cur = st.ctx();
+        let same_account = llm::host_of(&cur.settings.base_url) == llm::host_of(&settings.base_url)
+            && cur.settings.api_key.trim() == settings.api_key.trim();
+        let _one = same_account.then(|| st.ai_http.lock().unwrap_or_else(|e| e.into_inner()));
+        llm::test_connection(&settings)
+    })
+    .await
+    .map_err(|e| format!("测试线程异常：{e}"))?
 }
 
+/// 手动“问 AI”：返回 AI 的推测，存进 AI 缓存并发 `ai-answer`（列表、方块图都会跟着更新）。
+/// 和自动识别共用一把锁，不会同时发两个请求。拿到锁后用**现在的**设置核对（`ai_batch::ask_manual`）：排队时关了 AI →
+/// `AI 没打开` / `没填密钥`，换了服务商 / 模型 / 密钥 → `已取消`，都不发；排队时已经被问过了 → 返回缓存里的答案。
+/// 出错时返回短中文（见 `llm::ASK_MESSAGES`）。
 #[tauri::command]
-async fn ask_ai(path: String, state: State<'_, AppState>) -> Result<Explanation, String> {
+async fn ask_ai(path: String, app: AppHandle, state: State<'_, AppState>) -> Result<AiNote, String> {
     let r = state.result()?;
     let ctx = state.ctx();
-    tauri::async_runtime::spawn_blocking(move || {
-        let (chain, node) = find_node(&r.tree, &path).ok_or_else(|| format!("在扫描结果里找不到：{path}"))?;
+    // 先从扫描树里取好要发的信息，马上放开扫描树（清理后的刷新要独占它），再慢慢等网络
+    let (full, input, size) = {
+        let (chain, node) = find_node(&r.tree, &path).ok_or_else(|| llm::MSG_NOT_FOUND.to_string())?;
         if node.kind == NodeKind::Rest {
-            return Err("“其余小文件合计”不是一个真实的文件夹，没法问 AI".to_string());
+            return Err(llm::MSG_NOT_FOUND.to_string());
         }
-        let full = if node.kind == NodeKind::Dir { node.path.clone() } else { path.clone() };
+        let full = match (node.kind, chain.last()) {
+            (NodeKind::File, Some(p)) => diskwhy_core::fs::join(&p.path, &node.name),
+            _ => node.path.clone(),
+        };
         let t = Target { node, path: &full, parent: chain.last().copied(), ancestors: &chain };
-        llm::ask(&t, &ctx)
+        let input = llm::build_input(&t);
+        (full, input, node.allocated)
+    };
+    drop(r);
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let res = ask_manual(
+            &st.ai_http,
+            &ctx.settings,
+            || st.ctx().settings.clone(),
+            || ctx.ai.get(&full),
+            |s| llm::ask_input(&input, size, s, llm::ASK_TIMEOUT),
+        );
+        match res.map_err(|e| e.message)? {
+            ManualAnswer::Fresh(note) => {
+                ai_store_answer(&app, &ctx, &full, &note);
+                Ok(note)
+            }
+            ManualAnswer::Cached(note) => Ok(note),
+        }
     })
     .await
     .map_err(|e| format!("AI 线程异常：{e}"))?
+}
+
+// ───────────────────────── 阶段 M：AI 自动识别 ─────────────────────────
+
+/// 存一个答案（落盘失败记进 crash.log，不影响这次使用）并通知界面。
+fn ai_store_answer(app: &AppHandle, ctx: &ExplainCtx, path: &str, note: &AiNote) {
+    if let Err(e) = ctx.ai.put(path, note.clone()) {
+        diskwhy_core::crash::note("ai", &format!("AI 缓存写不进去：{e}"));
+    }
+    let _ = app.emit(AI_ANSWER_EVENT, AiAnswer { path: path.to_string(), note: note.clone() });
+}
+
+/// 停掉正在跑的自动识别（如果有：置取消标记——在等网络 / 排队等请求锁的那个线程不会再发新请求），
+/// 状态回到空闲（变了就通知界面）。返回新的代号。
+fn ai_stop(app: &AppHandle) -> u64 {
+    let st = app.state::<AppState>();
+    let mut g = st.ai.lock().unwrap_or_else(|e| e.into_inner());
+    let (gen, changed) = g.stop();
+    if changed {
+        let _ = app.emit(AI_STATUS_EVENT, g.status());
+    }
+    gen
+}
+
+/// 对当前扫描结果（重新）开始自动识别：先停掉旧的；AI 不能用（关了、没填全、云服务没填密钥）、没有扫描结果、
+/// 当前结果是打开的快照（可能是别人电脑上的东西，只能手动问）就到此为止（状态空闲）。
+/// 在后台线程里先找出值得问的项，再一个一个问。
+fn ai_start(app: &AppHandle) {
+    let gen = ai_stop(app);
+    let st = app.state::<AppState>();
+    let ctx = st.ctx();
+    if !ctx.settings.usable() || st.snapshot.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        return;
+    }
+    let Ok(r) = st.result() else { return };
+    // 这期间又有人开始 / 停止了：不开始
+    let Some(cancel) = st.ai.lock().unwrap_or_else(|e| e.into_inner()).begin(gen) else { return };
+    let app = app.clone();
+    let spawned = std::thread::Builder::new().name("ai-batch".into()).spawn(move || {
+        let st = app.state::<AppState>();
+        let set_status = |s: &AiStatus| {
+            let mut g = st.ai.lock().unwrap_or_else(|e| e.into_inner());
+            if g.report(gen, s) {
+                let _ = app.emit(AI_STATUS_EVENT, s);
+            }
+        };
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let items = ai_candidates(&r.tree, &ctx, ai_min_bytes(), AI_MAX_ITEMS);
+            drop(r); // 不一直占着扫描树（清理后的刷新要独占它）
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            run_batch(
+                &items,
+                &BatchConfig::default(),
+                &cancel,
+                &ctx.ai,
+                |path| ai_ask_one(&st, &ctx, &cancel, path),
+                |s| set_status(s),
+                |path, note| {
+                    // run_batch 已经存进 ctx.ai 了，这里只通知界面
+                    let _ = app.emit(AI_ANSWER_EVENT, AiAnswer { path: path.to_string(), note: note.clone() });
+                },
+            );
+        }));
+        // 万一 panic 了（panic hook 已经记进 crash.log）：别让界面一直转圈
+        if ran.is_err() {
+            let cur = st.ai.lock().unwrap_or_else(|e| e.into_inner()).status().clone();
+            set_status(&AiStatus { running: false, error: Some(llm::MSG_FAILED.into()), ..cur });
+        }
+    });
+    if let Err(e) = spawned {
+        diskwhy_core::crash::note("ai", &format!("AI 自动识别线程起不来：{e}"));
+    }
+}
+
+/// 自动识别的门槛（100 MB）。测试用（只在 debug 构建里）：环境变量 `DISKWHY_TEST_AI_MIN_BYTES=<字节>` 可以调低，
+/// 不用造上百 MB 的文件就能在真 exe 里跑一遍自动识别。
+#[cfg(debug_assertions)]
+fn ai_min_bytes() -> u64 {
+    std::env::var("DISKWHY_TEST_AI_MIN_BYTES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AI_MIN_BYTES)
+}
+
+#[cfg(not(debug_assertions))]
+fn ai_min_bytes() -> u64 {
+    AI_MIN_BYTES
+}
+
+/// 自动识别问一项（逻辑在 `diskwhy_core::explain::ai_batch::ask_one`）：每次都从**当前**扫描结果里找（清理后的刷新
+/// 可能换了树；刷新期间扫描结果暂时不在就等它回来，不算失败），取好信息就放开，再排队发请求；排到了先看一眼这一批
+/// 是不是已经取消了（换了设置 / 关了 AI / 新的扫描），再核对现在的设置和缓存（`recheck_batch`：设置变了 → 取消，
+/// 已经问过了 → 跳过），都通过才用现在的设置发。
+fn ai_ask_one(st: &AppState, ctx: &ExplainCtx, cancel: &AtomicBool, path: &str) -> Result<AiNote, AskError> {
+    ask_one(
+        cancel,
+        RESULT_WAIT,
+        || st.result.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        |r: &Arc<ScanResult>| {
+            let (chain, node) = find_node(&r.tree, path)?;
+            let t = Target { node, path, parent: chain.last().copied(), ancestors: &chain };
+            Some((llm::build_input(&t), node.allocated))
+        },
+        &st.ai_http,
+        || recheck_batch(&ctx.ai, path, &ctx.settings, &st.ctx().settings),
+        |(input, size), s| llm::ask_input(&input, size, &s, llm::ASK_TIMEOUT),
+    )
+}
+
+/// 自动识别的当前进度（界面重载后重新附着）。
+#[tauri::command]
+fn ai_status(state: State<'_, AppState>) -> AiStatus {
+    state.ai.lock().unwrap_or_else(|e| e.into_inner()).status().clone()
+}
+
+/// 对当前扫描结果重新跑一遍自动识别（界面上的“重试”）。
+#[tauri::command]
+fn ai_run_now(app: AppHandle) {
+    ai_start(&app);
 }
 
 // ───────────────────────── 阶段 F：界面偏好 ─────────────────────────
@@ -563,9 +797,20 @@ enum PreviewEvent {
 /// 阶段 G：先做快速计划并立刻通过 `on_event` 发 `quote`（弹层马上出现），再在后台枚举、逐个检查，
 /// 期间发 `progress`；全部做完才返回完整的预检报告并保存计划（只有这时才能执行）。
 /// `cancel_preview` 或新的一次预览会让这次尽快停下并返回“已取消”。
+/// 前端传来的清理清单项：`forced = true` 表示用户二次确认后强制加入（keep / 认不出来 / 不建议直接删的），
+/// 后端不再按档位 / 规则拦，但只进回收站 / 暂存区（见 `PlanItem::forced`）。
+#[derive(Deserialize)]
+struct UiPlanRequest {
+    path: String,
+    #[serde(default)]
+    expect_rule: Option<String>,
+    #[serde(default)]
+    forced: bool,
+}
+
 #[tauri::command]
 async fn preview_plan(
-    items: Vec<PlanRequest>,
+    items: Vec<UiPlanRequest>,
     strategy: Strategy,
     safe_direct: Option<bool>,
     on_event: Channel<PreviewEvent>,
@@ -596,7 +841,9 @@ async fn preview_plan(
     let p2 = prog.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
-        let mut plan = action::build_plan_quick(&r, &ctx, protector(), &items, strategy);
+        let forced: Vec<String> = items.iter().filter(|i| i.forced).map(|i| i.path.clone()).collect();
+        let reqs: Vec<PlanRequest> = items.into_iter().map(|i| PlanRequest { path: i.path, expect_rule: i.expect_rule }).collect();
+        let mut plan = action::build_plan_quick_forced(&r, &ctx, protector(), &reqs, &forced, strategy);
         plan.safe_direct = safe_direct.unwrap_or(true);
         let _ = on_event.send(PreviewEvent::Quote { report: action::quote(&plan) });
         let quote_ms = t0.elapsed().as_millis() as u64;
@@ -1166,6 +1413,14 @@ pub fn run() {
     if let Some(code) = quarantine::elevated_mkdir_from_args(&args) {
         std::process::exit(code);
     }
+    // 测试实例（DISKWHY_DATA_DIR）：WebView2 的资料夹也放进去，不和用户自己的 DiskWhy 共用（见文件头）。
+    if let Some(dir) = std::env::var_os(llm::DATA_DIR_ENV).filter(|v| !v.is_empty()) {
+        if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+            let wv = std::path::PathBuf::from(dir).join("WebView2");
+            let _ = std::fs::create_dir_all(&wv);
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &wv);
+        }
+    }
     // 闪退取证：panic → crash.log（带 backtrace）；未处理的原生异常 → crash\*.dmp + crash.log 一行。
     diskwhy_core::crash::install();
     let app = tauri::Builder::default()
@@ -1225,6 +1480,7 @@ pub fn run() {
             list_dir,
             get_treemap,
             node_info,
+            hard_block,
             save_snapshot,
             open_snapshot,
             startup_snapshot,
@@ -1233,6 +1489,8 @@ pub fn run() {
             save_settings,
             test_llm,
             ask_ai,
+            ai_status,
+            ai_run_now,
             action_env,
             preview_plan,
             cancel_preview,

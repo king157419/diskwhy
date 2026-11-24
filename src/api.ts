@@ -58,7 +58,42 @@ export interface Explanation {
   verified_on: string | null;
   notes: string[];
   clues: string[];
+  /** 阶段 M：认不出来（source = unknown）时 AI 的推测（后端从 ai-cache.json 填）；不改档位 / 来源 / 清理候选 */
+  ai?: AiNote;
 }
+
+/** 阶段 M：AI 对一个认不出来的文件夹 / 文件的推测（crates/diskwhy-core/src/explain/ai_store.rs 的 AiNote） */
+export interface AiNote {
+  what: string;
+  owner: string;
+  why: string;
+  lose: string;
+  confidence: number;
+  /** 回答它的模型 */
+  model: string;
+  /** 问的日期 YYYY-MM-DD */
+  at: string;
+  /** 问的时候它的大小（占用字节） */
+  size: number;
+}
+
+/** 阶段 M：后台自动问 AI 的进度（事件 ai-status / 命令 ai_status）。done = 已经问完的（含失败的），failed ⊆ done */
+export interface AiStatus {
+  running: boolean;
+  done: number;
+  total: number;
+  failed: number;
+  /** 出错停下的原因（一句短话：「密钥不对」…）；没出错为 null */
+  error: string | null;
+}
+
+/** 事件 ai-answer 的内容：path 是问的那一项的完整路径 */
+export interface AiAnswer {
+  path: string;
+  note: AiNote;
+}
+export const AI_STATUS_EVENT = "ai-status";
+export const AI_ANSWER_EVENT = "ai-answer";
 
 export interface RuleBytes {
   id: string;
@@ -157,6 +192,8 @@ export interface CandidatePath {
   path: string;
   bytes: number;
   deletable: boolean;
+  /** 硬拦（保护路径 / 系统保留 / 读不了…）的短原因（≤ 6 字）：怎么都不能勾。null 且 deletable = false：二次确认后可以强制勾（旧数据没有这个字段） */
+  hard?: string | null;
 }
 
 /** 一组清理候选：同一条规则（或同一种启发式）命中的所有位置 */
@@ -168,7 +205,8 @@ export interface CandidateGroup {
   name: string;
   owner: string;
   category: Category;
-  tier: "safe" | "review";
+  /** 后端算的候选只有 safe / review；「看看都是什么」里自己加的可以是 keep */
+  tier: Tier;
   lose_kind: LoseKind | null;
   lose_short?: string | null;
   how: How[];
@@ -232,6 +270,8 @@ export interface TreemapNode {
   children: TreemapNode[];
   hidden_bytes: number;
   hidden_count: number;
+  /** 阶段 M：认不出来（tier = unknown）时 AI 的推测 */
+  ai?: AiNote;
 }
 
 export interface NodeView {
@@ -281,8 +321,15 @@ export const relaunchAsAdmin = () => invoke<void>("relaunch_as_admin");
 export const getSettings = () => invoke<LlmSettings>("get_settings");
 export const saveSettings = (settings: LlmSettings) => invoke<string>("save_settings", { settings });
 export const testLlm = (settings: LlmSettings) => invoke<string>("test_llm", { settings });
-export const askAi = (path: string) => invoke<Explanation>("ask_ai", { path });
+/** 手动问 AI（列表展开行里的「问 AI」）：后端也会存进 ai-cache.json 并发 ai-answer 事件 */
+export const askAi = (path: string) => invoke<AiNote>("ask_ai", { path });
+/** 后台自动问 AI 的当前进度（界面重载后重新附着用） */
+export const aiStatus = () => invoke<AiStatus>("ai_status");
+/** 重新开始后台自动问 AI（出错后「重试」） */
+export const aiRunNow = () => invoke<void>("ai_run_now");
 export const getTreemap = (path: string, depth = 3) => invoke<TreemapNode>("get_treemap", { path, depth });
+/** 这个路径硬拦的短原因（保护路径 / 系统保留…，≤ 6 字）；能加进清理为 null */
+export const hardBlock = (path: string) => invoke<string | null>("hard_block", { path });
 export const nodeInfo = (path: string, kind: NodeKind) => invoke<NodeView>("node_info", { path, kind });
 /** 弹“另存为”对话框；用户取消返回 null */
 export const saveSnapshot = () => invoke<string | null>("save_snapshot");
@@ -328,12 +375,16 @@ export type SkipCode =
   | "missing"
   | "unreadable"
   | "hardlink"
-  | "recycle_unavailable";
+  | "recycle_unavailable"
+  | "running"
+  | "recent";
 export type EntryKind = "file" | "link" | "cloud_dir";
 
 export interface PlanRequest {
   path: string;
   expect_rule: string | null;
+  /** 用户二次确认后强制加入（keep / 认不出来 / 不建议直接删的）：后端不按档位拦，只进回收站 / 暂存区 */
+  forced?: boolean;
 }
 
 /** 前端的清理清单项（只用于显示；真正的档位 / 规则由后端在预览时重新判断） */
@@ -393,6 +444,8 @@ export interface ItemReport {
   skipped_by_reason: Record<string, number>;
   dirs_to_remove: number;
   enum_errors: string[];
+  /** 强制加入的（只进回收站 / 暂存区；旧报告没有） */
+  forced?: boolean;
 }
 
 export interface ActionWarning {

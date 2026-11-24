@@ -223,7 +223,7 @@ describe("单击翻译：方块 → MapHit", () => {
 });
 
 // ───── 第 2 轮（外观 / 键盘）：方块 → MapHit 的整段翻译、块上的字、标题栏放不放得下、方向键 ─────
-import { countLabel, countText, fitHead, hitOf, navStep, navTargets, tipName, type NavBox } from "./tmtree";
+import { countLabel, countText, fitChainHead, fitHead, hitOf, navStep, navTargets, tipName, type NavBox } from "./tmtree";
 
 describe("hitOf：方块 → MapHit（TreemapView 只调这一个）", () => {
   const tile = (key: string, ref: unknown, parentKey: string | null, extra: Partial<{ kind: "node" | "other"; mergedCount: number; value: number }> = {}) => ({
@@ -294,6 +294,37 @@ describe("块上的字", () => {
     // 「.ollama \\ models」：可用 160 → 带大小能露 8 个字「.ollama 」；可用 180 → 10 个字（到反斜杠后面）→ 都去掉末尾的空格和反斜杠
     expect(fitHead(".ollama \\ models", "7.7 GB", 160, M)).toEqual({ name: ".ollama", cut: true, size: true });
     expect(fitHead(".ollama \\ models", "7.7 GB", 180, M)).toEqual({ name: ".ollama", cut: true, size: true });
+  });
+  // 「收起」按钮：完整的占 60（含间隔），只有图标的占 26
+  const P = { full: 60, icon: 26 };
+  it("fitChainHead：放得下就名字 + 大小 + 完整的「收起」", () => {
+    // 名字 70 + 间隔 6 + 大小 70 + 按钮 60 = 206
+    expect(fitChainHead("Windows", "31.6 GB", 206, M, P)).toEqual({ name: "Windows", cut: false, size: true, pill: "full" });
+  });
+  it("fitChainHead：先让大小、截名字（名字还露得出 6 个字），按钮保持完整", () => {
+    // 去掉按钮剩 100：带大小名字只剩 100 − 76 − 8 = 16 → 不写大小；名字 7 字 70 放得下
+    expect(fitChainHead("Windows", "31.6 GB", 160, M, P)).toEqual({ name: "Windows", cut: false, size: false, pill: "full" });
+    // 剩 92：名字截到 8 个字 ≥ 6
+    expect(fitChainHead("SoftwareDistribution", "2.4 GB", 152, M, P)).toEqual({ name: "Software", cut: true, size: false, pill: "full" });
+  });
+  it("fitChainHead：完整的放不下（名字露不出 6 个字）→ 只有图标的按钮", () => {
+    // 完整：剩 50 → 名字 4 个字 < 6；图标：剩 84 → 名字 7 个字
+    expect(fitChainHead("SoftwareDistribution", "2.4 GB", 110, M, P)).toEqual({ name: "Softwar", cut: true, size: false, pill: "icon" });
+  });
+  it("fitChainHead：再窄（名字露不出 4 个字）→ 不放按钮，空间全给名字", () => {
+    // 图标：剩 40 → 名字 3 个字 < 4；不放按钮：66 → 5 个字
+    expect(fitChainHead("SoftwareDistribution", "2.4 GB", 66, M, P)).toEqual({ name: "Softw", cut: true, size: false, pill: "none" });
+    // 窄到连按钮都放不下
+    expect(fitChainHead("Temp", "1.1 GB", 20, M, P).pill).toBe("none");
+  });
+  it("fitChainHead：短名字整个写得下就算够（「下载」只有两个字）", () => {
+    // 完整：剩 40 → 带大小放不下，名字 20 放得下
+    expect(fitChainHead("下载", "12.4 GB", 100, M, P)).toEqual({ name: "下载", cut: false, size: false, pill: "full" });
+  });
+  it("fitChainHead：名字只剩大小（fitHead 给空名字）时不算放得下", () => {
+    const N = { ...M, size: (s: string) => s.length * 6 };
+    // 完整：剩 6 → 只能写大小（名字空）→ 不行；图标：剩 40 → 名字 3 个字 < 4 → 不行；不放：66 → 名字
+    expect(fitChainHead("WinSxS", "9.2 GB", 66, N, P)).toEqual({ name: "WinSxS", cut: false, size: false, pill: "none" });
   });
   it("fitHead：窄到名字只露得出一两个字：只写大小（「W…」猜不出是什么）；大小也放不下就照样截名字", () => {
     // 数字比名字窄（每个 6px）
@@ -378,9 +409,9 @@ describe("F7：自动缩放后图顶上的根标题条", () => {
     expect(head).toMatchObject({ key: "C:\\a\\d0", name: "d0", container: true, chain: true, parentKey: null });
     expect(head.rect).toEqual(frame);
     for (const it of z.items.filter((i) => i.depth === 1)) expect(it.parentKey).toBe(head.key);
-    // 单击标题条 = 收起到这个根这一级（链停在它这里，和点面包屑上它那一级一样）
-    expect(headHit(head)).toEqual({ kind: "dir", path: "C:\\a\\d0" });
-    // 链上别的容器的标题栏照旧 = 收起它
+    // 单击标题条 = 收起这个根自己（阶段 L：和链上别的容器的标题栏一样按外层 key 收起；不再是「收起到这一级」）
+    expect(headHit(head)).toEqual({ kind: "head", path: "C:\\a\\d0", outer: "C:\\a\\d0" });
+    // 链上别的容器的标题栏 = 收起它
     const pkBlock = z.items.find((i) => i.key === "C:\\a\\d0\\d1")!;
     expect(headHit(pkBlock)).toEqual({ kind: "head", path: "C:\\a\\d0\\d1", outer: "C:\\a\\d0\\d1" });
   });
@@ -390,6 +421,8 @@ describe("F7：自动缩放后图顶上的根标题条", () => {
     const z = layoutMap(T, chain, "C:\\Users\\king", frame, opt)!;
     const head = z.items.find((i) => i.depth === 0)!;
     expect(head.key).toBe("C:\\Users");
+    // 单击它 = 按外层收起（Users \ king 两层一起收起，和缩放前图里那一块的标题栏一样）
+    expect(headHit(head)).toEqual({ kind: "head", path: "C:\\Users\\king", outer: "C:\\Users" });
     const flat = layoutMap(T, chain, "C:\\", frame, opt)!;
     // 同一个 key：缩放前它是图里的一块（链上），缩放后它铺满整张图
     expect(flat.items.find((i) => i.key === "C:\\Users")!.chain).toBe(true);
@@ -484,5 +517,73 @@ describe("F3：块上的字按量出来的宽度 / 行高决定写法，永不�
       if (f.mode !== "none" && f.mode !== "size" && f.name && !f.cut) expect(f.name).toBe(name);
       if (f.cut) expect(Array.from(f.name).length).toBeGreaterThanOrEqual(3);
     }
+  });
+});
+
+// ───── 展开时调淡（阶段 M 收尾：「统一调淡 · 更淡」）─────
+import { outsideChain, tileNode } from "./tmtree";
+import { samePath } from "./treemap";
+
+describe("outsideChain：展开时链外的块统一调淡（一档，不分远近）", () => {
+  const I = (key: string, parentKey: string | null, chain = false) => ({ key, parentKey, chain });
+  const sorted = (s: Set<string>) => [...s].sort();
+  it("什么都没展开（没有 pk）/ pk 不在图上：一块也不调淡", () => {
+    const items = [I("U", null), I("U/king", "U"), I("W", null)];
+    expect(outsideChain(items, null).size).toBe(0);
+    expect(outsideChain(items, "nope").size).toBe(0);
+  });
+  it("链上一级（Windows）：Windows 里面的都不调淡，它的兄弟和兄弟里面的全部调淡", () => {
+    const items = [I("U", null), I("U/king", "U"), I("U/king/AppData", "U/king"), I("W", null, true), I("W/System32", "W"), I("W/System32/drivers", "W/System32"), I("W|其他", "W"), I("pf", null)];
+    expect(sorted(outsideChain(items, "W"))).toEqual(["U", "U/king", "U/king/AppData", "pf"]);
+  });
+  it("链上两级（Users → king）：祖先容器 Users 不调淡，但 Users 里 king 以外的（Public、其他）和图上别的都调淡", () => {
+    const items = [
+      I("U", null, true),
+      I("U/king", "U", true),
+      I("U/king/AppData", "U/king"),
+      I("U/king/AppData/Local", "U/king/AppData"),
+      I("U/Public", "U"),
+      I("U|其他", "U"),
+      I("W", null),
+      I("W/System32", "W"),
+      I("pf", null),
+    ];
+    expect(sorted(outsideChain(items, "U/king"))).toEqual(["U/Public", "U|其他", "W", "W/System32", "pf"]);
+  });
+  it("自动缩放后：根标题条（深度 0、链上）不调淡，根里 pk 以外的调淡", () => {
+    const items = [I("U", null, true), I("U/king", "U", true), I("U/king/a", "U/king"), I("U/Public", "U"), I("U/Public/x", "U/Public")];
+    expect(sorted(outsideChain(items, "U/king"))).toEqual(["U/Public", "U/Public/x"]);
+  });
+
+  // 真的布局：C:\ → Users \ king（外壳合并块，key = 外层 Users）→ AppData / 下载 / x.dat；Windows → System32
+  const frame = { x: 0, y: 0, w: 900, h: 700 };
+  const opt = { ...DEFAULT_LAYOUT, minPx: 8, maxDepth: 2, boostDepth: 2, headerPx: 26, pad: 4, padEnd: 6, minContainerPx: 60 };
+  const pkOf = (items: { chain: boolean; depth: number; ref?: unknown; key: string }[], p: string) =>
+    items.find((i) => i.chain && i.depth > 0 && samePath(tileNode(i)?.path, p))!.key;
+  it("外壳合并块 Users \\ king 就是 pk：它里面的都不调淡（它自己也不），Windows 一整块调淡", () => {
+    const chain = ["C:\\Users", "C:\\Users\\king"];
+    const { items } = layoutMap(TREE, chain, "C:\\", frame, opt)!;
+    const pk = pkOf(items, "C:\\Users\\king");
+    expect(pk).toBe("C:\\Users");
+    const dim = outsideChain(items, pk);
+    for (const it of items) {
+      const inWin = it.key === "C:\\Windows" || it.parentKey === "C:\\Windows";
+      expect(dim.has(it.key), it.key).toBe(inWin);
+    }
+    expect(dim.has("C:\\Windows")).toBe(true);
+  });
+  it("外壳合并块下面再展开一级（AppData）：合并块是祖先、不调淡；king 里 AppData 以外的（下载、x.dat）和 Windows 调淡", () => {
+    const chain = ["C:\\Users", "C:\\Users\\king", "C:\\Users\\king\\AppData"];
+    const { items } = layoutMap(TREE, chain, "C:\\", frame, opt)!;
+    const pk = pkOf(items, "C:\\Users\\king\\AppData");
+    const dim = outsideChain(items, pk);
+    expect(dim.has("C:\\Users")).toBe(false);
+    expect(dim.has(pk)).toBe(false);
+    expect(dim.has("C:\\Windows")).toBe(true);
+    const king = items.filter((i) => i.parentKey === "C:\\Users" && i.key !== pk);
+    expect(king.length).toBeGreaterThan(0);
+    for (const it of king) expect(dim.has(it.key), it.key).toBe(true);
+    // 链上的块一个都不调淡
+    for (const it of items) if (it.chain) expect(dim.has(it.key)).toBe(false);
   });
 });

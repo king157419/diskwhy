@@ -5,6 +5,12 @@
 // 阶段 J：「图例」按钮（悬停 / 点击出现，色块复用方块的配色类）；窄窗口 / 竖屏时方块图在上、列表在下。
 // 阶段 K：方块图是一张平面图，单击原地展开（见 store.ts mapClick）；面包屑第 i 级 = 收起到第 i 级；
 // Esc = 全部收起，Backspace = 收起一级。
+// 阶段 L：说明类的字一律写全（列表标题下的线索长了就折行），不用省略号截断。
+// 阶段 M：扫描完后台自动问 AI。认不出来、已经有推测的：类别写「AI 推测」（行的顺序、色点不变），展开行的「这是什么 / 删了会怎样」
+// 写推测、前面一个「AI 推测」小标签管这两行（推测没写后果时写中性的兜底，不退回叫人去点「问 AI」的那句），列表标题下的一行同样；
+// 同一个文件夹开着时，标题下那一行从线索换成推测（通常短一些）标题不变矮（lhMin），下面的行不会往上跳；
+// 工具栏图例旁边一个小标签显示进度 / 出错（AiChip）。没有「问 AI」可点时，后端说法里「或者（点）问 AI」那半句不显示。
+// 换了文件夹列表回到最上面。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   AppWindow,
@@ -22,12 +28,21 @@ import {
   Wrench,
 } from "lucide-vue-next";
 import TreemapView from "../components/TreemapView.vue";
-import { askAi, type Category, type Explanation, type NodeView } from "../api";
+import AiChip from "../components/AiChip.vue";
+import AiTag from "../components/AiTag.vue";
+import { hardBlock, type Category, type Explanation, type NodeView } from "../api";
+import { aiLose, noteFor, withoutAskAi } from "../ai";
 import { sizeParts, gbNum } from "../capacity";
 import { advice, CATEGORY_LABEL, clipWidth, isHardTag, loseTag } from "../labels";
 import { samePath } from "../treemap";
 import { fitTitle, pathKey } from "../tmtree";
 import {
+  addPathToCleanup,
+  aiNotes,
+  askAiNow,
+  candidates,
+  checked,
+  page,
   chain,
   collapseAll,
   collapseOne,
@@ -125,12 +140,17 @@ const ICON: Record<Category, unknown> = {
 };
 function icon(n: NodeView) {
   if (n.kind === "Rest") return MoreHorizontal;
-  if (n.kind === "File" && !n.explanation?.category) return FileIcon;
-  return ICON[n.explanation?.category ?? "unknown"] ?? Folder;
+  // 认不出来的文件用文件图标（ICON.unknown 是文件夹）
+  const c = n.explanation?.category;
+  if (n.kind === "File" && (!c || c === "unknown")) return FileIcon;
+  return ICON[c ?? "unknown"] ?? Folder;
 }
+/** 认不出来、后台问过 AI 的：它的推测（数据里没带上时用这次运行里收到过的补） */
+const aiOf = (n: NodeView | null | undefined) => noteFor(n, aiNotes.value);
 function catText(n: NodeView): string {
   if (n.kind === "Rest") return `小文件 ${n.files.toLocaleString("zh-CN")} 个`;
   const e = n.explanation;
+  if (aiOf(n)) return "AI 推测";
   if (!e || e.source.kind === "unknown") return n.kind === "Dir" ? `混合 ${n.child_count} 项` : "未知";
   if (e.category === "userdata") return e.tier === "keep" ? "你的文件" : "数据";
   return clipWidth(CATEGORY_LABEL[e.category] || "", 16);
@@ -155,6 +175,14 @@ watch(focus, () => {
   clearTimeout(rowTimer);
   rowTimer = setTimeout(() => (rowLimit.value = Infinity), 320);
 });
+// 换了一个文件夹：列表回到最上面（不然沿用上一个文件夹的滚动位置，最大的那几行被推出视野）。
+// 同一个文件夹的数据刷新不动；要展开某一行时，下面那个 watch 会再把它滚进可视区。
+watch(
+  () => focus.value?.node.path,
+  (p, old) => {
+    if (p && old && !samePath(p, old) && rowsEl.value) rowsEl.value.scrollTop = 0;
+  },
+);
 const shownRows = computed(() => rows.value.slice(0, rowLimit.value));
 /** 列表数据已经是当前展开的那个文件夹的（链一变到列表数据回来之前：旧行淡化，标题先用方块图数据里的名字和大小） */
 const listFresh = computed(() => !pkInfo.value || (!!focus.value && samePath(focus.value.node.path, pkInfo.value.path)));
@@ -212,8 +240,27 @@ const clueMap = computed(() => {
   }
   return m;
 });
-/** 当前展开的文件夹自己认不出来时，列表标题下面写它的第一条线索 */
-const pkClue = computed(() => (listFresh.value ? firstClue(focus.value?.node) : undefined));
+/**
+ * 当前展开的文件夹自己认不出来时，列表标题下面写一行：问过 AI 的写推测（带「AI 推测」标签），没问过写它的第一条线索
+ */
+const pkLine = computed<{ text: string; ai: boolean } | null>(() => {
+  if (!listFresh.value) return null;
+  const a = aiOf(focus.value?.node);
+  if (a) return { text: a.what.trim(), ai: true };
+  const c = firstClue(focus.value?.node);
+  return c ? { text: c, ai: false } : null;
+});
+/**
+ * 列表标题的最小高度（px，0 = 按 CSS）：同一个文件夹开着时，标题下那一行从线索换成 AI 推测（通常短一些、少折一行），
+ * 标题不跟着变矮——不然下面每一行都往上跳一下。换了文件夹、列表变宽变窄时放开。
+ */
+const lhEl = ref<HTMLElement | null>(null);
+const lhMin = ref(0);
+// 默认在 DOM 更新之前跑：这时量到的还是换之前（写着线索）的高度
+watch(pkLine, (now, before) => {
+  if (now?.ai && before && !before.ai && lhEl.value) lhMin.value = Math.max(lhMin.value, lhEl.value.getBoundingClientRect().height);
+});
+watch([() => focus.value?.node.path, ltW], () => (lhMin.value = 0));
 
 /** 列表里的大小：GB 一位小数（和设计稿一致），小于 1 GB 用 MB */
 function rowSize(b: number): [string, string] {
@@ -223,6 +270,35 @@ function rowSize(b: number): [string, string] {
 
 function toggleRow(n: NodeView) {
   openRow.value = openRow.value === n.path + n.kind ? null : n.path + n.kind;
+}
+
+// ── 加入清理（展开行里）：什么都能加，除了保护路径 / 系统保留这类硬拦的（显示 ≤ 6 字的原因）；
+// keep / 认不出来的加之前二次确认一次，加进去的只进回收站 / 暂存区 ──
+/** 路径 → 硬拦原因（null = 能加；"…" = 正在问后端） */
+const addWhy = ref<Record<string, string | null>>({});
+const canAdd = (n: NodeView) => n.kind !== "Rest" && !n.pseudo;
+watch(openRow, async (k) => {
+  const n = k ? shownRows.value.find((x) => x.path + x.kind === k) : null;
+  if (!n || !canAdd(n) || n.path in addWhy.value) return;
+  addWhy.value = { ...addWhy.value, [n.path]: "…" };
+  let why: string | null = null;
+  try {
+    why = await hardBlock(n.path);
+  } catch {
+    why = null;
+  }
+  addWhy.value = { ...addWhy.value, [n.path]: why };
+});
+/** 已经在清理清单里（勾着） */
+function inCleanup(n: NodeView) {
+  const k = n.path.toLowerCase();
+  return candidates.value.some((g) => checked.value.has(g.key) && g.paths.some((p) => p.path.toLowerCase() === k));
+}
+/** 行里的名字被截断（省略号）时才给原生提示：悬停一会儿能看到全名；没截断不弹 */
+function nameTip(e: MouseEvent, name: string) {
+  const el = e.currentTarget as HTMLElement;
+  if (el.scrollWidth > el.clientWidth + 1) el.title = name;
+  else el.removeAttribute("title");
 }
 /** 列表里的「›」：在方块图里展开这个文件夹（链延长一级） */
 function digRow(n: NodeView) {
@@ -249,22 +325,33 @@ watch([openRow, focus, rowLimit], () =>
   }),
 );
 
-// 问 AI（只在认不出来、而且用户在设置里开了 AI 时出现）
-const ai = ref<Record<string, Explanation | string>>({});
+// 手动「问 AI」（只在认不出来、还没有推测、而且用户在设置里开了 AI 时出现）：问的时候写「…」，出错写后端给的一句短话；
+// 问到了答案补进所有视图（store.askAiNow），这一行就换成「这是什么 / 删了会怎样」里的推测
+const asking = ref<Record<string, string>>({});
 async function doAsk(n: NodeView) {
-  ai.value = { ...ai.value, [n.path]: "…" };
+  const k = pathKey(n.path);
+  asking.value = { ...asking.value, [k]: "…" };
   try {
-    ai.value = { ...ai.value, [n.path]: await askAi(n.path) };
+    await askAiNow(n.path);
+    const next = { ...asking.value };
+    delete next[k];
+    asking.value = next;
   } catch (e) {
-    ai.value = { ...ai.value, [n.path]: String(e) };
+    asking.value = { ...asking.value, [k]: String(e) };
   }
 }
-const aiOf = (p: string) => ai.value[p];
+const askState = (n: NodeView) => asking.value[pathKey(n.path)];
+/** 展开行里有「问 AI」可点：认不出来、还没有推测、开了 AI */
+const canAsk = (n: NodeView) => n.explanation?.source.kind === "unknown" && llmReady.value && !aiOf(n) && n.kind !== "Rest" && !n.pseudo;
 
 /** 展开行的「建议」（阶段 H） */
-function adviceOf(e: Explanation) {
-  return advice(e.source.kind === "unknown" ? "keep" : e.tier, e.how, e.how_detail, e.source.kind === "rule" ? e.source.group : null);
+function adviceOf(n: NodeView, e: Explanation) {
+  const a = advice(e.source.kind === "unknown" ? "keep" : e.tier, e.how, e.how_detail, e.source.kind === "rule" ? e.source.group : null);
+  // 没有「问 AI」可点（已经有推测了 / 没开 AI）：「……，或者问 AI。」后半句不说
+  return canAsk(n) ? a : { ...a, detail: withoutAskAi(a.detail) };
 }
+/** 展开行的「删了会怎样」（没有推测时）：同样，没有「问 AI」可点就不叫人去点 */
+const loseText = (n: NodeView, e: Explanation) => (canAsk(n) ? e.lose : withoutAskAi(e.lose));
 
 function onKey(e: KeyboardEvent) {
   const t = e.target;
@@ -309,6 +396,7 @@ onBeforeUnmount(() => {
         <span class="sz num">{{ gbNum(focusTotal) }} GB</span>
       </nav>
       <div class="tools">
+        <AiChip class="ai-chip" />
         <div class="lg-wrap" @mouseenter="lgHover = true" @mouseleave="lgHover = false">
           <button class="lg-btn" :class="{ on: lgPinned }" :aria-expanded="lgShow" aria-label="图例" @click="lgPinned = !lgPinned">
             <span class="lg-ico" aria-hidden="true"><i class="tm-tone safe"></i><i class="tm-tone review"></i><i class="tm-tone keep"></i></span>图例
@@ -339,6 +427,7 @@ onBeforeUnmount(() => {
           :loading="tmLoading"
           :pin="exploreView === 'map'"
           :clues="clueMap"
+          :notes="aiNotes"
           @hit="onHit"
           @unsel="clearSel"
           @peek="onPeek"
@@ -346,21 +435,26 @@ onBeforeUnmount(() => {
       </div>
 
       <section v-if="exploreView !== 'map'" class="list">
-        <div class="lh" :class="{ hasclue: !!pkClue }">
+        <div ref="lhEl" class="lh" :class="{ hasclue: !!pkLine }" :style="lhMin ? { minHeight: lhMin + 'px' } : undefined">
           <div ref="ltEl" class="lt">
             <h2 ref="h2El" :title="titleFit.cut ? focusName : undefined">{{ titleFit.name }}<span v-if="titleFit.cut" class="el">…</span></h2>
             <span class="m"><template v-if="listFresh"><b class="num">{{ rows.length }}</b> 项 · </template><b class="num">{{ gbNum(focusTotal) }}</b> GB</span>
             <span class="sort">按大小</span>
           </div>
-          <div v-if="pkClue" class="clue" :title="pkClue"><Lightbulb :size="13" :stroke-width="1.8" aria-hidden="true" /><span>{{ pkClue }}</span></div>
+          <div v-if="pkLine" class="clue" :class="{ ai: pkLine.ai }">
+            <AiTag v-if="pkLine.ai" /><Lightbulb v-else :size="13" :stroke-width="1.8" aria-hidden="true" /><span>{{ pkLine.text }}</span>
+          </div>
         </div>
         <div ref="rowsEl" class="rows" :class="{ stale: !listFresh }">
           <template v-for="n in shownRows" :key="n.path + n.kind">
             <div class="li" :class="{ tail: tone(n) === 'mix', open: openRow === n.path + n.kind }">
               <i class="dot" :class="tone(n)"></i>
               <span class="ic"><component :is="icon(n)" :size="16" :stroke-width="1.6" /></span>
-              <button class="n" :aria-label="'展开：' + n.name" @click="toggleRow(n)">{{ n.name }}</button>
-              <span class="c">{{ catText(n) }}</span>
+              <button class="n" :aria-label="'展开：' + n.name" @mouseenter="nameTip($event, n.name)" @click="toggleRow(n)">{{ n.name }}</button>
+              <span class="c" :class="{ ai: !!aiOf(n) }"
+                ><svg v-if="aiOf(n)" class="ai-star" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 .6C6.35 3.6 8.4 5.65 11.4 6 8.4 6.35 6.35 8.4 6 11.4 5.65 8.4 3.6 6.35.6 6 3.6 5.65 5.65 3.6 6 .6Z" /></svg
+                >{{ catText(n) }}</span
+              >
               <span class="br"><i :style="{ width: (n.allocated / maxRow) * 100 + '%' }"></i></span>
               <span class="s num">{{ rowSize(n.allocated)[0] }}<small>{{ rowSize(n.allocated)[1] }}</small></span>
               <button v-if="n.kind === 'Dir' && n.child_count > 0 && !n.pseudo" class="go" :aria-label="'在方块图里展开：' + n.name" @click="digRow(n)">
@@ -371,28 +465,44 @@ onBeforeUnmount(() => {
             <div v-if="openRow === n.path + n.kind && n.explanation" class="detail">
               <dl>
                 <dt>这是什么</dt>
-                <dd>{{ n.explanation.what }}</dd>
+                <dd v-if="aiOf(n)" class="aiw"><AiTag /><span>{{ aiOf(n)!.what.trim() }}</span></dd>
+                <dd v-else>{{ n.explanation.what }}</dd>
                 <dt>删了会怎样</dt>
-                <dd>
+                <!-- AI 的说法：同一个「AI 推测」标签管这两行（是猜的，不是确认；档位照旧是认不出来、「建议」照旧是别动）。
+                     第二行不再叠一个一样的标签，只留一个看不见的同宽占位：两行推测的字左边对齐 -->
+                <dd v-if="aiOf(n)" class="aiw"><AiTag class="ghost" aria-hidden="true" /><span>{{ aiLose(aiOf(n)!) }}</span></dd>
+                <dd v-else>
                   <span v-if="loseTag(n.explanation) && n.explanation.tier === 'review'" class="tag" :class="{ hard: isHardTag(n.explanation.lose_kind) }">{{
                     loseTag(n.explanation)
                   }}</span>
-                  {{ n.explanation.lose }}
+                  {{ loseText(n, n.explanation) }}
                 </dd>
                 <dt>建议</dt>
                 <dd>
-                  <b class="lead">{{ adviceOf(n.explanation).head }}。</b>{{ adviceOf(n.explanation).detail }}
+                  <b class="lead">{{ adviceOf(n, n.explanation).head }}。</b>{{ adviceOf(n, n.explanation).detail }}
                 </dd>
+                <template v-if="canAdd(n)">
+                  <dt>清理</dt>
+                  <dd class="add">
+                    <span v-if="addWhy[n.path] && addWhy[n.path] !== '…'" class="tag plain">{{ addWhy[n.path] }}</span>
+                    <template v-else-if="inCleanup(n)">
+                      <span class="added">已加入</span><button class="link small" @click="page = 'cleanup'">去清理</button>
+                    </template>
+                    <button v-else class="link small" :disabled="addWhy[n.path] === '…'" @click="addPathToCleanup(n)">加入清理</button>
+                  </dd>
+                </template>
                 <template v-if="n.explanation.clues.length">
                   <dt>线索</dt>
                   <dd>{{ n.explanation.clues.join("；") }}</dd>
                 </template>
-                <template v-if="n.explanation.source.kind === 'unknown' && llmReady">
+                <template v-if="canAsk(n)">
                   <dt>问 AI</dt>
-                  <dd>
-                    <button v-if="!aiOf(n.path)" class="link small" @click="doAsk(n)">问 AI</button>
-                    <template v-else-if="typeof aiOf(n.path) === 'string'">{{ aiOf(n.path) }}</template>
-                    <template v-else>{{ (aiOf(n.path) as Explanation).what }} · {{ (aiOf(n.path) as Explanation).lose }}</template>
+                  <dd class="ask">
+                    <button v-if="!askState(n)" class="link small" @click="doAsk(n)">问 AI</button>
+                    <span v-else-if="askState(n) === '…'" class="asking" role="status" aria-label="正在问 AI"><i></i><i></i><i></i></span>
+                    <template v-else>
+                      <span class="ask-err">{{ askState(n) }}</span><button class="link small" @click="doAsk(n)">重试</button>
+                    </template>
                   </dd>
                 </template>
               </dl>
@@ -641,12 +751,13 @@ onBeforeUnmount(() => {
   width: auto;
   flex: 1;
 }
+/* 高度至少 64（线索长了折成两三行时往下长，不截断）；底下留 4px：一行线索时总高正好还是 64 */
 .lh {
-  height: 64px;
+  min-height: 64px;
   flex: none;
   display: flex;
   flex-direction: column;
-  padding: 10px 4px 0;
+  padding: 10px 4px 4px;
   border-bottom: 1px solid var(--line2);
   min-width: 0;
 }
@@ -656,25 +767,38 @@ onBeforeUnmount(() => {
   gap: 12px;
   min-width: 0;
 }
-/* 当前展开的文件夹自己认不出来：标题下面一行灰色小字写它的第一条线索 */
+/* 当前展开的文件夹自己认不出来：标题下面灰色小字写它的第一条线索（阶段 L：写全，长了就折行，不用省略号） */
 .lh .clue {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   margin-top: 1px;
   min-width: 0;
   font-size: var(--fs-meta);
   line-height: 18px;
   color: var(--ink3);
-  white-space: nowrap;
 }
 .lh .clue svg {
   flex: none;
+  margin-top: 2.5px;
 }
 .lh .clue span {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+/* 问过 AI 的：小标签代替灯泡（标签和第一行字一样高，对齐第一行） */
+.lh .clue.ai {
+  gap: 7px;
+  color: var(--ink2);
+}
+.lh .clue.ai .tag {
+  flex: none;
+  min-width: auto;
+  user-select: none;
+}
+[data-theme="C"] .lh .clue.ai > span:not(.tag) {
+  padding-top: 1px;
 }
 .lh h2 {
   font-family: var(--heading);
@@ -747,6 +871,22 @@ onBeforeUnmount(() => {
   color: var(--ink3);
   white-space: nowrap;
   padding: 0 10px 0 8px;
+}
+/* 问过 AI 的：「✦ AI 推测」（中性灰，比「混合 N 项」深一级） */
+.li .c.ai {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink2);
+}
+.li .c.ai .ai-star {
+  color: var(--ink3);
+}
+[data-theme="C"] .li .c.ai {
+  color: var(--ink2);
+}
+[data-theme="C"] .li .c.ai .ai-star {
+  color: #141412;
 }
 .li .br {
   height: 4px;
@@ -839,6 +979,25 @@ onBeforeUnmount(() => {
 .detail dd .tag {
   margin-right: 6px;
 }
+/* 「这是什么」「删了会怎样」是 AI 推测：标签在前，推测的字折行时和第一行对齐（不钻到标签下面） */
+.detail dd.aiw {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+}
+.detail dd.aiw .tag {
+  margin: 0.5px 0 0;
+}
+[data-theme="C"] .detail dd.aiw .tag {
+  margin-top: -0.5px;
+}
+.detail dd.aiw .tag.ghost {
+  visibility: hidden;
+}
+.detail dd.aiw > span:not(.tag) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .detail dd .lead {
   color: var(--ink);
   font-weight: var(--w-semi);
@@ -850,6 +1009,57 @@ onBeforeUnmount(() => {
 }
 .link.small {
   font-size: var(--fs-meta);
+}
+/* 手动问 AI：正在问 = 三个轮流变深的小点；出错 = 后端给的一句短话 + 「重试」 */
+.detail dd.add {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.detail dd.add .added {
+  color: var(--ink2);
+}
+.detail dd.ask {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  column-gap: 12px;
+  row-gap: 2px;
+}
+.ask-err {
+  color: var(--ink2);
+  overflow-wrap: anywhere;
+}
+.asking {
+  display: inline-flex;
+  gap: 4px;
+  height: 19px;
+  align-items: center;
+}
+.asking i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--ink3);
+  opacity: 0.35;
+  animation: ask-dot 1.1s var(--ease) infinite;
+}
+.asking i:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.asking i:nth-child(3) {
+  animation-delay: 0.36s;
+}
+@keyframes ask-dot {
+  30% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .asking i {
+    animation: none;
+    opacity: 0.7;
+  }
 }
 
 /* ───────── 窄窗口 / 竖屏（阶段 J §3.7）：方块图在上、列表在下。方块图的高度固定（约可用高度的 58%，有下限），
@@ -876,11 +1086,11 @@ onBeforeUnmount(() => {
     min-height: 0;
   }
   .lh {
-    height: 48px;
+    min-height: 48px;
     padding-top: 4px;
   }
   .lh.hasclue {
-    height: 66px;
+    min-height: 66px;
   }
 }
 /* 更窄：副栏换行，面包屑独占一行 */
@@ -893,10 +1103,19 @@ onBeforeUnmount(() => {
   .crumb {
     flex: 1 1 100%;
   }
+  /* 图例、AI 小标签靠左（小标签在图例右边，出现 / 消失时图例不挪），视图切换靠右 */
   .tools {
     margin-left: 0;
     flex: 1 1 100%;
-    justify-content: space-between;
+    justify-content: flex-start;
+    gap: 10px;
+  }
+  .tools .ai-chip {
+    order: 1;
+  }
+  .tools .seg-t {
+    order: 2;
+    margin-left: auto;
   }
   .lg-pop {
     right: auto;

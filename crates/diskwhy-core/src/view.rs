@@ -239,6 +239,9 @@ pub struct TreemapNode {
     /// 因为太小 / 太多没有发过来的子项合计（前端画成“其他”）。
     pub hidden_bytes: u64,
     pub hidden_count: usize,
+    /// AI 推测（只在 tier = "unknown" 且问过 AI 时有；档位 / 颜色照旧是 unknown）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<explain::AiNote>,
 }
 
 fn unknown_category() -> explain::Category {
@@ -268,7 +271,7 @@ fn tm_node(
     ctx: Option<&ExplainCtx>,
 ) -> TreemapNode {
     let _ = result;
-    let (tier, what, owner, lose_kind, lose_short, category) = match ctx {
+    let (tier, what, owner, lose_kind, lose_short, category, ai) = match ctx {
         Some(ctx) => {
             let t = Target { node: n, path, parent: ancestors.last().copied(), ancestors };
             let e = match inherited {
@@ -285,9 +288,9 @@ fn tm_node(
                     explain::Tier::Keep => "keep",
                 }
             };
-            (tier.to_string(), e.what, e.owner, e.lose_kind, e.lose_short, e.category)
+            (tier.to_string(), e.what, e.owner, e.lose_kind, e.lose_short, e.category, e.ai)
         }
-        None => ("unknown".to_string(), String::new(), None, None, None, explain::Category::Unknown),
+        None => ("unknown".to_string(), String::new(), None, None, None, explain::Category::Unknown, None),
     };
     TreemapNode {
         name: n.name.clone(),
@@ -310,6 +313,7 @@ fn tm_node(
         children: Vec::new(),
         hidden_bytes: 0,
         hidden_count: 0,
+        ai,
     }
 }
 

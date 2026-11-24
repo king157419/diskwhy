@@ -27,7 +27,6 @@ import {
   remainSecs,
   remainText,
   shortPath,
-  skipHeadline,
   skipRows,
   skipSummary,
   stashFolder,
@@ -37,6 +36,7 @@ import {
 import {
   authorizeStash,
   candidates,
+  checkedBytes,
   checkProgress,
   chooseDest,
   closeBlockedAt,
@@ -44,6 +44,7 @@ import {
   dest,
   elevating,
   execError,
+  execEstSecs,
   execPhase,
   execProg,
   execResult,
@@ -51,8 +52,10 @@ import {
   finishExec,
   groupCat,
   page,
+  rechecking,
   runExec,
   scanRoot,
+  okStashDrives,
   stashDrives,
   stopExec,
   summary,
@@ -110,10 +113,12 @@ const live = computed(() => R.value.items.filter((i) => !i.blocked && (pending.v
 const check = computed(() => checkLine(checkProgress.value));
 const blocked = computed(() => R.value.items.filter((i) => i.blocked));
 
+/** 走「需你判断」去向的：需你判断的项 + 强制加入的（keep / 认不出来 / 不建议直接删的，只进回收站 / 暂存区） */
+const isReviewLike = (i: ItemReport) => i.tier !== "safe" || !!i.forced;
 /** 需你判断的项：按候选组合并（一组可能有好几个位置） */
 const reviewRows = computed(() => {
   const m = new Map<string, { key: string; name: string; lose: LoseKind | null; short: string | null; bytes: number }>();
-  for (const it of live.value.filter((i) => i.tier === "review")) {
+  for (const it of live.value.filter(isReviewLike)) {
     const g = groupOf(it.path);
     const key = g?.key ?? it.path;
     const cur = m.get(key) ?? { key, name: g?.name ?? it.what, lose: g?.lose_kind ?? null, short: g ? loseTag(g) : null, bytes: 0 };
@@ -126,7 +131,7 @@ const reviewRows = computed(() => {
 /** 可放心清理：按分类一行 */
 const safeCats = computed(() => {
   const m = new Map<CleanCat, { cat: CleanCat; items: { name: string; bytes: number; key: string }[]; bytes: number }>();
-  for (const it of live.value.filter((i) => i.tier === "safe")) {
+  for (const it of live.value.filter((i) => !isReviewLike(i))) {
     const g = groupOf(it.path);
     const cat: CleanCat = g ? groupCat(g) : "sys";
     const cur = m.get(cat) ?? { cat, items: [], bytes: 0 };
@@ -140,7 +145,6 @@ const safeCats = computed(() => {
   return [...m.values()].sort((a, b) => b.bytes - a.bytes);
 });
 
-const itemCount = computed(() => reviewRows.value.length + safeCats.value.reduce((a, c) => a + c.items.length, 0));
 const hasReview = computed(() => reviewRows.value.length > 0);
 
 // ── 去向（§3.1）──
@@ -248,7 +252,6 @@ const lowSpace = computed(() => R.value.warnings.find((w) => w.code === "recycle
 
 // ── 跳过（解释 30.1 → 29.3）──
 const skip = computed(() => skipSummary(R.value));
-const skipText = computed(() => skipHeadline(skip.value));
 /** 展开后按项列（同名的组合并，跳过字节多的在前，最多 12 行）：「Chrome 缓存  正在使用 4 · 刚改过 2」 */
 const skipItems = computed(() => {
   const m = new Map<string, { name: string; bytes: number; reasons: Record<string, number> }>();
@@ -284,6 +287,15 @@ const freesBytes = computed(() => {
   return bd.permanent.bytes + q;
 });
 const est = computed(() => (pending.value || !rep.value ? "" : estText(R.value.est_secs ?? 0)));
+/** 大数字 = 清理页的「已选」（同一个数）；界面重载后重新附着、没有勾选时退回预检的总数 */
+const selTotal = computed(() => checkedBytes.value || R.value.total_bytes);
+/** 检查完真能处理的比已选少（有在用 / 刚改过的会跳过）：一行小字「实际 28.1 GB · 正在使用」，不再出第二个大数字 */
+const actualText = computed(() => {
+  if (pending.value || !rep.value) return "";
+  const a = gbNum(R.value.total_bytes);
+  if (a === gbNum(selTotal.value) && !skip.value.bytes) return "";
+  return [`实际 ${a} GB`, skip.value.main].filter(Boolean).join(" · ");
+});
 
 const canRun = computed(
   () =>
@@ -291,6 +303,7 @@ const canRun = computed(
     !!rep.value &&
     !pending.value &&
     R.value.can_execute &&
+    !rechecking.value &&
     !blocking.value.length &&
     !stashBlocked.value &&
     live.value.length > 0 &&
@@ -316,9 +329,14 @@ watch(
   },
   { immediate: true },
 );
+/** 剩余时间：按滑窗速率算；刚开始（前 2 秒、还算不出速率）先用预检估的用时减去已经过去的 */
 const remain = computed(() => {
   const p = execProg.value;
-  return p ? remainText(remainSecs(samples.value, p.cost_total), pct.value) : "";
+  if (!p) return "";
+  const r = remainSecs(samples.value, p.cost_total);
+  if (r !== null) return remainText(r, pct.value);
+  if (execEstSecs.value > 0) return remainText(Math.max(5, execEstSecs.value - p.elapsed_ms / 1000), pct.value);
+  return "";
 });
 /** 条下一行：已处理 12.3 / 29.3 GB · 4.1 万 / 39.6 万个 */
 const doneLine = computed(() => {
@@ -418,6 +436,7 @@ function close() {
         <div class="m-top"><h2>正在清理</h2></div>
         <div class="m-total">
           <span class="v num pct">{{ pctText(pct) }}<small>%</small></span>
+          <span v-if="remain && !execStopping" class="after"><b class="remain-big num">{{ remain }}</b></span>
         </div>
         <div class="prog" role="progressbar" :aria-valuenow="Math.floor(pct)" aria-valuemin="0" aria-valuemax="100" :aria-valuetext="pctText(pct) + '%'">
           <i :style="{ width: pct + '%' }"></i>
@@ -429,8 +448,6 @@ function close() {
             <span v-if="nudge" class="hint" role="status">稍等再关</span>
           </template>
           <template v-else>
-            <span v-if="remain" class="remain num">{{ remain }}</span>
-            <i v-if="remain" class="sep">·</i>
             <button class="stop" :class="{ nudge }" @click="stopExec">停止</button>
             <span v-if="nudge" class="hint" role="status">先停止再关</span>
           </template>
@@ -441,11 +458,11 @@ function close() {
       <!-- ───── 确认 ───── -->
       <template v-else>
         <div class="m-top">
-          <h2>清理 <span class="num">{{ itemCount }}</span> 项</h2>
+          <h2>确认清理</h2>
           <button class="x" aria-label="取消" @click="close"><svg class="i" viewBox="0 0 24 24"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
         </div>
         <div class="m-total">
-          <span class="v num" :class="{ est: pending }">{{ gbNum(R.total_bytes) }}<small>GB</small></span>
+          <span class="v num">{{ gbNum(selTotal) }}<small>GB</small></span>
           <span class="after">
             {{ dname }}剩余
             <b class="num">{{ gbNum(free) }}<template v-if="freesBytes > 0"> → {{ gbNum(free + freesBytes) }}</template> GB</b>
@@ -520,7 +537,7 @@ function close() {
             </div>
             <template v-for="c in safeCats" :key="c.cat">
               <button class="m-row" :aria-expanded="openCat === c.cat" @click="openCat = openCat === c.cat ? null : c.cat">
-                <span class="dot safe"></span><span class="n">{{ CLEAN_CAT_NAME[c.cat] }}</span><span class="c num">{{ c.items.length }} 项</span>
+                <span class="dot safe"></span><span class="n">{{ CLEAN_CAT_NAME[c.cat] }}</span>
                 <span class="s num">{{ size(c.bytes) }}</span>
                 <span class="chev"><svg class="i" viewBox="0 0 24 24"><path :d="openCat === c.cat ? 'm6 9 6 6 6-6' : 'm9 18 6-6-6-6'" /></svg></span>
               </button>
@@ -533,13 +550,13 @@ function close() {
             <span class="spin" aria-hidden="true"></span><span class="num">{{ check.text }}</span>
             <span class="cbar"><i :style="{ width: check.pct + '%' }"></i></span>
           </div>
-          <button v-else-if="skipText" class="m-skip" :aria-expanded="skipOpen" @click="skipOpen = !skipOpen">
-            <b class="num">{{ skipText }}</b>
+          <button v-else-if="actualText" class="m-skip" :aria-expanded="skipOpen" @click="skipOpen = !skipOpen">
+            <b class="num">{{ actualText }}</b>
             <svg class="i" viewBox="0 0 24 24"><path :d="skipOpen ? 'm6 9 6 6 6-6' : 'm9 18 6-6-6-6'" /></svg>
           </button>
           <div v-if="skipOpen && !pending" class="m-sub reasons">
             <span v-for="s in skip.rows" :key="s.code" :title="s.tip">
-              <i>{{ s.label }}</i><em class="num">{{ s.count ? n(s.count) + (s.code === "blocked" ? " 项" : " 个") : "" }}</em><b class="num">{{ s.bytes ? size(s.bytes) : "" }}</b>
+              <i>{{ s.label }}</i><em></em><b class="num">{{ s.bytes ? size(s.bytes) : "" }}</b>
             </span>
             <div v-if="R.locked_processes.length || blocked.length || skipItems.length" class="details">
               <span v-if="R.locked_processes.length" class="procs"><i>占用的程序</i><em>{{ [...new Set(R.locked_processes.map((p) => p.name))].join("、") }}</em></span>
@@ -564,7 +581,7 @@ function close() {
         <!-- 回收站在所扫的盘上、这个盘又快满了：「改放 D 盘」只对需你判断的有意义（可放心清理不进暂存区） -->
         <div v-if="lowSpace && !isStash && (hasReview || safeToBin)" class="act-row" :title="lowSpace.message">
           <span>回收站不腾空间</span>
-          <button v-if="hasReview && stashDrives.length" class="chip" @click="pick('stash', stashDrives[0].root)">改放 {{ driveName(stashDrives[0].root) }}</button>
+          <button v-if="hasReview && okStashDrives.length" class="chip" @click="pick('stash', okStashDrives[0].root)">改放 {{ driveName(okStashDrives[0].root) }}</button>
         </div>
         <div v-for="w in notes" :key="w.key" class="note" :title="w.tip">{{ w.text }}</div>
         <div v-for="w in blocking" :key="w.key" class="act-row warn-row" :title="w.tip">
@@ -579,12 +596,15 @@ function close() {
             <svg v-if="ack" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
           </button>
           <span>我知道这些删了的后果</span>
-          <span class="c"><span class="num">{{ reviewRows.length }}</span> 项需你判断</span>
         </div>
-        <button class="btn go" :disabled="!canRun" :aria-busy="pending" @click="run">
+        <button class="btn go" :disabled="!canRun" :aria-busy="pending || rechecking" @click="run">
           <template v-if="pending">正在检查…</template>
           <template v-else>
-            清理 <span class="num">{{ gbNum(R.total_bytes) }} GB</span><span v-if="est" class="est-t">{{ est }}</span>
+            开始清理
+            <span v-if="rechecking" class="est-t"><span class="spin" aria-hidden="true"></span></span>
+            <span v-else-if="est" class="est-t" :title="'预计用时' + est"
+              ><svg class="clk" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>预计{{ est }}</span
+            >
           </template>
         </button>
       </template>
@@ -1152,20 +1172,36 @@ function close() {
   width: 100%;
   height: 50px;
 }
-/* 主按钮旁的预计时间：同一颗按钮里的浅色小字 */
+/* 主按钮里的预计用时：「⏱ 预计约 2 分钟」，一条细竖线隔开，比按钮字小一号但看得清 */
 .btn .est-t {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-family: var(--ui);
-  font-size: var(--fs-sub);
-  font-weight: var(--w-med);
-  opacity: 0.66;
+  font-size: 15px;
+  font-weight: var(--w-semi);
+  opacity: 0.9;
   margin-left: 14px;
   padding-left: 14px;
   border-left: 1px solid currentColor;
   line-height: 1;
   letter-spacing: 0;
 }
-[data-theme="C"] .btn .est-t {
+.btn .est-t .clk {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.btn .est-t .spin {
+  border-color: currentColor;
+  border-top-color: transparent;
   opacity: 0.8;
+}
+[data-theme="C"] .btn .est-t {
   border-left-color: rgba(212, 242, 76, 0.45);
 }
 
@@ -1231,9 +1267,12 @@ function close() {
   font-size: var(--fs-body);
   color: var(--ink2);
 }
-.run-line .remain {
+/* 执行中大数字右边的剩余时间（刚开始用预检估的用时，之后按实际速率） */
+.m-total .after .remain-big {
+  font-size: 20px;
+  font-weight: var(--w-semi);
   color: var(--ink);
-  font-weight: var(--w-med);
+  margin-left: 0;
 }
 .run-line .stopping {
   color: var(--ink2);

@@ -1092,3 +1092,61 @@ pub fn grant_modify_plain_dir(dir: &str, sid: &str) -> Result<(), u32> {
     unsafe { CloseHandle(h) };
     r
 }
+
+/// 正在运行的一个进程（映像路径小写，用来判断“某个文件夹里有没有程序正在运行”）。
+#[derive(Debug, Clone)]
+pub struct RunningImage {
+    pub pid: u32,
+    pub name: String,
+    /// 完整路径（小写，Win32 形式，去掉 `\\?\` 前缀）。
+    pub path_lower: String,
+}
+
+/// 一次性拍下所有正在运行进程的映像路径（ToolHelp 列进程 + QueryFullProcessImageNameW 取完整路径）。
+/// 打不开的进程（系统进程、别的用户的提权进程）跳过：它们不会从用户的缓存 / 临时文件夹里运行。
+pub fn running_images() -> Vec<RunningImage> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return out;
+        }
+        let mut pe: PROCESSENTRY32W = zeroed();
+        pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut pe) != 0;
+        while ok {
+            let pid = pe.th32ProcessID;
+            if pid != 0 {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if !h.is_null() {
+                    let mut buf = vec![0u16; 2048];
+                    let mut n = buf.len() as u32;
+                    if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) != 0 && n > 0 {
+                        let path = strip_verbatim(&String::from_utf16_lossy(&buf[..n as usize]));
+                        out.push(RunningImage { pid, name: from_wide_nul(&pe.szExeFile), path_lower: path.to_lowercase() });
+                    }
+                    CloseHandle(h);
+                }
+            }
+            ok = Process32NextW(snap, &mut pe) != 0;
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+/// `root`（小写比较）里面正在运行的进程。
+pub fn images_under(images: &[RunningImage], root: &str) -> Vec<LockingProcess> {
+    let r = root.trim_end_matches('\\').to_lowercase();
+    if r.is_empty() {
+        return Vec::new();
+    }
+    let pre = format!("{r}\\");
+    images
+        .iter()
+        .filter(|i| i.path_lower == r || i.path_lower.starts_with(&pre))
+        .map(|i| LockingProcess { pid: i.pid, name: i.name.clone(), service: String::new() })
+        .collect()
+}

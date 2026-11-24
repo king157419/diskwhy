@@ -1,0 +1,92 @@
+# 旧版本：软件自动更新时把每个新版本放进一个新文件夹，旧的不删，越堆越多。
+# 每条规则都写了 keep_latest：同一个文件夹里版本号最新（或最近刚改过）的那一份算“正在用的版本”，不能删；
+# 其余的才是这里说的“旧版本”。删的时候旧版本文件夹里只要有一个文件被占用，整个文件夹都跳过，不会只删一半。
+# 文案均为 DiskWhy 自己撰写（MIT）。
+
+[[rule]]
+id = "claude-code-old-versions"
+owner = "Claude Code（Claude 桌面版自带）"
+category = "app"
+tier = "safe"
+kind = "dir"
+keep_latest = 1
+match = [
+  '%APPDATA%\Claude\claude-code\*',
+  '%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code\*',
+]
+what = "Claude 桌面版自带的 Claude Code 的旧版本"
+why = "Claude 桌面版把它自带的 Claude Code 每个版本放进一个版本号文件夹（里面是 <哈希>\\claude.exe），更新后旧版本的文件夹还留着，每个约 280 MB。本机看到 2.1.308 和 2.1.309 两个，正在运行的 claude.exe 都来自 2.1.309（版本号最新的那个）。商店版 Claude 的这个文件夹实际存在 Packages\\Claude_…\\LocalCache\\Roaming\\Claude\\claude-code"
+lose = "不影响正在用的版本；旧版本删了就回不去了，一般用不到。还开着的、更新前就打开的 Claude Code 会话如果还在用旧版本，DiskWhy 会整个跳过它。"
+how = "delete"
+how_detail = "直接删除。"
+refs = ["https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes"]
+verified_on = "2026-11-02"
+
+[[rule]]
+id = "codex-runtimes-previous"
+owner = "Codex 桌面版 / ChatGPT 桌面版（OpenAI）"
+category = "app"
+tier = "safe"
+kind = "dir"
+keep_latest = 1
+match = ['%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime.previous-*']
+what = "Codex 主运行时每次刷新时留下的上一版"
+why = "Codex App 自己安装和刷新 .cache\\codex-runtimes 里的主运行时（openai/codex issue #29597）。每刷新一次，旧的就改名成 codex-primary-runtime.previous-<GUID> 留在旁边，从不清理：本机有 7 个，约 670 MB。正在用的是没有 .previous 的 codex-primary-runtime（本机运行中的 node.exe 就在它里面），不归这条规则管；.previous 里面最新的一个也先留着，以防刷新出问题要回退"
+lose = "不影响正在用的版本；旧版本删了就回不去了，一般用不到。"
+how = "delete"
+how_detail = "直接删除。"
+refs = ["https://github.com/openai/codex/issues/29597"]
+verified_on = "2026-11-02"
+
+[[rule]]
+id = "codex-command-runner-old"
+owner = "Codex（OpenAI，Windows 沙盒）"
+category = "app"
+tier = "safe"
+kind = "file"
+keep_latest = 2
+match = ['%USERPROFILE%\.codex\.sandbox-bin\codex-command-runner-*.exe']
+what = "Codex 沙盒辅助程序的旧版本"
+why = "Codex 在 Windows 上跑命令时，把沙盒辅助程序复制到 .codex\\.sandbox-bin，名字带版本号（codex-command-runner-<版本>.exe），每升级一次多一个，旧的不删：本机有 31 个，从 0.125 到 0.166。桌面版和命令行版可能各用各的版本，所以这里留版本号最新的两个（再加上最近刚复制进来的那个）。缺了的话 Codex 下次用沙盒时会重新复制（openai/codex 的提交 #13413：复制到 CODEX_HOME 失败时退回安装包里的那份）"
+lose = "不影响正在用的版本；旧版本删了就回不去了，一般用不到。"
+how = "delete"
+how_detail = "直接删除。"
+refs = [
+  "https://github.com/openai/codex/issues/38665",
+  "https://github.com/openai/codex/issues/36865",
+]
+verified_on = "2026-11-02"
+
+[[rule]]
+id = "codex-cua-node-old"
+owner = "Codex 桌面版（OpenAI）"
+category = "app"
+tier = "safe"
+kind = "dir"
+keep_latest = 1
+when_child = ["manifest.json"]
+match = ['%LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node\*']
+what = "Codex 桌面版“操控电脑”功能用的 Node 运行时的旧版本"
+why = "每个按哈希命名的文件夹是一个版本的运行时，里面的 manifest.json 写着版本（本机：0.0.35 和 0.0.30）。正在运行的 node_repl.exe 等都来自最新的那个，旧的更新后没有删"
+lose = "不影响正在用的版本；旧版本删了就回不去了，一般用不到。"
+how = "delete"
+how_detail = "直接删除。"
+refs = ["https://github.com/openai/codex/issues/42412"]
+verified_on = "2026-11-02"
+
+[[rule]]
+id = "wps-office-old-versions"
+owner = "WPS Office"
+category = "app"
+tier = "safe"
+kind = "dir"
+keep_latest = 1
+when_child = ["office6"]
+match = ['%LOCALAPPDATA%\Kingsoft\WPS Office\*.*.*.*']
+what = "WPS Office 升级后留下的旧版本"
+why = "WPS 每次升级在这里建一个新的版本号文件夹（如 12.1.0.29162），旧的那个留着不删，一个约 1.6 GB。正在用的版本登记在注册表 HKCU\\Software\\Kingsoft\\Office\\6.0\\Common 的 InstallRoot / Version，卸载信息里的 LocationRoot 也指向它；本机是 12.1.0.29162（正在运行的 wps.exe 都来自这里，版本号也最新），旧的 12.1.0.28485 在注册表里只记成 updateinfo 的 LastOldVersion"
+lose = "不影响正在用的版本；旧版本删了就回不去了，一般用不到。"
+how = "delete"
+how_detail = "直接删除。"
+refs = []
+verified_on = "2026-11-02"

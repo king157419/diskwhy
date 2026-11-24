@@ -20,7 +20,27 @@
 //! kind = "any"            # any（默认）| dir | file
 //! when_child = ["Cache_Data"]   # 目录里必须有其中之一（名字，大小写不敏感）才算命中
 //! owner_from_path = false # true 时用注册表 / 文件夹名推断具体是哪个软件
+//! keep_latest = 1         # 旧版本规则：同一父文件夹里留最新的 N 个版本（见下）
+//! min_age_days = 7        # 只删 N 天以上没改过的（临时文件夹用，见下）
 //! ```
+//!
+//! `min_age_days = N`（N ≥ 1，可选，只能用在 `scope = tree`、`how` 含 `delete` 的规则上）：命中的文件夹 F 不再整个算能删，
+//! 而是 F 下面每个**直接子项**单独看——文件看它自己的修改时间，子文件夹看它整棵子树里最新的修改时间——N 天内都没改过的
+//! 才能删。清理页的“能腾出”只算这些旧的（按扫描树里的修改时间估）；预检和执行开始时按每个文件真实的修改时间再查一遍，
+//! 子项里有一个文件是 N 天内改的、被占用、或者有程序正从里面运行，这个子项整个跳过（[`crate::action::preflight::skip_busy_units`]）。
+//!
+//! `keep_latest = N`（N ≥ 1，可选，“旧版本”规则用）：每个模式的**最后一段必须带通配**（`*` / `?`，不能是 `**`），
+//! 同一个父文件夹里会命中好几个兄弟（每个版本一个）。同一个父文件夹里、最具体命中的规则**正是这一条**的兄弟中，
+//! 下面这些算“正在用的版本”，一律当 keep（固定说法「正在用的版本」，不能删、不进清理页），其余的才按规则自己的
+//! 档位和文案（一般是 safe、“旧版本……”）：
+//! - 按版本号最高的 N 个（数字段按数字比：1.10 > 1.9，app-10.0.0 > app-2.0.0；先去掉兄弟们共同的前缀 / 后缀，
+//!   剩下的必须以 `1.2`、`v1.2.3`、`1.2.3-beta.1` 这样至少两段数字开头；正式版高于同号的预发布版）；
+//! - 有任何一个兄弟的名字不像版本号（哈希、GUID 之类）：改按修改时间，最新的 N 个；
+//! - 另外，修改时间最新的那一个兄弟永远算“正在用”。
+//!
+//! 看不到兄弟（比如扫描根就是这个文件夹）时当“正在用”。正在用的版本文件夹里面的东西也跟着当 keep。
+//! 删除时（预检和执行开始各查一次）旧版本文件夹里只要有一个文件被占用（Restart Manager）或 30 分钟内改过，
+//! 整个文件夹都跳过，不会只删一半（[`crate::action::preflight::skip_busy_units`]）。
 //!
 //! `lose_kind`（界面上的后果标签，一项只挂一个，按最坏的选）：
 //! irreversible（找不回来）> repair（影响修复）> unsure（需你确认）> reinstall（要重装）>
@@ -55,6 +75,7 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("ai-models", include_str!("../../../../rules/ai-models.toml")),
     ("cn-apps", include_str!("../../../../rules/cn-apps.toml")),
     ("misc", include_str!("../../../../rules/misc.toml")),
+    ("old-versions", include_str!("../../../../rules/old-versions.toml")),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -113,6 +134,12 @@ pub struct RuleDef {
     pub when_child: Vec<String>,
     #[serde(default)]
     pub owner_from_path: bool,
+    /// 旧版本规则：同一父文件夹里留最新的几个版本（见文件头）。
+    #[serde(default)]
+    pub keep_latest: Option<u32>,
+    /// 只删 N 天以上没改过的直接子项（见文件头）。
+    #[serde(default)]
+    pub min_age_days: Option<u32>,
 }
 
 impl RuleDef {
@@ -152,6 +179,10 @@ pub struct Rule {
     pub kind: KindFilter,
     pub when_child: Vec<String>,
     pub owner_from_path: bool,
+    /// 旧版本规则：同一父文件夹里留最新的几个版本（None = 普通规则）。
+    pub keep_latest: Option<u32>,
+    /// 只删 N 天以上没改过的直接子项（None = 不看年龄）。
+    pub min_age_days: Option<u32>,
 }
 
 /// 规则集合 + 展平的已编译模式表。
@@ -259,6 +290,37 @@ pub fn validate(def: &RuleDef, seen_ids: &mut HashSet<String>) -> Vec<String> {
     if !def.when_child.is_empty() && def.kind == KindFilter::File {
         e.push("when_child 只能用于目录规则".into());
     }
+    if let Some(n) = def.keep_latest {
+        if n == 0 {
+            e.push("keep_latest 至少是 1（至少留一个正在用的版本）".into());
+        }
+        if def.tier == Tier::Keep {
+            e.push("keep 档不用写 keep_latest（本来就都不删）".into());
+        }
+        for p in &def.patterns {
+            let last = split_lower(p).pop().unwrap_or_default();
+            if last == "**" || !(last.contains('*') || last.contains('?')) {
+                e.push(format!("keep_latest 的模式 `{p}` 最后一段必须带通配（* 或 ?，不能是 **）：一个版本一个兄弟"));
+            }
+        }
+    }
+    if let Some(n) = def.min_age_days {
+        if n == 0 {
+            e.push("min_age_days 至少是 1".into());
+        }
+        if def.scope != Scope::Tree {
+            e.push("min_age_days 只能用在 scope = tree 的规则上（按里面每个子项的年龄挑）".into());
+        }
+        if def.kind == KindFilter::File {
+            e.push("min_age_days 只能用于文件夹规则".into());
+        }
+        if !how.contains(&How::Delete) {
+            e.push("min_age_days 只对能直接删的规则有意义（how 要含 delete）".into());
+        }
+        if def.keep_latest.is_some() {
+            e.push("min_age_days 和 keep_latest 不能写在同一条规则上".into());
+        }
+    }
     for p in &def.patterns {
         if p.contains("..") {
             e.push(format!("模式 `{p}` 不能含 .."));
@@ -341,6 +403,8 @@ impl RuleSet {
             kind: def.kind,
             when_child: def.when_child,
             owner_from_path: def.owner_from_path,
+            keep_latest: def.keep_latest,
+            min_age_days: def.min_age_days,
         };
         // 环境变量在本机不存在的模式直接跳过（比如 32 位系统没有 ProgramFiles(x86)）。
         for raw in &rule.raw_patterns {

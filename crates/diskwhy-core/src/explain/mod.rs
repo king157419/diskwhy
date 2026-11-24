@@ -5,8 +5,12 @@
 //!    `scope = "tree"` 的规则（“继承”）。
 //! 2. 启发式（[`heuristics`]）：目录内容签名 → 注册表归属 → 年龄提示。结果只能是 review / keep。
 //! 3. 都不行：`source = Unknown`，把看到的线索列出来。
-//! 4. LLM 兜底（[`llm`]）只在用户点“问 AI”时调用，不在这里自动跑。
+//! 4. LLM 兜底（[`llm`]）不在这里调用。扫描完由界面壳在后台把认不出的大项问 AI（[`ai_batch`]），
+//!    答案存在 [`ai_store::AiStore`]（`ExplainCtx.ai`）；这里只在最后结果是“未知”时把存好的答案附在
+//!    `Explanation.ai` 上——档位、来源、分类、后果、能腾多少全都不变。
 
+pub mod ai_batch;
+pub mod ai_store;
 pub mod big_items;
 pub mod candidates;
 pub mod env;
@@ -15,15 +19,18 @@ pub mod llm;
 pub mod pattern;
 pub mod registry;
 pub mod rules;
+pub mod versions;
 
 use crate::model::{Node, NodeKind};
 use crate::view::human_bytes;
+pub use ai_store::{ai_candidates, AiNote, AiStore};
 use env::EnvMap;
 use llm::LlmSettings;
 use pattern::split_lower;
 use registry::RegistrySnapshot;
 use rules::{InheritedHit, Rule, RuleSet, Scope};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// 三档。未知目录也是 `Review`（界面上用 `source = Unknown` 区分成灰色）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -170,6 +177,9 @@ pub struct Explanation {
     pub notes: Vec<String>,
     /// 线索（启发式 / 未知时列出看到了什么）。
     pub clues: Vec<String>,
+    /// AI 推测（只在 `source = Unknown` 且自动识别 / 手动“问 AI”问过这个路径时有；其余字段照旧是“未知”的样子）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<AiNote>,
 }
 
 impl Explanation {
@@ -189,6 +199,8 @@ pub struct ExplainCtx {
     protected: Vec<Vec<String>>,
     /// 当前时间（Unix 秒），测试可固定。
     pub now: i64,
+    /// AI 答案缓存（复制上下文时共用同一份，换设置后答案还在）。
+    pub ai: Arc<AiStore>,
 }
 
 /// 受保护的用户目录名（%USERPROFILE% 之下）。
@@ -219,10 +231,10 @@ impl ExplainCtx {
                 protected.push(split_lower(&format!("{public}\\{d}")));
             }
         }
-        ExplainCtx { env, rules, registry, settings, protected, now: now_unix() }
+        ExplainCtx { env, rules, registry, settings, protected, now: now_unix(), ai: Arc::new(AiStore::memory()) }
     }
 
-    /// 生产用：当前进程环境变量 + 内置规则 + 用户自定义规则目录 + 注册表 + settings.json。
+    /// 生产用：当前进程环境变量 + 内置规则 + 用户自定义规则目录 + 注册表 + settings.json + ai-cache.json。
     /// 返回 (ctx, 警告列表)。内置规则校验失败会被当作警告返回（测试会拦住这种情况）。
     pub fn load_default() -> (Self, Vec<String>) {
         let env = EnvMap::from_process();
@@ -232,7 +244,9 @@ impl ExplainCtx {
         }
         let registry = RegistrySnapshot::load();
         let settings = LlmSettings::load();
-        (ExplainCtx::new(env, rules, registry, settings), warnings)
+        let mut ctx = ExplainCtx::new(env, rules, registry, settings);
+        ctx.ai = Arc::new(AiStore::load_default());
+        (ctx, warnings)
     }
 
     /// 路径是否落在受保护用户目录之下（含自身）。
@@ -339,6 +353,95 @@ impl ExplainCtx {
     }
 }
 
+// ───────────────────────── 旧版本（keep_latest） ─────────────────────────
+
+/// keep_latest 规则里“正在用的版本”的固定说法（界面上的“这是什么”）。
+pub const CURRENT_VERSION_WHAT: &str = "正在用的版本";
+/// 正在用的版本文件夹里面的东西。
+pub const CURRENT_VERSION_INSIDE_WHAT: &str = "正在用的版本里的文件";
+
+impl ExplainCtx {
+    /// 匹配规则用的小写段：商店应用重定向的路径换成真实 AppData 路径（和解释一致）。
+    pub fn match_segs(&self, path: &str) -> Vec<String> {
+        match self.msix_redirect(path) {
+            Some(m) => split_lower(&m.mapped),
+            None => split_lower(path),
+        }
+    }
+
+    /// keep_latest 规则 `ri` 在父目录 `parent`（匹配用的小写段 `parent_segs`）里：每个子项是不是“正在用的版本”，
+    /// 和 `parent.children` 一一对应；最具体命中的规则不是 `ri` 的子项为 false。规则没有 keep_latest 时全是 false。
+    pub fn current_versions(&self, ri: usize, parent: &Node, parent_segs: &[String]) -> Vec<bool> {
+        let mut out = vec![false; parent.children.len()];
+        let Some(n) = self.rules.rules[ri].keep_latest else { return out };
+        let mut members = Vec::new();
+        let mut segs = parent_segs.to_vec();
+        for (i, c) in parent.children.iter().enumerate() {
+            if c.kind == NodeKind::Rest {
+                continue;
+            }
+            segs.push(c.name.to_lowercase());
+            if self.rules.best_exact(&segs, Some(c)) == Some(ri) {
+                members.push(i);
+            }
+            segs.pop();
+        }
+        let items: Vec<(String, i64)> = members.iter().map(|&i| (parent.children[i].name.clone(), parent.children[i].mtime)).collect();
+        for (k, cur) in versions::pick_current(&items, n as usize).into_iter().enumerate() {
+            out[members[k]] = cur;
+        }
+        out
+    }
+
+    /// `node`（`parent` 的子项，精确命中规则 `ri`）是不是 keep_latest 规则里“正在用的版本”。
+    /// 规则没有 keep_latest → false；看不到父目录、或在父目录里找不到它 → true（宁可多留）。
+    pub fn is_current_version(&self, ri: usize, node: &Node, parent: Option<&Node>) -> bool {
+        if self.rules.rules[ri].keep_latest.is_none() {
+            return false;
+        }
+        let Some(p) = parent else { return true };
+        let idx = p.children.iter().position(|c| std::ptr::eq(c, node)).or_else(|| {
+            let lc = node.name.to_lowercase();
+            p.children.iter().position(|c| c.kind == node.kind && c.name.to_lowercase() == lc)
+        });
+        match idx {
+            Some(i) => self.current_versions(ri, p, &self.match_segs(&p.path))[i],
+            None => true,
+        }
+    }
+
+    /// 继承命中来自 keep_latest 规则时：命中的那个上层文件夹是不是正在用的版本（在 `ancestors` 里找它和它的父目录）。
+    pub fn inherited_is_current(&self, h: &InheritedHit, ancestors: &[&Node]) -> bool {
+        if self.rules.rules[h.rule].keep_latest.is_none() {
+            return false;
+        }
+        match ancestors.iter().position(|a| a.path == h.from_path) {
+            Some(i) => self.is_current_version(h.rule, ancestors[i], if i > 0 { Some(ancestors[i - 1]) } else { None }),
+            None => true,
+        }
+    }
+}
+
+/// 把规则给出的解释改成“正在用的版本”：keep、不能删、固定说法（规则自己的“旧版本……”文案不适用）。
+fn mark_current(e: &mut Explanation, allocated: u64, inside: bool) {
+    e.tier = Tier::Keep;
+    e.what = if inside { CURRENT_VERSION_INSIDE_WHAT } else { CURRENT_VERSION_WHAT }.to_string();
+    e.why = "这个软件每次自动更新都会在旁边多放一份新版本。这一份是现在在用的（版本号最新，或者最近刚用过），旁边那些旧版本才可以删。".into();
+    e.lose = "这是正在用的版本，删了软件就打不开，要重新安装。不要删。".into();
+    e.lose_kind = None;
+    e.lose_short = None;
+    e.how = vec![How::None];
+    e.how_detail = String::new();
+    (e.gain_bytes, e.gain_note) = gain(Tier::Keep, &e.how, allocated);
+    e.notes.push("同一个文件夹里有好几个版本：DiskWhy 只把旧的标成可以清理，正在用的这一份一直留着。".into());
+}
+
+/// `node` 在祖先链里的父目录：`Some(None)` = 它是链的第一个；`None` = 链里没有它。
+fn parent_in<'a>(ancestors: &[&'a Node], node: &Node) -> Option<Option<&'a Node>> {
+    let i = ancestors.iter().position(|a| std::ptr::eq(*a, node) || (!node.path.is_empty() && a.path == node.path))?;
+    Some(if i > 0 { Some(ancestors[i - 1]) } else { None })
+}
+
 /// 解释一个节点。继承命中会自己沿 `ancestors` 往上找。
 pub fn explain(t: &Target, ctx: &ExplainCtx) -> Explanation {
     let inherited = ctx.inherited(t.ancestors);
@@ -347,12 +450,18 @@ pub fn explain(t: &Target, ctx: &ExplainCtx) -> Explanation {
 
 /// 同 [`explain`]，但继承命中由调用方预先算好（列目录时对所有子项只算一次，用 [`ExplainCtx::inherited`]）。
 pub fn explain_with_inherited(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) -> Explanation {
-    if t.node.kind != NodeKind::Rest {
-        if let Some(m) = ctx.msix_redirect(t.path) {
-            return explain_redirected(t, inherited, &m, ctx);
-        }
+    let mut e = match t.node.kind {
+        NodeKind::Rest => explain_plain(t, inherited, ctx),
+        _ => match ctx.msix_redirect(t.path) {
+            Some(m) => explain_redirected(t, inherited, &m, ctx),
+            None => explain_plain(t, inherited, ctx),
+        },
+    };
+    // 认不出来、但 AI 推测过：只附上 AI 的说法，别的一概不动（“其余小文件合计”的 path 是所在目录，不附）。
+    if e.is_unknown() && t.node.kind != NodeKind::Rest {
+        e.ai = ctx.ai.get(t.path);
     }
-    explain_plain(t, inherited, ctx)
+    e
 }
 
 /// 商店应用重定向的路径：按真实 AppData 路径解释，再补一句“它其实是哪里、卸载时会怎样”。
@@ -382,10 +491,18 @@ fn explain_plain(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx)
     }
     let segs = split_lower(t.path);
     if let Some(idx) = ctx.rules.best_exact(&segs, Some(node)) {
-        return from_rule(&ctx.rules.rules[idx], t, &segs, None, ctx);
+        let mut e = from_rule(&ctx.rules.rules[idx], t, &segs, None, ctx);
+        if ctx.is_current_version(idx, node, t.parent) {
+            mark_current(&mut e, node.allocated, false);
+        }
+        return e;
     }
     if let Some(h) = inherited {
-        return from_rule(&ctx.rules.rules[h.rule], t, &segs, Some(&h.from_path), ctx);
+        let mut e = from_rule(&ctx.rules.rules[h.rule], t, &segs, Some(&h.from_path), ctx);
+        if ctx.inherited_is_current(h, t.ancestors) {
+            mark_current(&mut e, node.allocated, true);
+        }
+        return e;
     }
     heuristics::explain_unmatched(t, ctx)
 }
@@ -405,6 +522,14 @@ fn explain_rest(t: &Target, inherited: Option<&InheritedHit>, ctx: &ExplainCtx) 
         .or_else(|| inherited.map(|h| (h.rule, Some(h.from_path.as_str()))));
     if let Some((idx, from)) = dir_rule {
         let mut e = from_rule(&ctx.rules.rules[idx], t, &segs, from.or(Some(t.path)), ctx);
+        let current = match (from, t.parent) {
+            (None, Some(p)) => ctx.is_current_version(idx, p, parent_in(t.ancestors, p).flatten()),
+            (None, None) => false,
+            (Some(_), _) => inherited.is_some_and(|h| ctx.inherited_is_current(h, t.ancestors)),
+        };
+        if current {
+            mark_current(&mut e, t.node.allocated, true);
+        }
         e.notes.insert(
             0,
             format!("这是「{}」里除最大的几个文件外其余 {} 个小文件的合计，跟随所在文件夹的说明。", t.path, t.node.files),
@@ -441,7 +566,19 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         Some(rule.owner.clone())
     };
     let how = rule.how.clone();
-    let (gain_bytes, gain_note) = gain(tier, &how, t.node.allocated);
+    let (mut gain_bytes, mut gain_note) = gain(tier, &how, t.node.allocated);
+    // 按年龄挑的规则（临时文件夹）：只算 N 天以上没改过的（按扫描树里的修改时间估）。
+    if let Some(n) = rule.min_age_days.filter(|_| tier != Tier::Keep && how.contains(&How::Delete)) {
+        let cutoff = ctx.now - n as i64 * 86_400;
+        gain_bytes = if inherited_from.is_none() && t.node.kind == NodeKind::Dir {
+            old_children_bytes(t.node, cutoff)
+        } else if newest_mtime(t.node) < cutoff {
+            t.node.allocated
+        } else {
+            0
+        };
+        gain_note = format!("{n} 天以上没改过的约 {} 可以删；最近 {n} 天改过的、正在用的先不删", human_bytes(gain_bytes));
+    }
     // safe 规则因为落在个人文件夹下被降成 review 时，规则本身没写后果类型：按“需你确认”算。
     let lose_kind = match (tier, rule.lose_kind) {
         (Tier::Review, None) => Some(LoseKind::Unsure),
@@ -475,7 +612,24 @@ fn from_rule(rule: &Rule, t: &Target, segs: &[String], inherited_from: Option<&s
         verified_on: Some(rule.verified_on.clone()),
         notes,
         clues: Vec::new(),
+        ai: None,
     }
+}
+
+/// 子树里文件最新的修改时间（Unix 秒）；没有文件的文件夹用它自己的修改时间。
+pub fn newest_mtime(n: &Node) -> i64 {
+    fn walk(n: &Node) -> Option<i64> {
+        match n.kind {
+            NodeKind::Dir => n.children.iter().filter_map(walk).max(),
+            _ => Some(n.mtime),
+        }
+    }
+    walk(n).unwrap_or(n.mtime)
+}
+
+/// min_age_days：`node`（规则命中的文件夹）里直接子项中，整棵子树都早于 `cutoff` 没改过的那些的字节合计。
+pub fn old_children_bytes(node: &Node, cutoff: i64) -> u64 {
+    node.children.iter().filter(|c| newest_mtime(c) < cutoff).map(|c| c.allocated).sum()
 }
 
 /// “能腾出多少”。
@@ -534,8 +688,7 @@ pub struct TierSummary {
 pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
     let start = std::time::Instant::now();
     let rs = &ctx.rules;
-    let mut per_rule = vec![0u64; rs.rules.len()];
-    let mut uncovered = 0u64;
+    let mut acc = SummaryAcc { per_rule: vec![0u64; rs.rules.len()], per_current: vec![0u64; rs.rules.len()], uncovered: 0 };
     let root_segs = split_lower(&tree.path);
     let active: Vec<u32> = (0..rs.patterns.len() as u32)
         .filter(|&i| {
@@ -544,22 +697,29 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
         })
         .collect();
     let mut segs = root_segs;
-    walk_summary(tree, &mut segs, &active, None, ctx, &mut per_rule, &mut uncovered);
+    walk_summary(tree, &mut segs, &active, false, None, ctx, &mut acc);
 
-    let mut s = TierSummary { uncovered_bytes: uncovered, rules_total: rs.rules.len(), ..Default::default() };
+    let mut s = TierSummary { uncovered_bytes: acc.uncovered, rules_total: rs.rules.len(), ..Default::default() };
     let mut items: Vec<RuleBytes> = Vec::new();
-    for (i, &b) in per_rule.iter().enumerate() {
-        if b == 0 {
+    for (i, (&b, &c)) in acc.per_rule.iter().zip(&acc.per_current).enumerate() {
+        if b == 0 && c == 0 {
             continue;
         }
         let r = &rs.rules[i];
         s.rules_hit += 1;
-        match r.tier {
-            Tier::Safe => s.safe_bytes += b,
-            Tier::Review => s.review_bytes += b,
-            Tier::Keep => s.keep_bytes += b,
+        if b > 0 {
+            match r.tier {
+                Tier::Safe => s.safe_bytes += b,
+                Tier::Review => s.review_bytes += b,
+                Tier::Keep => s.keep_bytes += b,
+            }
+            items.push(RuleBytes { id: r.id.clone(), owner: r.owner.clone(), what: r.what.clone(), tier: r.tier, bytes: b });
         }
-        items.push(RuleBytes { id: r.id.clone(), owner: r.owner.clone(), what: r.what.clone(), tier: r.tier, bytes: b });
+        // keep_latest 规则里“正在用的版本”：算 keep（和解释、清理页一致）。
+        if c > 0 {
+            s.keep_bytes += c;
+            items.push(RuleBytes { id: r.id.clone(), owner: r.owner.clone(), what: CURRENT_VERSION_WHAT.into(), tier: Tier::Keep, bytes: c });
+        }
     }
     items.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     for it in items {
@@ -576,37 +736,65 @@ pub fn tier_summary(tree: &Node, ctx: &ExplainCtx) -> TierSummary {
     s
 }
 
-fn add(per_rule: &mut [u64], uncovered: &mut u64, rule: Option<usize>, bytes: u64) {
-    match rule {
-        Some(i) => per_rule[i] += bytes,
-        None => *uncovered += bytes,
+/// 汇总时的累计：各规则的字节（keep_latest 规则里“正在用的版本”另记一栏，算 keep）+ 未覆盖。
+struct SummaryAcc {
+    per_rule: Vec<u64>,
+    per_current: Vec<u64>,
+    uncovered: u64,
+}
+
+impl SummaryAcc {
+    /// `rule` = (规则下标, 是不是 keep_latest 规则里正在用的版本)。
+    fn add(&mut self, rule: Option<(usize, bool)>, bytes: u64) {
+        match rule {
+            Some((i, false)) => self.per_rule[i] += bytes,
+            Some((i, true)) => self.per_current[i] += bytes,
+            None => self.uncovered += bytes,
+        }
     }
 }
 
+/// keep_latest：父目录 `parent` 的第 `idx` 个子项（精确命中规则 `ri`）是不是正在用的版本；同一个父目录、同一条规则只算一次。
+fn current_flag(ctx: &ExplainCtx, cache: &mut Vec<(usize, Vec<bool>)>, ri: usize, parent: &Node, parent_segs: &[String], idx: usize) -> bool {
+    if ctx.rules.rules[ri].keep_latest.is_none() {
+        return false;
+    }
+    if let Some((_, v)) = cache.iter().find(|(r, _)| *r == ri) {
+        return v[idx];
+    }
+    let v = ctx.current_versions(ri, parent, parent_segs);
+    let f = v[idx];
+    cache.push((ri, v));
+    f
+}
+
+/// `self_current`：`node` 自己是 keep_latest 规则里正在用的版本（由上一层算好传进来）。
 fn walk_summary(
     node: &Node,
     segs: &mut Vec<String>,
     active: &[u32],
-    inherited: Option<usize>,
+    self_current: bool,
+    inherited: Option<(usize, bool)>,
     ctx: &ExplainCtx,
-    per_rule: &mut [u64],
-    uncovered: &mut u64,
+    acc: &mut SummaryAcc,
 ) {
     let rs = &ctx.rules;
     let exact = rs.best_exact_among(active, segs, Some(node));
     // self 规则只说明文件夹本身，里面的东西不归它。
     let child_inherited = match exact {
-        Some(i) if rs.rules[i].scope == Scope::Tree => Some(i),
+        Some(i) if rs.rules[i].scope == Scope::Tree => Some((i, self_current)),
         _ => inherited,
     };
-    for c in &node.children {
+    let mut cur_cache: Vec<(usize, Vec<bool>)> = Vec::new();
+    for (ci, c) in node.children.iter().enumerate() {
         match c.kind {
-            NodeKind::Rest => add(per_rule, uncovered, child_inherited, c.allocated),
+            NodeKind::Rest => acc.add(child_inherited, c.allocated),
             NodeKind::File => {
                 segs.push(c.name.to_lowercase());
                 let f = rs.best_exact_among(active, segs, Some(c));
+                let own = f.map(|ri| (ri, current_flag(ctx, &mut cur_cache, ri, node, &segs[..segs.len() - 1], ci)));
                 segs.pop();
-                add(per_rule, uncovered, f.or(child_inherited), c.allocated);
+                acc.add(own.or(child_inherited), c.allocated);
             }
             NodeKind::Dir => {
                 segs.push(c.name.to_lowercase());
@@ -619,7 +807,7 @@ fn walk_summary(
                             p.matches(&msegs) || p.could_match_below(&msegs)
                         })
                         .collect();
-                    walk_summary(c, &mut msegs, &mactive, None, ctx, per_rule, uncovered);
+                    walk_summary(c, &mut msegs, &mactive, false, None, ctx, acc);
                     segs.pop();
                     continue;
                 }
@@ -631,11 +819,12 @@ fn walk_summary(
                         p.matches(segs) || p.could_match_below(segs)
                     })
                     .collect();
+                let own_rule = if child_active.is_empty() { None } else { rs.best_exact_among(&child_active, segs, Some(c)) };
+                let own_current = own_rule.is_some_and(|ri| current_flag(ctx, &mut cur_cache, ri, node, &segs[..segs.len() - 1], ci));
                 if child_active.is_empty() || c.children.is_empty() {
-                    let own = if child_active.is_empty() { None } else { rs.best_exact_among(&child_active, segs, Some(c)) };
-                    add(per_rule, uncovered, own.or(child_inherited), c.allocated);
+                    acc.add(own_rule.map(|ri| (ri, own_current)).or(child_inherited), c.allocated);
                 } else {
-                    walk_summary(c, segs, &child_active, child_inherited, ctx, per_rule, uncovered);
+                    walk_summary(c, segs, &child_active, own_current, child_inherited, ctx, acc);
                 }
                 segs.pop();
             }

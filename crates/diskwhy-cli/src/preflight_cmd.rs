@@ -4,7 +4,7 @@
 //! `--profile` 另外把预检的各个环节单独重跑一遍计时（枚举 / 取指纹 / 保护路径 / 占用探测 / Restart Manager），
 //! 用来找慢在哪里。单独重跑时文件系统缓存已经是热的，数字只用来比较各环节的相对大小。
 
-use super::Args;
+use crate::legacy::Args;
 use diskwhy_core::action::protect::Protector;
 use diskwhy_core::action::{self, winops, Decision, EntryKind, PlanRequest, PreflightOptions, Progress, SkipReason, Strategy};
 use diskwhy_core::explain::candidates::cleanup_candidates;

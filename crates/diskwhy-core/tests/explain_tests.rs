@@ -283,7 +283,8 @@ fn required_items_from_plan_are_covered() {
     assert!(r("wsl-distro-vhdx").how_detail.contains("wsl --export") && r("wsl-distro-vhdx").how_detail.contains("wsl --import"));
     check("wechat-files", Tier::Keep, &[How::Migrate]);
     check("qq-files", Tier::Keep, &[How::Migrate]);
-    check("wechat-render-cache", Tier::Safe, &[]);
+    // 缓存复查（2026-11）：radium 里有内置浏览器资料和小程序本地存储，不是缓存 → review，只能用微信自带清理
+    check("wechat-radium", Tier::Review, &[How::BuiltinTool]);
     check("wechat-logs", Tier::Safe, &[]);
     check("feishu-update", Tier::Safe, &[]);
     check("feishu-larkshell", Tier::Review, &[]);
@@ -302,7 +303,8 @@ fn required_items_from_plan_are_covered() {
     check("chrome-profile", Tier::Keep, &[]);
     check("edge-profile", Tier::Keep, &[]);
     check("chromium-generic-cache", Tier::Safe, &[]);
-    check("chromium-generic-sw-cache", Tier::Safe, &[]);
+    // 缓存复查：Service Worker 的 CacheStorage / ScriptCache 是网站数据（和 IndexedDB 同类），不是缓存 → review
+    check("chromium-generic-sw-cache", Tier::Review, &[]);
     // 开发缓存全家
     for id in ["npm-cache", "pnpm-store", "yarn-cache", "pip-cache", "uv-cache", "cargo-registry", "go-cache", "gradle-cache", "nuget-cache"] {
         assert_eq!(r(id).tier, Tier::Safe, "{id} 应为 safe");
@@ -358,9 +360,9 @@ fn env_expansion_case_and_wildcards() {
     assert!(d.how.contains(&How::Migrate) && d.gain_bytes == 0);
     let w = ex(&t, r"C:\Users\bob\AppData\Local\wsl\{d1f9e0f8-2451-4607-a4db-2cfc50dc641c}\ext4.vhdx", &ctx);
     assert_eq!((rule_id(&w), w.tier), (Some("wsl-distro-vhdx"), Tier::Keep));
-    // ** 通配 + 具体规则优先于上层继承：飞书里的 CacheStorage 是 safe，其余 review
+    // ** 通配 + 具体规则优先于上层继承：飞书里的 CacheStorage 由 Service Worker 规则说明（缓存复查后是 review）
     let sw = ex(&t, r"C:\Users\bob\AppData\Roaming\LarkShell\aha\users\51af\profile_explorer\Service Worker\CacheStorage", &ctx);
-    assert_eq!((rule_id(&sw), sw.tier), (Some("chromium-generic-sw-cache"), Tier::Safe));
+    assert_eq!((rule_id(&sw), sw.tier), (Some("chromium-generic-sw-cache"), Tier::Review));
     assert!(sw.owner.as_deref().unwrap_or("").contains("LarkShell"), "owner_from_path 应推断出 LarkShell：{:?}", sw.owner);
     let sdk = ex(&t, r"C:\Users\bob\AppData\Roaming\LarkShell\sdk_storage", &ctx);
     assert_eq!((rule_id(&sdk), sdk.tier), (Some("feishu-larkshell"), Tier::Review));
@@ -698,7 +700,7 @@ fn llm_request_body_has_no_file_content_and_redacted_path() {
     let path = root.join("mystery").to_string_lossy().to_string();
     let t = Target { node, path: &path, parent: chain.last().copied(), ancestors: &chain };
     let input = llm::build_input(&t);
-    let body = llm::build_request_body("test-model", &input).to_string();
+    let body = llm::build_request_body("http://127.0.0.1:11434/v1", "test-model", &input).to_string();
 
     assert!(!body.contains(SECRET), "请求体里出现了文件内容！");
     assert!(body.contains("notes.txt") && body.contains("data\\\\"), "应包含子项名：{body}");
@@ -849,7 +851,7 @@ fn llm_request_body_sends_no_sampling_params() {
         extensions: vec![],
         modified: "2026-01-01".into(),
     };
-    let b = llm::build_request_body("kimi-k2.6", &input);
+    let b = llm::build_request_body("https://api.moonshot.cn/v1", "kimi-k2.6", &input);
     let o = b.as_object().unwrap();
     for k in ["temperature", "top_p", "max_tokens", "n", "presence_penalty", "frequency_penalty"] {
         assert!(!o.contains_key(k), "不该发 {k}：{b}");
@@ -1218,8 +1220,10 @@ fn every_review_rule_has_lose_kind() {
             assert!(r.lose_kind.is_some(), "review 规则 {} 没有 lose_kind", r.id);
         }
     }
-    // 72 条原有 review 规则 + 阶段 F 新增的 C:\tmp / C:\Temp / C:\AMD 三条
-    assert_eq!(n, 75, "review 规则条数变了：{n}");
+    // 72 条原有 review 规则 + 阶段 F 新增的 C:\tmp / C:\Temp / C:\AMD 三条；
+    // “旧版本”规则（keep_latest）把 codex-runtimes-previous 从 review 改成了 safe（正在用的版本另外当 keep）
+    // 缓存复查（2026-11）：wechat-radium、yarn-berry-cache 新增，chromium-generic-sw-cache 从 safe 降成 review
+    assert_eq!(n, 77, "review 规则条数变了：{n}");
     // 抽查几条 README 里的例子
     let k = |id: &str| ctx.rules.by_id(id).and_then(|r| r.lose_kind);
     assert_eq!(k("recycle-bin"), Some(LoseKind::Irreversible));
@@ -1274,7 +1278,8 @@ fn explanations_carry_lose_kind() {
     assert_eq!(maven.lose_kind, Some(LoseKind::Irreversible));
     let json = serde_json::to_string(&maven).unwrap();
     assert!(json.contains("\"lose_kind\":\"irreversible\""), "应序列化成 snake_case：{json}");
-    assert_eq!(ex(&t, r"C:\Users\bob\AppData\Local\npm-cache", &ctx).lose_kind, None);
+    // 缓存复查：要联网才能回来的 safe 缓存标“要重下载”
+    assert_eq!(ex(&t, r"C:\Users\bob\AppData\Local\npm-cache", &ctx).lose_kind, Some(LoseKind::Redownload));
     let unk = ex(&t, r"C:\mystery", &ctx);
     assert!(unk.is_unknown());
     assert_eq!(unk.lose_kind, Some(LoseKind::Unsure));
@@ -1342,6 +1347,14 @@ fn cleanup_candidates_group_by_rule_and_respect_guards() {
     // 保护路径拦下的 safe 规则：列出来但不能删
     let wt = by("windows-temp");
     assert_eq!((wt.bytes, wt.deletable_bytes), (40, 0));
+    // 硬拦（保护路径）的带短原因；只是“不建议直接删”的（Windows.old 只能用系统工具）没有，界面上可以二次确认后强制勾
+    assert!(wt.paths.iter().all(|p| p.hard.as_deref() == Some("系统保护")), "{:?}", wt.paths);
+    assert!(old.paths.iter().all(|p| p.hard.is_none()));
+    assert!(npm.paths.iter().all(|p| p.hard.is_none()));
+    // cleanup_candidates_with：原因原样带出来
+    let g2 = diskwhy_core::explain::candidates::cleanup_candidates_with(&t, &ctx, &|p: &str| blocked(p).then(|| "系统目录".to_string()));
+    let wt2 = g2.iter().find(|x| x.key == "windows-temp").unwrap();
+    assert_eq!(wt2.paths[0].hard.as_deref(), Some("系统目录"));
 
     // keep 规则（WinSxS）不出现
     assert!(g.iter().all(|x| x.tier != Tier::Keep));
@@ -1484,7 +1497,7 @@ fn every_review_rule_has_short_concrete_tag() {
             assert!(r.lose_short.as_deref().is_some_and(|s| !s.trim().is_empty()), "review 规则 {} 没有 lose_short", r.id);
         }
     }
-    assert_eq!(n, 75);
+    assert_eq!(n, 77); // 旧版本规则 -1；缓存复查 +3（wechat-radium、yarn-berry-cache 新增，chromium-generic-sw-cache 降档）
     let s = |id: &str| ctx.rules.by_id(id).and_then(|r| r.lose_short.clone()).unwrap_or_default();
     assert_eq!(s("hiberfil"), "不能休眠");
     assert_eq!(s("windows-old"), "不能退回旧系统");

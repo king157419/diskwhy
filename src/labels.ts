@@ -43,7 +43,10 @@ export function worstLose(kinds: (LoseKind | null | undefined)[]): LoseKind | nu
 
 // ───── 清理页左侧的分类 ─────
 
-export type CleanCat = "sys" | "browser" | "dev" | "ai" | "app" | "data";
+/** 从「看看都是什么」加进清理的候选组的 group 名 */
+export const EXTRA_GROUP = "extra";
+
+export type CleanCat = "sys" | "browser" | "dev" | "ai" | "app" | "data" | "mine";
 export const CLEAN_CATS: { id: CleanCat; name: string }[] = [
   { id: "sys", name: "系统缓存" },
   { id: "browser", name: "浏览器" },
@@ -51,6 +54,7 @@ export const CLEAN_CATS: { id: CleanCat; name: string }[] = [
   { id: "ai", name: "AI 模型" },
   { id: "app", name: "应用缓存" },
   { id: "data", name: "软件数据" },
+  { id: "mine", name: "你加的" },
 ];
 export const CLEAN_CAT_NAME: Record<CleanCat, string> = Object.fromEntries(CLEAN_CATS.map((c) => [c.id, c.name])) as Record<
   CleanCat,
@@ -59,6 +63,8 @@ export const CLEAN_CAT_NAME: Record<CleanCat, string> = Object.fromEntries(CLEAN
 
 /** 规则文件分组 + 分类 → 清理页分类 */
 export function cleanCat(group: string, category: Category): CleanCat {
+  // 「看看都是什么」里自己加进来的（keep / 认不出来的也能加，二次确认过）
+  if (group === EXTRA_GROUP) return "mine";
   if (category === "model") return "ai";
   switch (group) {
     case "windows-system":
@@ -82,7 +88,8 @@ export const CATEGORY_LABEL: Record<Category, string> = {
   log: "日志",
   installer: "安装包",
   build: "编译生成",
-  model: "AI 模型",
+  // 列表的类别一栏：不写「AI 模型」——和问过 AI 的「✦ AI 推测」挨在一起时只差一颗小星，分不清（审查 2026-10-12）
+  model: "模型",
   userdata: "数据",
   system: "系统文件",
   vm: "虚拟机",
@@ -188,6 +195,8 @@ export const SKIP_LABEL: Record<string, string> = {
   unreadable: "读不到",
   hardlink: "硬链接",
   recycle_unavailable: "回收站放不下",
+  running: "正在运行",
+  recent: "最近改过",
   /** 前端合成：整项被护栏拦下 */
   blocked: "被拦下",
   /** 前端合成：扫描之后变小了（文件已经没了 / 硬链接不占空间 …） */
@@ -205,6 +214,8 @@ export const SKIP_TIP: Record<string, string> = {
   unreadable: "读不到文件信息",
   hardlink: "硬链接，删了不腾空间",
   recycle_unavailable: "太大或路径太长，送进回收站会被直接删掉",
+  running: "有程序正从这里运行，整个文件夹不动",
+  recent: "7 天内改过，先不删",
   blocked: "整项被拦下，不会动",
   shrunk: "比扫描时小了：有的文件已经没了，硬链接和很小的文件不占空间",
 };

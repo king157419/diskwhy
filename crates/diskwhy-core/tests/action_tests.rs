@@ -411,6 +411,70 @@ fn tier_gate_rejects_keep_unknown_llm_and_tool_only() {
     println!("keep: {keep}\nunknown: {unk}\ntool: {tool}\nllm: {why}");
 }
 
+/// 用户二次确认后强制加入（forced）：keep / 认不出来 / 只能用工具 / 规则对不上的都放行，但只进暂存区 / 回收站
+/// （策略是“直接删除”、档位是 safe 时也不直接删）；保护路径照样拦；本来就能过闸的不标 forced。
+#[test]
+fn forced_items_pass_tier_gate_but_never_go_permanent() {
+    let t = TempTree::new("forced");
+    for d in ["cache", "keep", "tool", "mystery"] {
+        write_old(&t.p(&format!("{d}\\a.dat")), &content(d, 3000));
+    }
+    let root = t.s("");
+    let ctx = ctx_for(&root);
+    let r = scan_dir(&root);
+    let prot = Protector::from_system();
+    let names = ["cache", "keep", "tool", "mystery"];
+    let reqs: Vec<PlanRequest> = names.iter().map(|d| req(&t.s(d))).collect();
+    // 前端传来的写法大小写不一样也认
+    let forced: Vec<String> = names.iter().map(|d| t.s(d).to_uppercase()).chain([r"C:\Windows".to_string()]).collect();
+    let mut reqs_all = reqs.clone();
+    reqs_all.push(req(r"C:\Windows"));
+    let q = TempTree::new("forced-q");
+    let mut plan = action::build_plan_forced(&r, &ctx, &prot, &reqs_all, &forced, Strategy::Quarantine { dest_root: q.s("") });
+    let idx = |d: &str| plan.items.iter().position(|i| i.path.to_lowercase().ends_with(&format!("\\{d}"))).unwrap();
+    // 保护路径：forced 也拦
+    let win = plan.items.iter().find(|i| i.path.eq_ignore_ascii_case(r"C:\Windows")).unwrap();
+    assert!(win.blocked.is_some() && !win.forced, "保护路径必须照样拦：{:?}", win.blocked);
+    // 本来就能过闸的：不标 forced，safe 档照样直接删
+    let c = &plan.items[idx("cache")];
+    assert!(c.blocked.is_none() && !c.forced);
+    assert_eq!(plan.dest_for(c), action::Dest::Permanent);
+    // keep / 只能用工具 / 认不出来：放行、标 forced、进暂存区
+    for d in ["keep", "tool", "mystery"] {
+        let it = &plan.items[idx(d)];
+        assert!(it.blocked.is_none(), "{d} 强制加入后不该被拦：{:?}", it.blocked);
+        assert!(it.forced, "{d} 应标 forced");
+        assert_eq!(plan.dest_for(it), action::Dest::Quarantine, "{d}");
+    }
+    // 不传 forced：照旧整项拒绝
+    let plain = action::build_plan(&r, &ctx, &prot, &reqs, Strategy::RecycleBin);
+    assert!(plain.items.iter().filter(|i| !i.path.ends_with("\\cache")).all(|i| i.blocked.is_some() && !i.forced));
+    // 策略是“直接删除”：forced 的 safe 档（t-tool）和 keep 都改进回收站
+    let mut perm = plan.clone();
+    perm.strategy = Strategy::Permanent;
+    assert_eq!(perm.dest_for(&perm.items[idx("tool")]), action::Dest::Recycle);
+    assert_eq!(perm.dest_for(&perm.items[idx("keep")]), action::Dest::Recycle);
+    assert_eq!(perm.dest_for(&perm.items[idx("cache")]), action::Dest::Permanent);
+    // 预检 + 执行：forced 的都进了暂存区（找得回来），再整批还原
+    let rep = action::preflight(&mut plan, &prot, &PreflightOptions::default());
+    assert!(rep.can_execute, "{:?}", rep.warnings);
+    assert!(rep.items.iter().filter(|i| i.forced).count() == 3);
+    assert_eq!(rep.review_items.len(), 3, "forced 的项要在确认区单独列出");
+    let log = ActionLog::open(&t.p("actions.log"));
+    let ex = action::execute(&plan, &prot, &ExecOptions::new(&log), |_| {}).unwrap();
+    for d in ["keep", "tool", "mystery"] {
+        assert!(!t.p(&format!("{d}\\a.dat")).exists(), "{d} 应已移走");
+    }
+    assert!(!t.p("cache\\a.dat").exists());
+    assert_eq!(ex.by_dest.quarantine.count, 3, "{:?}", ex.by_dest);
+    assert_eq!(ex.by_dest.permanent.count, 1, "{:?}", ex.by_dest);
+    let rr = quarantine::restore(Path::new(ex.manifest_path.as_ref().unwrap()), &log).unwrap();
+    assert_eq!(rr.restored, 3);
+    for d in ["keep", "tool", "mystery"] {
+        assert!(t.p(&format!("{d}\\a.dat")).exists(), "{d} 应已还原");
+    }
+}
+
 #[test]
 fn rule_consistency_rejects_parent_of_rule_dir_and_changed_rule() {
     let t = TempTree::new("rulecons");
@@ -910,6 +974,7 @@ fn guidance_gives_commands_but_never_runs_them() {
         verified_on: None,
         notes: vec![],
         clues: vec![],
+        ai: None,
     };
     let g = guidance_for(&mk("winsxs", Tier::Keep, vec![How::BuiltinTool]));
     assert!(g.iter().any(|x| x.command.as_deref() == Some("DISM /Online /Cleanup-Image /StartComponentCleanup") && x.needs_admin));

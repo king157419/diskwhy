@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 清理页：左边分类是纯文字行（名字 + 大小 + 细条），右边是表格式列表（名称 / 位置 / 大小），
-// 按“可放心清理”“需你判断”分组，行高 50px、细线分隔；需你判断的行只挂一个后果标签（来自规则的 lose_kind）。
+// 按“可放心清理”“需你判断”分组，行高 50px、细线分隔；需你判断的行只挂一个后果标签（来自规则的 lose_kind）；
+// 可放心清理的行在规则写了“要重新下载”这类后果时也挂（“下次会慢一点”不挂）。
 // 点一行在行内展开说明（这是什么 / 删了会怎样 / 建议，阶段 H）。底部通栏 + 一个主按钮。
 // 窄窗口 / 竖屏（阶段 J §3.7）：左边分类变成顶上一行可横向滚动的标签，表格只留 勾选 / 名字（带标签）/ 大小。
 // 行上的标签是规则写的具体后果（lose_short，比如“不能休眠”），颜色按 lose_kind（找不回来实心、其余浅底）。
@@ -13,10 +14,12 @@ import {
   candidates,
   checked,
   checkedBytes,
+  checkState,
   freesByDefault,
   checkedGroups,
   doPreview,
   groupCat,
+  hardWhy,
   previewBusy,
   scanRoot,
   setGroups,
@@ -24,13 +27,11 @@ import {
   toggleGroup,
 } from "../store";
 
-const GB = 1024 ** 3;
-
 const cats = computed(() => {
   const list = CLEAN_CATS.map((c) => {
     const gs = candidates.value.filter((g) => groupCat(g) === c.id);
     const safe = gs.filter((g) => g.tier === "safe").reduce((a, g) => a + g.bytes, 0);
-    const review = gs.filter((g) => g.tier === "review").reduce((a, g) => a + g.bytes, 0);
+    const review = gs.filter((g) => g.tier !== "safe").reduce((a, g) => a + g.bytes, 0);
     return { ...c, groups: gs, safe, review, total: safe + review };
   }).filter((c) => c.groups.length > 0);
   return list;
@@ -51,17 +52,34 @@ function ordered(gs: CandidateGroup[]) {
   // 能直接删的在前，按大小；只能手动 / 用工具处理的排后面
   return [...gs].sort((a, b) => Number(canCheck(b)) - Number(canCheck(a)) || b.bytes - a.bytes);
 }
-const safeRows = computed(() => ordered(current.value?.groups.filter((g) => g.tier === "safe") ?? []));
-const reviewRows = computed(() => ordered(current.value?.groups.filter((g) => g.tier === "review") ?? []));
+type Sec = "safe" | "review" | "mine";
+/** 列表分段：可放心清理 / 需你判断；「你加的」分类里只有一段 */
+const sections = computed<{ t: Sec; rows: CandidateGroup[] }[]>(() => {
+  const gs = current.value?.groups ?? [];
+  if (current.value?.id === "mine") return [{ t: "mine", rows: ordered(gs) }];
+  return [
+    { t: "safe", rows: ordered(gs.filter((g) => g.tier === "safe")) },
+    { t: "review", rows: ordered(gs.filter((g) => g.tier !== "safe")) },
+  ];
+});
+const SEC_NAME: Record<Sec, string> = { safe: "可放心清理", review: "需你判断", mine: "你加的" };
+const SEC_HINT: Record<Sec, string> = { safe: "不丢数据", review: "看过再勾", mine: "可找回" };
+const SEC_DOT: Record<Sec, string> = { safe: "safe", review: "review", mine: "keep" };
 
-const catCheckable = computed(() => (current.value?.groups ?? []).filter(canCheck));
-const catChecked = computed(() => catCheckable.value.filter((g) => checked.value.has(g.key)));
-const catSelBytes = computed(() => catChecked.value.reduce((a, g) => a + g.deletable_bytes, 0));
-const headState = computed(() => (catChecked.value.length === 0 ? "" : catChecked.value.length === catCheckable.value.length ? "on" : "part"));
-function toggleAllInCat() {
-  const keys = catCheckable.value.map((g) => g.key);
-  setGroups(keys, headState.value !== "on");
+// ── 全选：整页 / 本类（表头）/ 一段（段标题）都走同一套：全勾满了 → 全取消；否则勾满（要强制的先二次确认一次）──
+function selState(gs: CandidateGroup[]): "" | "on" | "part" {
+  const cs = gs.filter(canCheck);
+  if (!cs.length) return "";
+  const st = cs.map(checkState);
+  if (st.every((s) => s === "on")) return "on";
+  return st.some((s) => s) ? "part" : "";
 }
+function toggleAll(gs: CandidateGroup[]) {
+  const keys = gs.filter(canCheck).map((g) => g.key);
+  setGroups(keys, selState(gs) !== "on");
+}
+const headState = computed(() => selState(current.value?.groups ?? []));
+const pageState = computed(() => selState(candidates.value));
 
 const open = ref<string | null>(null);
 function toggleOpen(k: string) {
@@ -87,6 +105,12 @@ function loc(g: CandidateGroup): { text: string; mono: boolean } {
   return { text: `${g.paths.length} 个位置`, mono: false };
 }
 
+/** 行上的后果标签：需你判断的一律挂；可放心清理的只在规则写了比“下次慢一点”更重的后果（比如要重新下载）时挂 */
+function rowTag(g: CandidateGroup): string | null {
+  if (g.tier === "review") return loseTag(g);
+  return g.lose_kind && g.lose_kind !== "slower" ? loseTag(g) : null;
+}
+
 function manualLabel(g: CandidateGroup): string {
   if (g.how.includes("builtin_tool")) return "用自带工具";
   if (g.how.includes("migrate") && !g.how.includes("manual")) return "搬到别的盘";
@@ -108,6 +132,7 @@ const free = computed(() => summary.value?.free_bytes ?? 0);
 const dname = computed(() => driveName(summary.value?.root ?? scanRoot.value));
 const keepBytes = computed(() => summary.value?.tiers.keep_bytes ?? 0);
 const totalChecked = computed(() => checkedGroups.value.length);
+const ck = (s: string) => s === "on";
 </script>
 
 <template>
@@ -136,42 +161,58 @@ const totalChecked = computed(() => checkedGroups.value.length);
     <main v-if="current" class="main">
       <div class="head">
         <h1>{{ current.name }}</h1>
-        <span class="meta"><b class="num">{{ current.groups.length }}</b> 项 · <b class="num">{{ gbNum(current.total) }}</b> GB</span>
-        <span class="sel">本类已选<b class="num">{{ (catSelBytes / GB).toFixed(2) }}</b>GB</span>
+        <span class="meta"><b class="num">{{ gbNum(current.total) }}</b> GB</span>
+        <button class="all" role="checkbox" :aria-checked="ck(pageState)" aria-label="全选：所有分类" @click="toggleAll(candidates)">
+          <span class="cb" :class="pageState"><svg v-if="ck(pageState)" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg></span>全选
+        </button>
       </div>
 
       <div class="grid cols">
-        <button class="cb" :class="headState" :aria-label="'全选：' + current.name" :disabled="!catCheckable.length" @click="toggleAllInCat">
-          <svg v-if="headState === 'on'" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
+        <button class="cb" :class="headState" role="checkbox" :aria-checked="ck(headState)" :aria-label="'全选：' + current.name" @click="toggleAll(current.groups)">
+          <svg v-if="ck(headState)" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
         </button>
         <span>名称</span><span>位置</span><span class="r">大小</span><span></span>
       </div>
 
       <div class="scroll">
-        <template v-for="grp in [{ t: 'safe', rows: safeRows }, { t: 'review', rows: reviewRows }]" :key="grp.t">
+        <template v-for="grp in sections" :key="grp.t">
           <template v-if="grp.rows.length">
             <div class="grp">
-              <span class="dot" :class="grp.t"></span>{{ grp.t === "safe" ? "可放心清理" : "需你判断" }}<span class="c num">{{ grp.rows.length }}</span>
-              <span class="hint">{{ grp.t === "safe" ? "删了会自动重建" : "看过再勾" }}</span>
+              <button
+                class="cb"
+                :class="selState(grp.rows)"
+                role="checkbox"
+                :aria-checked="ck(selState(grp.rows))"
+                :aria-label="'全选：' + SEC_NAME[grp.t]"
+                :disabled="!grp.rows.some(canCheck)"
+                @click="toggleAll(grp.rows)"
+              >
+                <svg v-if="ck(selState(grp.rows))" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
+              </button>
+              <span class="dot" :class="SEC_DOT[grp.t]"></span>{{ SEC_NAME[grp.t] }}
+              <span class="hint">{{ SEC_HINT[grp.t] }}</span>
             </div>
             <template v-for="g in grp.rows" :key="g.key">
               <div class="grid row" :class="{ off: !checked.has(g.key), open: open === g.key }">
                 <button
                   v-if="canCheck(g)"
                   class="cb"
-                  :class="{ on: checked.has(g.key) }"
+                  :class="checkState(g)"
                   role="checkbox"
-                  :aria-checked="checked.has(g.key)"
+                  :aria-checked="ck(checkState(g))"
                   :aria-label="'选中：' + g.name"
                   @click="toggleGroup(g.key)"
                 >
-                  <svg v-if="checked.has(g.key)" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
+                  <svg v-if="ck(checkState(g))" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></svg>
                 </button>
-                <span v-else class="cb na" :title="manualLabel(g)"></span>
+                <span v-else class="cb na" :title="hardWhy(g) ?? ''"></span>
                 <button class="nm" :aria-label="'展开：' + g.name" :aria-expanded="open === g.key" @click="toggleOpen(g.key)">
                   <span class="nm-t">{{ g.name }}</span>
-                  <span v-if="g.tier === 'review' && loseTag(g)" class="tag" :class="{ hard: isHardTag(g.lose_kind) }">{{ loseTag(g) }}</span>
-                  <span v-if="!canCheck(g) && g.tier === 'safe'" class="tag plain">{{ manualLabel(g) }}</span>
+                  <span v-if="hardWhy(g)" class="tag plain">{{ hardWhy(g) }}</span>
+                  <template v-else>
+                    <span v-if="rowTag(g)" class="tag" :class="{ hard: isHardTag(g.lose_kind) }">{{ rowTag(g) }}</span>
+                    <span v-if="g.deletable_bytes <= 0 && g.tier === 'safe'" class="tag plain">{{ manualLabel(g) }}</span>
+                  </template>
                 </button>
                 <span class="loc" :class="{ cjk: !loc(g).mono }" :title="g.paths.map((p) => p.path).join('\n')" @click="toggleOpen(g.key)">{{ loc(g).text }}</span>
                 <span class="sz num" @click="toggleOpen(g.key)">{{ sizeParts(g.bytes)[0] }}<small>{{ sizeParts(g.bytes)[1] }}</small></span>
@@ -184,7 +225,7 @@ const totalChecked = computed(() => checkedGroups.value.length);
                   <dt>这是什么</dt>
                   <dd>{{ g.what }}</dd>
                   <dt>删了会怎样</dt>
-                  <dd><b v-if="g.tier === 'review' && loseTag(g)" class="lead">{{ loseTag(g) }}。</b>{{ g.lose }}</dd>
+                  <dd><b v-if="rowTag(g)" class="lead">{{ rowTag(g) }}。</b>{{ g.lose }}</dd>
                   <dt>建议</dt>
                   <dd>
                     <b class="lead">{{ advice(g.tier, g.how, g.how_detail, g.group).head }}。</b>{{ advice(g.tier, g.how, g.how_detail, g.group).detail }}
@@ -209,9 +250,7 @@ const totalChecked = computed(() => checkedGroups.value.length);
     </main>
 
     <footer class="bar">
-      <div class="cnt"><span class="k">已选</span><span class="v num">{{ totalChecked }}<small>项</small></span></div>
-      <div class="sep cnt-sep"></div>
-      <div class="big"><span class="k">能腾出</span><span class="v num">{{ gbNum(checkedBytes) }}<small>GB</small></span></div>
+      <div class="big"><span class="k">已选</span><span class="v num">{{ gbNum(checkedBytes) }}<small>GB</small></span></div>
       <div class="sep"></div>
       <div class="free">
         <span class="k">{{ dname }}剩余</span><span class="fv" title="按默认去向估算，回收站不腾空间"><b class="num">{{ gbNum(free) }}</b><span class="arr">→</span><b class="num">{{ gbNum(free + freesByDefault) }} GB</b></span>
@@ -378,18 +417,28 @@ const totalChecked = computed(() => checkedGroups.value.length);
   font-weight: var(--w-med);
   color: var(--ink2);
 }
-.head .sel {
+/* 整页全选：一个小勾选框 + 两个字，靠右；不用三档颜色 */
+.head .all {
   margin-left: auto;
-  font-size: var(--fs-sub);
-  color: var(--ink2);
+  align-self: center;
   display: flex;
-  align-items: baseline;
-  gap: 6px;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px 0 8px;
+  border-radius: var(--r);
+  font-size: var(--fs-sub);
+  font-weight: var(--w-med);
+  color: var(--ink2);
+  transition: background-color var(--dur-1) var(--ease);
 }
-.head .sel b {
-  font-size: 20px;
-  font-weight: var(--w-semi);
+.head .all:hover {
+  background: var(--hover);
   color: var(--ink);
+}
+.head .all:focus-visible {
+  outline: 2px solid var(--ink3);
+  outline-offset: 1px;
 }
 
 .grid {
@@ -424,8 +473,17 @@ const totalChecked = computed(() => checkedGroups.value.length);
   font-size: var(--fs-sub);
   font-weight: var(--w-semi);
   color: var(--ink);
-  padding-left: 40px;
   border-bottom: 1px solid var(--line);
+}
+/* 段标题前的勾选框 = 这一段全选（和行上的勾选框对齐） */
+.grp .cb {
+  margin-right: 12px;
+}
+.grp .cb:disabled {
+  visibility: hidden;
+}
+[data-theme="C"] .grp .cb {
+  margin-right: 10px;
 }
 .grp .c {
   font-weight: var(--w-reg);
@@ -827,8 +885,8 @@ const totalChecked = computed(() => checkedGroups.value.length);
   .row .loc {
     display: none;
   }
-  .grp {
-    padding-left: 36px;
+  .grp .cb {
+    margin-right: 8px;
   }
   .grp .hint {
     margin-right: 26px;

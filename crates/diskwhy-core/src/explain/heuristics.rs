@@ -371,6 +371,7 @@ fn finish(h: Hint, t: &Target, stats: &SubtreeStats, ctx: &ExplainCtx) -> Explan
         verified_on: None,
         notes,
         clues: h.clues,
+        ai: None,
     }
 }
 
@@ -944,5 +945,6 @@ pub fn unknown(t: &Target, s: &SubtreeStats, ctx: &ExplainCtx) -> Explanation {
         verified_on: None,
         notes: Vec::new(),
         clues,
+        ai: None,
     }
 }

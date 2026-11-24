@@ -331,6 +331,32 @@ impl Protector {
     }
 }
 
+/// 保护原因的短说法（≤ 6 个字，清理页上不能勾的那一行显示；完整原因悬停看）。
+pub fn short_reason(why: &str) -> &'static str {
+    let w = why.to_lowercase();
+    if w.contains("卷根") {
+        "整个盘"
+    } else if w.contains("diskwhy 自己") {
+        "本程序数据"
+    } else if w.contains("密钥") {
+        "密钥目录"
+    } else if w.contains("回收站") {
+        "回收站"
+    } else if w.contains("程序安装目录") {
+        "程序目录"
+    } else if w.contains("onedrive") {
+        "OneDrive"
+    } else if w.contains("用户目录") {
+        "用户目录"
+    } else if w.contains("你的") {
+        "个人文件夹"
+    } else if w.contains("短文件名") || (w.contains("路径") && !w.contains("受保护")) {
+        "路径不明"
+    } else {
+        "系统目录"
+    }
+}
+
 /// 父目录真实位置（GetFinalPathNameByHandleW）的缓存，一次预检内有效。
 ///
 /// 阶段 G 实测（本机默认勾选 39.6 万个文件、6.5 万个文件夹）：逐个文件解析父目录要 40 秒，
@@ -410,5 +436,35 @@ mod tests {
         assert!(normalize(r"C:\a:stream").is_err());
         assert!(looks_short_name("PROGRA~1"));
         assert!(!looks_short_name("my~file"));
+    }
+
+    #[test]
+    fn short_reasons_fit_six_chars() {
+        let p = Protector::with(
+            &[
+                ("SystemRoot".into(), r"C:\Windows".into()),
+                ("ProgramFiles".into(), r"C:\Program Files".into()),
+                ("USERPROFILE".into(), r"C:\Users\me".into()),
+                ("LOCALAPPDATA".into(), r"C:\Users\me\AppData\Local".into()),
+            ],
+            &[],
+            &[r"C:\".into()],
+        );
+        let cases = [
+            (r"C:\", "整个盘"),
+            (r"C:\Windows\Temp", "系统目录"),
+            (r"C:\Program Files\App", "程序目录"),
+            (r"C:\Users\me\Documents", "个人文件夹"),
+            (r"C:\Users\me", "用户目录"),
+            (r"C:\Users\me\.ssh\id", "密钥目录"),
+            (r"C:\$Recycle.Bin\x", "回收站"),
+            (r"C:\Users\me\AppData\Local\DiskWhy\x", "本程序数据"),
+        ];
+        for (path, want) in cases {
+            let why = p.check(path).unwrap_or_else(|| panic!("{path} 应受保护"));
+            let s = short_reason(&why);
+            assert_eq!(s, want, "{path}: {why}");
+            assert!(s.chars().count() <= 6);
+        }
     }
 }

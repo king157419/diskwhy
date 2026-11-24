@@ -1,8 +1,16 @@
 // 全局界面状态 + 动作（阶段 F：首页 / 清理 / 看看都是什么 / 确认弹层 / 暂存区 / 设置）。
 // 只调用 api.ts 里的后端命令；清理候选由后端算好（ScanSummary.candidates），这里只管勾选和预检。
-import { computed, ref, shallowRef, watch } from "vue";
+import { computed, reactive, ref, shallowRef, watch } from "vue";
 import {
   actionEnv,
+  aiRunNow,
+  askAi,
+  aiStatus as fetchAiStatus,
+  AI_ANSWER_EVENT,
+  AI_STATUS_EVENT,
+  type AiAnswer,
+  type AiNote,
+  type AiStatus,
   cancelScan,
   getEnv,
   getTreemap,
@@ -34,6 +42,8 @@ import {
   tmKey,
   type ActionEnv,
   type CandidateGroup,
+  type CandidatePath,
+  type PlanRequest,
   type DirListing,
   type DriveInfo,
   type EnvInfo,
@@ -47,7 +57,8 @@ import {
   type Strategy,
   type TreemapNode,
 } from "./api";
-import { cleanCat, type CleanCat } from "./labels";
+import { AI_IDLE, finishedOk, llmUsable, patchListing, patchTree, type AiNotes } from "./ai";
+import { cleanCat, EXTRA_GROUP, type CleanCat } from "./labels";
 import { samePath } from "./treemap";
 import { ancestorsIn, buildDisplay, chainLevelStarts, collapseFor, findTm, isUnder, pathKey, type MapHit, type Stub } from "./tmtree";
 
@@ -78,47 +89,171 @@ export const drive = computed(() => {
 });
 
 // ───── 清理候选 / 勾选 ─────
-export const candidates = computed<CandidateGroup[]>(() => summary.value?.candidates ?? []);
+// 每个候选路径三种情况：能直接删（deletable）/ 硬拦（hard：保护路径、系统保留…，怎么都不能勾，显示 ≤ 6 字的原因）/
+// 其余（keep、认不出来、规则说要手动 / 用自带工具删的）= 二次确认后可以强制勾：发给后端时带 forced，只进回收站 / 暂存区。
+/** 「看看都是什么」里自己加进清理的（keep / 认不出来的也行，二次确认过）：前端合成的候选组，key = "x:" + 路径 */
+export const extraGroups = ref<CandidateGroup[]>([]);
+export const candidates = computed<CandidateGroup[]>(() => [...(summary.value?.candidates ?? []), ...extraGroups.value]);
 /** 勾选的候选组（key） */
 export const checked = ref<Set<string>>(new Set());
+/** 勾选的组里，连“要强制”的路径也一起删的（二次确认过）；不在这里的组只删能直接删的部分 */
+export const forcedKeys = ref<Set<string>>(new Set());
 
+/** 二次确认后才能删的路径（不能直接删、又没被硬拦） */
+export const forceable = (p: CandidatePath) => !p.deletable && !p.hard;
+/** 一组里要强制的那部分字节 */
+export function forceBytes(g: CandidateGroup): number {
+  return g.paths.filter(forceable).reduce((a, p) => a + p.bytes, 0);
+}
+/** 能不能勾：有能直接删的、或者有二次确认后能删的 */
 export function canCheck(g: CandidateGroup): boolean {
-  return g.deletable_bytes > 0;
+  return g.deletable_bytes > 0 || forceBytes(g) > 0;
+}
+/** 一组整个都被硬拦（怎么都不能勾）时的短原因；能勾为 null */
+export function hardWhy(g: CandidateGroup): string | null {
+  if (canCheck(g)) return null;
+  return g.paths.find((p) => p.hard)?.hard ?? null;
+}
+/** 勾满它要不要先二次确认 */
+export function needsForce(g: CandidateGroup): boolean {
+  return forceBytes(g) > 0 && !forcedKeys.value.has(g.key);
+}
+/** 一组现在算进去的字节：能直接删的 + （确认过的）要强制的 */
+export function selBytes(g: CandidateGroup): number {
+  return g.deletable_bytes + (forcedKeys.value.has(g.key) ? forceBytes(g) : 0);
+}
+/** 勾选框状态：on / part（勾了，但要强制的那部分没算进去）/ "" */
+export function checkState(g: CandidateGroup): "" | "on" | "part" {
+  if (!checked.value.has(g.key)) return "";
+  return needsForce(g) ? "part" : "on";
 }
 
-/** 默认勾选：可放心清理且能直接删的全选，需你判断的一律不选 */
+/** 默认勾选：可放心清理且能直接删的全选（只算能直接删的部分），需你判断的一律不选 */
 export function resetSelection() {
-  checked.value = new Set(candidates.value.filter((g) => g.tier === "safe" && canCheck(g)).map((g) => g.key));
+  extraGroups.value = [];
+  forcedKeys.value = new Set();
+  forceAsk.value = null;
+  checked.value = new Set(candidates.value.filter((g) => g.tier === "safe" && g.deletable_bytes > 0).map((g) => g.key));
+}
+
+// ── 二次确认（勾 keep / 认不出来 / 不建议直接删的）──
+export interface ForceAsk {
+  /** 要强制的组 */
+  keys: string[];
+  /** 「只选能删的」：这些组里能直接删的部分照常勾（没有能直接删的为空） */
+  plainKeys: string[];
+  /** 不用强制、照常勾上的组（全选时一起勾的） */
+  alsoKeys: string[];
+}
+/** 正在问的二次确认（App 里的小弹层） */
+export const forceAsk = ref<ForceAsk | null>(null);
+
+function applySel(on: string[], forced: string[], off: string[] = []) {
+  const s = new Set(checked.value);
+  const f = new Set(forcedKeys.value);
+  for (const k of off) {
+    s.delete(k);
+    f.delete(k);
+  }
+  for (const k of on) s.add(k);
+  for (const k of forced) {
+    s.add(k);
+    f.add(k);
+  }
+  checked.value = s;
+  forcedKeys.value = f;
+}
+
+/** 勾上一些组（全选 / 单个）：里面有要强制、还没确认过的 → 先问一次；没有 → 直接勾 */
+export function selectGroups(keys: string[]) {
+  const gs = keys.map((k) => candidates.value.find((x) => x.key === k)).filter((g): g is CandidateGroup => !!g && canCheck(g));
+  const ask = gs.filter(needsForce);
+  const plain = gs.filter((g) => !needsForce(g)).map((g) => g.key);
+  if (!ask.length) {
+    applySel(plain, []);
+    return;
+  }
+  forceAsk.value = { keys: ask.map((g) => g.key), plainKeys: ask.filter((g) => g.deletable_bytes > 0).map((g) => g.key), alsoKeys: plain };
+}
+
+/** 二次确认的回答：all = 仍要删（连要强制的一起）；plain = 只选能直接删的；null = 算了 */
+export function answerForce(choice: "all" | "plain" | null) {
+  const a = forceAsk.value;
+  forceAsk.value = null;
+  if (a && choice === "all") applySel(a.alsoKeys, a.keys);
+  else if (a && choice === "plain") applySel([...a.alsoKeys, ...a.plainKeys], []);
+  // 自己加进来的那一组没勾上（点了「算了」）就拿掉
+  extraGroups.value = extraGroups.value.filter((g) => checked.value.has(g.key));
 }
 
 export function toggleGroup(key: string) {
   const g = candidates.value.find((x) => x.key === key);
   if (!g || !canCheck(g)) return;
-  const s = new Set(checked.value);
-  if (s.has(key)) s.delete(key);
-  else s.add(key);
-  checked.value = s;
+  // 勾满了 → 取消；没勾 / 只勾了能直接删的部分 → 勾满（要强制的先确认）
+  if (checkState(g) === "on") applySel([], [], [key]);
+  else selectGroups([key]);
 }
 
 export function setGroups(keys: string[], on: boolean) {
-  const s = new Set(checked.value);
-  for (const k of keys) {
-    const g = candidates.value.find((x) => x.key === k);
-    if (!g || !canCheck(g)) continue;
-    if (on) s.add(k);
-    else s.delete(k);
-  }
-  checked.value = s;
+  if (on) selectGroups(keys);
+  else applySel([], [], keys);
 }
 
-export const checkedGroups = computed(() => candidates.value.filter((g) => checked.value.has(g.key) && canCheck(g)));
-export const checkedBytes = computed(() => checkedGroups.value.reduce((a, g) => a + g.deletable_bytes, 0));
+export const checkedGroups = computed(() => candidates.value.filter((g) => checked.value.has(g.key) && selBytes(g) > 0));
+/** 已选：清理页的大数字、清理按钮、确认弹层的大数字都是这一个数 */
+export const checkedBytes = computed(() => checkedGroups.value.reduce((a, g) => a + selBytes(g), 0));
+
+/** 发给后端的清单：能直接删的照常；确认过的要强制的带 forced（后端只放进回收站 / 暂存区） */
+export function planItems(): PlanRequest[] {
+  return checkedGroups.value.flatMap((g) => {
+    const f = forcedKeys.value.has(g.key);
+    return g.paths
+      .filter((p) => p.deletable || (f && forceable(p)))
+      .map((p) => (p.deletable ? { path: p.path, expect_rule: g.rule_id } : { path: p.path, expect_rule: g.rule_id, forced: true }));
+  });
+}
+
+/** 「看看都是什么」里「加入清理」：已经是某个候选就勾那一组；否则合成一组（都要先二次确认） */
+export function addPathToCleanup(n: NodeView): string {
+  const k = n.path.toLowerCase();
+  const hit = candidates.value.find((g) => g.paths.some((p) => p.path.toLowerCase() === k));
+  if (hit) {
+    if (checkState(hit) !== "on") selectGroups([hit.key]);
+    return hit.key;
+  }
+  const e = n.explanation;
+  const key = "x:" + n.path;
+  const g: CandidateGroup = {
+    key,
+    rule_id: e && e.source.kind === "rule" ? e.source.id : null,
+    group: EXTRA_GROUP,
+    heuristic: null,
+    name: n.name,
+    owner: e?.owner ?? "",
+    category: e?.category ?? "unknown",
+    tier: e && e.source.kind !== "unknown" ? e.tier : "keep",
+    lose_kind: e?.lose_kind ?? null,
+    lose_short: e?.lose_short ?? null,
+    how: e?.how ?? [],
+    what: e?.what ?? "",
+    lose: e?.lose ?? "",
+    how_detail: e?.how_detail ?? "",
+    bytes: n.allocated,
+    deletable_bytes: 0,
+    paths: [{ path: n.path, bytes: n.allocated, deletable: false, hard: null }],
+  };
+  extraGroups.value = [...extraGroups.value.filter((x) => x.key !== key), g];
+  selectGroups([key]);
+  return key;
+}
 
 /** 首页：能直接删的“可放心清理”合计（= 主按钮清理的量） */
-export const safeGroups = computed(() => candidates.value.filter((g) => g.tier === "safe" && canCheck(g)));
+export const safeGroups = computed(() => candidates.value.filter((g) => g.tier === "safe" && g.deletable_bytes > 0));
 export const safeBytes = computed(() => safeGroups.value.reduce((a, g) => a + g.deletable_bytes, 0));
 /** 首页：“需你判断”合计（清理页里需你判断的全部行） */
-export const reviewBytes = computed(() => candidates.value.filter((g) => g.tier === "review").reduce((a, g) => a + g.bytes, 0));
+export const reviewBytes = computed(() =>
+  candidates.value.filter((g) => g.tier === "review" && g.group !== EXTRA_GROUP).reduce((a, g) => a + g.bytes, 0),
+);
 
 export function groupCat(g: CandidateGroup): CleanCat {
   return cleanCat(g.group, g.category);
@@ -179,11 +314,25 @@ export const stashDrives = computed(() => {
   return (actEnv.value?.drives ?? drives.value).filter((d) => d.root.toUpperCase() !== src).sort((a, b) => b.free_bytes - a.free_bytes);
 });
 
-/** 勾选里有没有需你判断的、需你判断的有多大（决定要不要解析暂存区、空间够不够） */
-function reviewNeed(): { has: boolean; bytes: number } {
-  const g = checkedGroups.value.filter((x) => x.tier === "review");
-  return { has: g.length > 0, bytes: g.reduce((a, x) => a + x.deletable_bytes, 0) };
+/** 一组里按「需你判断」的去向走的字节（需你判断的整组；别的组里强制加入的部分——强制的只进回收站 / 暂存区） */
+function reviewPart(g: CandidateGroup): number {
+  if (g.tier === "review") return selBytes(g);
+  return forcedKeys.value.has(g.key) ? forceBytes(g) : 0;
 }
+
+/** 勾选里有没有需你判断的（含强制加入的）、有多大（决定要不要解析暂存区、空间够不够） */
+function reviewNeed(): { has: boolean; bytes: number } {
+  const bytes = checkedGroups.value.reduce((a, g) => a + reviewPart(g), 0);
+  return { has: bytes > 0, bytes };
+}
+
+/**
+ * 这次运行里试过、建不了（要授权 / 失败）的暂存盘（大写盘根）：默认去向和底栏的估算都不再考虑它们
+ * （用户在下拉里明确选它时照样去问后端）。
+ */
+const stashBad = reactive(new Set<string>());
+/** 暂存盘里这次运行没试出“建不了”的（弹层里「改放 D 盘」只推荐这些，免得一点就要授权） */
+export const okStashDrives = computed(() => stashDrives.value.filter((d) => !stashBad.has(d.root.toUpperCase())));
 
 /** 问后端某个盘上的暂存区能不能用（①已有 ②试建 ③以前用过的位置）；结果写进 dest */
 async function resolveStash(drive: string): Promise<DestState["status"]> {
@@ -195,6 +344,8 @@ async function resolveStash(drive: string): Promise<DestState["status"]> {
     st = { status: "failed", message: String(e) };
   }
   if (dest.value.mode !== "stash" || dest.value.drive !== drive) return dest.value.status;
+  if (st.status === "ok") stashBad.delete(drive.toUpperCase());
+  else stashBad.add(drive.toUpperCase());
   if (st.status === "ok") dest.value = { ...dest.value, dest: st.dest_root, status: "ok" };
   else if (st.status === "needs_elevation") dest.value = { ...dest.value, status: "needs_elevation" };
   else dest.value = { ...dest.value, status: "failed", failMsg: st.message };
@@ -208,7 +359,7 @@ async function resolveStash(drive: string): Promise<DestState["status"]> {
 export function defaultStashDrives(needBytes: number) {
   const sys = (env.value?.system_drive || "C:\\").toUpperCase();
   return stashDrives.value.filter(
-    (d) => d.root.toUpperCase() !== sys && d.free_bytes > needBytes + STASH_SLACK,
+    (d) => d.root.toUpperCase() !== sys && !stashBad.has(d.root.toUpperCase()) && d.free_bytes > needBytes + STASH_SLACK,
   );
 }
 
@@ -217,8 +368,9 @@ export const freesByDefault = computed(() => {
   let safe = 0;
   let review = 0;
   for (const g of checkedGroups.value) {
-    if (g.tier === "review") review += g.deletable_bytes;
-    else safe += g.deletable_bytes;
+    const r = reviewPart(g);
+    review += r;
+    safe += selBytes(g) - r;
   }
   return safe + (review > 0 && defaultStashDrives(review).length ? review : 0);
 });
@@ -235,6 +387,7 @@ export function rememberedDest(src = sourceDrive()): DestMemo | null {
 }
 export function forgetDestChoices() {
   destMemo.clear();
+  stashBad.clear();
 }
 function rememberDest(mode: DestMode, arg?: string) {
   const src = sourceDrive().toUpperCase();
@@ -266,14 +419,15 @@ async function useRemembered(need: { has: boolean; bytes: number }): Promise<boo
       if (!d || (need.has && d.free_bytes <= need.bytes + STASH_SLACK)) return false;
       dest.value = { ...base, drive: d.root };
       if (!need.has) return true;
-      const st = await resolveStash(d.root);
-      return st === "ok" || st === "needs_elevation";
+      // 要授权的不算能用：默认流程里不出现授权这一步，退回默认（别的盘 / 回收站）
+      return (await resolveStash(d.root)) === "ok";
     }
   }
 }
 
 /**
- * 默认去向（§3.1）：有别的固定盘、空间够、暂存区能用或能授权 → 「D 盘暂存区」；否则 → 「回收站」。
+ * 默认去向（§3.1）：有别的固定盘、空间够、暂存区不用授权就能建 → 「D 盘暂存区」；否则 → 「回收站」
+ * （盘根要管理员权限才能建文件夹时不弹授权，悄悄改用回收站；用户仍可以在下拉里自己选那个盘再授权）。
  * 清单里没有需你判断的时不去解析（不在 D:\ 白建文件夹），去向只影响需你判断的那部分。
  */
 async function pickDefaultDest() {
@@ -291,8 +445,7 @@ async function pickDefaultDest() {
   }
   for (const d of cands) {
     dest.value = { ...recycle, mode: "stash", drive: d.root };
-    const st = await resolveStash(d.root);
-    if (st === "ok" || st === "needs_elevation") return;
+    if ((await resolveStash(d.root)) === "ok") return;
   }
   dest.value = recycle;
 }
@@ -318,6 +471,8 @@ export function currentPlanArgs(): { strategy: Strategy; safeDirect: boolean } {
 
 /** 后台逐个文件检查的进度（弹层里显示）；检查做完为 null */
 export const checkProgress = ref<PreviewProgress | null>(null);
+/** 换了去向、正在后台悄悄重新检查（弹层照旧显示上一次的结果，只是主按钮先不能点） */
+export const rechecking = ref(false);
 /** 当前这次预检的序号：关掉弹层 / 换了删到哪里之后，旧的结果回来也不用 */
 let previewSeq = 0;
 
@@ -341,21 +496,22 @@ export async function doPreview() {
  * 逐个文件的检查在后台进行（progress），做完 promise 返回完整报告，按钮才可用。
  */
 export async function runPreview() {
-  const items = checkedGroups.value.flatMap((g) => g.paths.filter((p) => p.deletable).map((p) => ({ path: p.path, expect_rule: g.rule_id })));
+  const items = planItems();
   if (!items.length) return;
   const seq = ++previewSeq;
   const { strategy, safeDirect } = currentPlanArgs();
-  previewBusy.value = true;
+  // 换去向重新预检（弹层已经有结果）：悄悄在后台做，弹层不重置、不出现“正在检查”，只是主按钮先不能点
+  const quiet = !!report.value && !report.value.pending;
+  previewBusy.value = !quiet;
+  rechecking.value = quiet;
   message.value = "";
-  // 换去向重新预检：旧的报告先留着（弹层不闪），但标成“正在检查”，主按钮不可用
-  if (report.value) report.value = { ...report.value, pending: true, est_secs: 0 };
-  checkProgress.value = { phase: "plan", dirs: 0, entries: 0, checked: 0, to_check: 0, locked: 0, rm_done: 0, rm_total: 0 };
+  if (!quiet) checkProgress.value = { phase: "plan", dirs: 0, entries: 0, checked: 0, to_check: 0, locked: 0, rm_done: 0, rm_total: 0 };
   try {
     const final = await previewPlan(
       items,
       strategy,
       (e) => {
-        if (seq !== previewSeq) return;
+        if (seq !== previewSeq || quiet) return;
         if (e.kind === "quote") {
           report.value = e.report;
           previewBusy.value = false;
@@ -374,6 +530,7 @@ export async function runPreview() {
   } finally {
     if (seq === previewSeq) {
       previewBusy.value = false;
+      rechecking.value = false;
       checkProgress.value = null;
     }
   }
@@ -382,11 +539,13 @@ export async function runPreview() {
 /** 关掉确认弹层：还在检查就让后端停下 */
 export function closeReport() {
   const checking = report.value?.pending || checkProgress.value !== null;
+  const busy = checking || rechecking.value;
   previewSeq++;
   report.value = null;
   checkProgress.value = null;
   previewBusy.value = false;
-  if (checking) void cancelPreview().catch(() => {});
+  rechecking.value = false;
+  if (busy) void cancelPreview().catch(() => {});
 }
 
 /** 弹层下拉里选了去向：暂存区（某个盘）/ 回收站 / 直接删除 / 其他文件夹（已选好的路径）→ 重新预检 */
@@ -394,7 +553,7 @@ export async function chooseDest(mode: DestMode, arg?: string) {
   if (mode !== "folder" || arg) rememberDest(mode, arg);
   if (mode === "stash") {
     dest.value = { mode, drive: arg ?? "", dest: "", status: "pending", failMsg: "", explicit: true };
-    if (report.value) report.value = { ...report.value, pending: true, est_secs: 0 };
+    // 弹层照旧显示上一次的结果（不重置），主按钮由 stashBlocked 拦住，等暂存区准备好再悄悄重新检查
     await resolveStash(arg ?? "");
   } else if (mode === "folder") {
     if (!arg) return;
@@ -420,6 +579,7 @@ export async function authorizeStash() {
   }
   if (dest.value.mode !== "stash" || dest.value.drive !== d.drive) return;
   if (st.status === "ok") {
+    stashBad.delete(d.drive.toUpperCase());
     dest.value = { ...dest.value, dest: st.dest_root, status: "ok", failMsg: "" };
     if (report.value) await runPreview();
   } else if (st.status === "failed") dest.value = { ...dest.value, status: "failed", failMsg: st.message };
@@ -434,6 +594,8 @@ export const execStopping = ref(false);
 export const execError = ref("");
 /** 最近一次被拦下关窗的时间（ms）；弹层据此闪一下「停止」 */
 export const closeBlockedAt = ref(0);
+/** 开始清理时预检估的用时（秒）：执行刚开始、还算不出速率时，弹层先用它显示「剩约 …」 */
+export const execEstSecs = ref(0);
 
 /** 开始执行（确认弹层主按钮）。失败（动任何文件之前）回到确认状态并显示原因 */
 export async function runExec(rep: PreflightReport) {
@@ -442,6 +604,7 @@ export async function runExec(rep: PreflightReport) {
   execError.value = "";
   execStopping.value = false;
   execResult.value = null;
+  execEstSecs.value = rep.est_secs ?? 0;
   execProg.value = {
     done: 0,
     total: rep.total_entries,
@@ -595,6 +758,7 @@ export async function init() {
     scanRoot.value = (c ?? drives.value[0])?.root ?? "C:\\";
     void refreshActionEnv();
     void listenCloseBlocked();
+    void listenAi();
     // 界面重载 / 窗口重建时清理还在跑：先重新附着、等它做完再扫（不和清理抢盘）
     if (await actionStatus().catch(() => false)) await attachExec();
     void loadInterrupted();
@@ -621,6 +785,10 @@ export async function doScan() {
   resetExplore();
   cancelling.value = false;
   checked.value = new Set();
+  forcedKeys.value = new Set();
+  extraGroups.value = [];
+  // 新的扫描会让后端停下正在问的 AI（扫完再按新结果重新问）：工具栏的小标签先收起
+  aiRestart();
   try {
     const s = await startScan(scanRoot.value, (p) => (progress.value = p));
     summary.value = s;
@@ -926,6 +1094,7 @@ function stubNode(l: DirListing): TreemapNode {
     children: [],
     hidden_bytes: 0,
     hidden_count: 0,
+    ...(e?.ai && e.source.kind === "unknown" ? { ai: e.ai } : {}),
   };
 }
 
@@ -1193,6 +1362,105 @@ export async function reloadViews() {
   }
 }
 
+// ───── 阶段 M：自动问 AI ─────
+// 扫描完（打开快照 / 保存了能用的 AI 设置之后也是）后端在后台一项一项地问认不出来的大文件夹 / 文件，答案存在
+// %LOCALAPPDATA%\DiskWhy\ai-cache.json；每问到一个发 ai-answer，进度变了发 ai-status。这里收事件：
+// 进度给工具栏的小标签，答案就地补进所有缓存着的视图数据（列表、方块图），不用重新取数据。
+
+/** 后台问 AI 的进度（启动时取一次，之后跟着 ai-status 事件） */
+export const aiStatus = ref<AiStatus>({ ...AI_IDLE });
+/** 刚全部问完：问到了几个（工具栏闪一下「AI ✓」（个数只用来判断闪不闪，不写出来），AI_FLASH_MS 后回到 null） */
+export const aiFlash = ref<number | null>(null);
+export const AI_FLASH_MS = 3000;
+/** 这次运行里收到过的推测（pathKey → 推测）：数据还没带上它的时候显示用它补（ai.ts noteFor / tmNoteFor） */
+export const aiNotes = shallowRef<AiNotes>(new Map());
+let flashTimer: ReturnType<typeof setTimeout> | undefined;
+/** 启动时取进度之前已经收到过事件：取回来的（可能更旧）就不用了 */
+let aiEventSeen = false;
+let aiListening = false;
+
+function clearFlash() {
+  clearTimeout(flashTimer);
+  aiFlash.value = null;
+}
+
+/** 收到一次进度（ai-status 事件）：刚全部问完时闪一下问到的个数 */
+export function applyAiStatus(s: AiStatus) {
+  const ok = finishedOk(aiStatus.value, s);
+  aiStatus.value = { ...AI_IDLE, ...s };
+  if (ok !== null) {
+    clearTimeout(flashTimer);
+    aiFlash.value = ok;
+    flashTimer = setTimeout(() => (aiFlash.value = null), AI_FLASH_MS);
+  } else if (s.running || s.error) clearFlash();
+}
+
+/** 新的扫描开始：后端会停下正在问的，小标签先收起（扫完后端按新结果重新开始，会再发进度） */
+function aiRestart() {
+  clearFlash();
+  aiStatus.value = { ...AI_IDLE };
+}
+
+/**
+ * 收到一个答案（ai-answer 事件 / 手动「问 AI」的返回）：所有缓存着的视图对象里同一路径（大小写不敏感）、认不出来的那一项补上 ai——
+ * 列表（盘根的列表、右边正在看的列表：标题那一项 + 每一行）、方块图（盘根的数据、按文件夹缓存的子树、补节点、当前的显示树）。
+ * 列表是响应式对象，就地改界面马上跟上；方块图数据是普通对象（改它不会触发重排），悬停 / 钉住的卡片读 aiNotes，换了它就重算。
+ */
+export function applyAiAnswer(path: string, note: AiNote) {
+  if (!path || !note) return;
+  const k = pathKey(path);
+  aiNotes.value = new Map(aiNotes.value).set(k, note);
+  patchListing(listing.value, k, note);
+  patchListing(focus.value, k, note);
+  patchTree(rootTm.value, k, note);
+  for (const t of tmCache.values()) patchTree(t, k, note);
+  for (const s of tmStubs.values()) patchTree(s.node, k, note);
+  patchTree(tm.value, k, note);
+}
+
+/** 收 ai-status / ai-answer 事件，再取一次当前进度（init 里调；测试直接调） */
+export async function listenAi() {
+  if (aiListening) return;
+  aiListening = true;
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen<AiStatus>(AI_STATUS_EVENT, (e) => {
+      aiEventSeen = true;
+      applyAiStatus(e.payload);
+    });
+    await listen<AiAnswer>(AI_ANSWER_EVENT, (e) => applyAiAnswer(e.payload.path, e.payload.note));
+  } catch {
+    aiListening = false;
+    return;
+  }
+  // 界面重载 / 窗口重建时后台可能正问到一半：取一次当前进度
+  try {
+    const s = await fetchAiStatus();
+    if (s && !aiEventSeen) aiStatus.value = { ...AI_IDLE, ...s };
+  } catch {
+    /* 旧后端没有这个命令：等事件 */
+  }
+}
+
+/** 小标签「AI 出错」→「重试」：后端重新开始（还没问到的接着问） */
+export async function aiRetry() {
+  clearFlash();
+  const before = aiStatus.value;
+  aiStatus.value = { ...before, error: null };
+  try {
+    await aiRunNow();
+  } catch (e) {
+    aiStatus.value = { ...aiStatus.value, running: false, error: String(e) };
+  }
+}
+
+/** 列表展开行里手动「问 AI」：答案同样补进所有视图（后端也会存下并发 ai-answer，补两次没关系） */
+export async function askAiNow(path: string): Promise<AiNote> {
+  const note = await askAi(path);
+  applyAiAnswer(path, note);
+  return note;
+}
+
 // ───── 其他 ─────
 export async function doRelaunch() {
   relaunching.value = true;
@@ -1238,6 +1506,7 @@ export async function doOpenSnapshot(path?: string) {
   }
 }
 
+/** 保存了 AI 设置：「问 AI」按钮跟着出现 / 消失（规则同后端 LlmSettings::usable：云服务还要填了密钥） */
 export function onSettingsSaved(s: LlmSettings) {
-  if (env.value) env.value.llm_ready = s.enabled && !!s.base_url && !!s.model;
+  if (env.value) env.value.llm_ready = llmUsable(s);
 }

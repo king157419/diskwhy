@@ -28,3 +28,14 @@ dist-ssr
 
 # 浏览器预览用的假数据（含本机路径，不提交）
 /src/dev/
+
+# Rust 构建产物与本机环境
+target/
+src-tauri/target/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pdb
+*.exe

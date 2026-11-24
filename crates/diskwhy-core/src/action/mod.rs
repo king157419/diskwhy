@@ -30,7 +30,7 @@ pub mod winops;
 
 pub use execute::{execute, ExecOptions, ExecProgress, ExecReport, ItemResult};
 pub use perf::PerfModel;
-pub use plan::{build_plan, build_plan_quick, enumerate_plan};
+pub use plan::{build_plan, build_plan_forced, build_plan_quick, build_plan_quick_forced, enumerate_plan};
 pub use preflight::{preflight, preflight_with, quote, PreflightOptions, PreflightReport};
 
 use crate::explain::{How, Source, Tier};
@@ -192,6 +192,10 @@ pub enum SkipReason {
     Hardlink { links: u32 },
     /// 回收站收不下（比回收站上限还大 / 这个盘的回收站设成了直接删除）：送进去会被 Windows 直接永久删除，所以不送（阶段 J）。
     RecycleUnavailable { why: String },
+    /// 有程序正从这个文件夹里运行（进程映像在里面）：整个文件夹不动，免得删掉一半。
+    Running { processes: Vec<LockingProcess> },
+    /// 按年龄挑的规则（min_age_days）：这一项里有文件是最近 N 天改的，整个子项先不删。
+    Recent { days: u32 },
 }
 
 impl SkipReason {
@@ -207,6 +211,8 @@ impl SkipReason {
             SkipReason::Unreadable { .. } => "unreadable",
             SkipReason::Hardlink { .. } => "hardlink",
             SkipReason::RecycleUnavailable { .. } => "recycle_unavailable",
+            SkipReason::Running { .. } => "running",
+            SkipReason::Recent { .. } => "recent",
         }
     }
 
@@ -226,6 +232,11 @@ impl SkipReason {
             SkipReason::Unreadable { code } => format!("读不到文件信息（Win32 错误 {code}）"),
             SkipReason::Hardlink { .. } => "硬链接，删了不腾空间".into(),
             SkipReason::RecycleUnavailable { why } => why.clone(),
+            SkipReason::Running { processes } => format!(
+                "正在运行：{}（整个文件夹不动，DiskWhy 不会关掉它们）",
+                processes.iter().map(|p| format!("{}（PID {}）", p.name, p.pid)).collect::<Vec<_>>().join("、")
+            ),
+            SkipReason::Recent { days } => format!("最近 {days} 天内改过（只删 {days} 天以上没动过的，整个子文件夹先不删）"),
         }
     }
 }
@@ -276,6 +287,40 @@ pub struct PlanItem {
     /// 所在卷是 NTFS（常驻 MFT 的小文件删了不腾空间，见 [`crate::fs::cluster_bytes`]）。
     #[serde(default)]
     pub ntfs: bool,
+    /// 由“旧版本”（keep_latest）规则说明时：那个旧版本文件夹（这一项本身，或它所在的上层版本文件夹）。
+    /// 预检和执行开始时，这个文件夹里只要有文件被占用 / 刚改过，整个跳过（不会只删一半，见
+    /// [`preflight::skip_busy_versions`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_root: Option<String>,
+    /// 由按年龄挑的规则（min_age_days）说明时：规则命中的那个文件夹（比如 %TEMP%）和天数。它下面每个直接子项是一个
+    /// 单元：子项里有一个文件 N 天内改过 / 被占用 / 有程序在里面运行，整个子项跳过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_age_days: Option<u32>,
+    /// 商店应用重定向区里的项：(LocalCache 里的前缀, 程序看到的 AppData 前缀)。程序从重定向区运行时，
+    /// 进程映像路径是后者，判断“有没有程序在里面运行”时两种写法都要看。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msix_alias: Option<(String, String)>,
+    /// 用户二次确认后强制加入的（keep / 认不出来 / 规则说不建议直接删的）：档位门槛和规则一致性不拦，
+    /// 保护路径、节点本身（系统保留 / 映射 / 读不了 / 云占位）、热文件、占用等其余护栏照旧。
+    /// 这种项**永远不直接删**：去回收站或暂存区（见 [`Plan::dest_for`]），找得回来。
+    #[serde(default)]
+    pub forced: bool,
+}
+
+impl PlanItem {
+    /// 同一个路径在商店应用重定向下的另一种写法（没有就是 None）。
+    pub fn alias_of(&self, path: &str) -> Option<String> {
+        let (real, alias) = self.msix_alias.as_ref()?;
+        let (pl, rl) = (path.to_lowercase(), real.to_lowercase());
+        if pl == rl {
+            return Some(alias.clone());
+        }
+        let rest = pl.strip_prefix(&format!("{}\\", rl.trim_end_matches('\\')))?;
+        let n = path.chars().count() - rest.chars().count();
+        Some(format!("{}\\{}", alias.trim_end_matches('\\'), path.chars().skip(n).collect::<String>()))
+    }
 }
 
 fn default_cluster() -> u64 {
@@ -387,6 +432,13 @@ impl Plan {
 
     /// 这一项的去向：safe 档且 `safe_direct` → 直接删除；否则按策略。9 条护栏和去向无关，都在去向之前执行。
     pub fn dest_for(&self, item: &PlanItem) -> Dest {
+        // 强制加入的项不管档位、不管策略，都不直接删（策略是“直接删除”时也进回收站）
+        if item.forced {
+            return match self.strategy {
+                Strategy::Quarantine { .. } => Dest::Quarantine,
+                _ => Dest::Recycle,
+            };
+        }
         if item.tier == Tier::Safe && self.safe_direct {
             return Dest::Permanent;
         }

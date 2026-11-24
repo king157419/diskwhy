@@ -26,6 +26,7 @@ id = "chrome-cache"
 owner = "Google Chrome"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = [
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\Cache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\Code Cache',
@@ -33,19 +34,17 @@ match = [
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnGraphiteCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\*\DawnWebGPUCache',
-  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Service Worker\CacheStorage',
-  '%LOCALAPPDATA%\Google\Chrome\User Data\*\Service Worker\ScriptCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\ShaderCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\GrShaderCache',
   '%LOCALAPPDATA%\Google\Chrome\User Data\GraphiteDawnCache',
 ]
 what = "Chrome 的网页缓存（图片、脚本、显卡着色器等）"
 why = "打开过的网页先存一份，下次打开更快"
-lose = "不丢书签、密码和历史；删掉后网页第一次打开会慢一点。个别网站离线缓存的内容会重新下载。"
+lose = "不丢书签、密码和历史；网页第一次打开要联网重新下载，会慢一点。网站存在 Service Worker 里的离线数据不在这一项（单独列在“需要你判断”里）。"
 how = ["delete", "builtin_tool"]
-how_detail = "关掉 Chrome 后删除；或在 Chrome 的“删除浏览数据”里勾选“缓存的图片和文件”。"
+how_detail = "关掉 Chrome 后删除；或在 Chrome 的“删除浏览数据”里只勾“缓存的图片和文件”。"
 refs = ["https://support.google.com/chrome/answer/2392709"]
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "chrome-on-device-model"
@@ -113,6 +112,7 @@ id = "edge-cache"
 owner = "Microsoft Edge"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = [
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Cache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Code Cache',
@@ -120,18 +120,16 @@ match = [
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnGraphiteCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\DawnWebGPUCache',
-  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Service Worker\CacheStorage',
-  '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Service Worker\ScriptCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\ShaderCache',
   '%LOCALAPPDATA%\Microsoft\Edge\User Data\GrShaderCache',
 ]
 what = "Edge 的网页缓存"
 why = "打开过的网页先存一份，下次打开更快"
-lose = "不丢收藏夹、密码和历史；网页第一次打开会慢一点。"
+lose = "不丢收藏夹、密码和历史；网页第一次打开要联网重新下载，会慢一点。网站存在 Service Worker 里的离线数据不在这一项。"
 how = ["delete", "builtin_tool"]
-how_detail = "关掉 Edge（包括后台运行）后删除；或用 Edge 的“清除浏览数据”。"
+how_detail = "关掉 Edge（包括后台运行）后删除；或用 Edge 的“清除浏览数据”只勾“缓存的图像和文件”。"
 refs = []
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "edge-program"
@@ -187,25 +185,24 @@ id = "chromium-browsers-cache"
 owner = "Brave / Vivaldi / Opera"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = [
   '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Cache',
   '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Code Cache',
   '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\GPUCache',
-  '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Service Worker\CacheStorage',
   '%LOCALAPPDATA%\Vivaldi\User Data\*\Cache',
   '%LOCALAPPDATA%\Vivaldi\User Data\*\Code Cache',
   '%LOCALAPPDATA%\Vivaldi\User Data\*\GPUCache',
-  '%LOCALAPPDATA%\Vivaldi\User Data\*\Service Worker\CacheStorage',
   '%LOCALAPPDATA%\Opera Software\Opera Stable\Cache',
   '%LOCALAPPDATA%\Opera Software\Opera GX Stable\Cache',
 ]
 what = "浏览器的网页缓存"
 why = "打开过的网页先存一份，下次打开更快"
-lose = "不丢书签和密码；网页第一次打开会慢一点。"
+lose = "不丢书签和密码；网页第一次打开要联网重新下载，会慢一点。"
 how = "delete"
 how_detail = "关掉浏览器后删除，或用浏览器自带的“清除浏览数据”。"
 refs = []
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "opera-profile"
@@ -242,6 +239,7 @@ id = "firefox-cache"
 owner = "Mozilla Firefox"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = [
   '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\cache2',
   '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\startupCache',
@@ -263,6 +261,7 @@ id = "chromium-generic-cache"
 owner = "Chromium / Electron 程序"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 owner_from_path = true
 match = ['%APPDATA%\**\Cache', '%LOCALAPPDATA%\**\Cache']
 when_child = ["Cache_Data", "data_0", "data_1"]
@@ -279,6 +278,7 @@ id = "chromium-generic-code-cache"
 owner = "Chromium / Electron 程序"
 category = "cache"
 tier = "safe"
+lose_kind = "slower"
 owner_from_path = true
 match = ['%APPDATA%\**\Code Cache', '%LOCALAPPDATA%\**\Code Cache', '%APPDATA%\**\CodeCache']
 when_child = ["js", "wasm"]
@@ -295,6 +295,7 @@ id = "chromium-generic-gpu-cache"
 owner = "Chromium / Electron 程序"
 category = "cache"
 tier = "safe"
+lose_kind = "slower"
 owner_from_path = true
 match = [
   '%APPDATA%\**\GPUCache', '%LOCALAPPDATA%\**\GPUCache',
@@ -318,19 +319,25 @@ verified_on = "2026-09-23"
 id = "chromium-generic-sw-cache"
 owner = "Chromium / Electron 程序"
 category = "cache"
-tier = "safe"
+tier = "review"
+lose_kind = "unsure"
+lose_short = "离线数据可能丢"
 owner_from_path = true
+kind = "dir"
 match = [
   '%APPDATA%\**\Service Worker\CacheStorage', '%LOCALAPPDATA%\**\Service Worker\CacheStorage',
   '%APPDATA%\**\Service Worker\ScriptCache', '%LOCALAPPDATA%\**\Service Worker\ScriptCache',
 ]
-what = "网页离线缓存（Service Worker 缓存）"
-why = "网页应用（比如在线文档、网页版工具，以及飞书等 Electron 应用的内置网页）把资源存到本地，下次秒开，有的还能离线用"
-lose = "不丢账号数据（服务器上有）；删掉后这些网页应用第一次打开会重新下载资源，离线状态下暂时打不开。"
-how = "delete"
-how_detail = "退出对应程序后删除；程序会按需重新缓存。"
-refs = ["https://developer.mozilla.org/en-US/docs/Web/API/CacheStorage"]
-verified_on = "2026-09-23"
+what = "网页应用的离线存储（Service Worker 的 Cache Storage 和脚本）"
+why = "网页和 Electron 程序里的网页（Gmail、飞书文档、Razer、NVIDIA App 等）把页面和数据存在本机，下次秒开、断网也能用。Chromium 把它算作“网站数据”（和 IndexedDB 同类），不算“缓存的图片和文件”"
+lose = "大多是能重新下载的页面资源；但网站可以往里存任何东西（本机实测：Razer 存了 DeviceDataJson，NVIDIA App 存了离线数据）。删了这些网页应用要联网重新加载，存在里面、还没传到服务器的内容会丢；只删脚本不删注册信息时，对应网页的离线功能可能要联网再打开一次才恢复。"
+how = ["delete", "builtin_tool"]
+how_detail = "浏览器里按网站清：设置 > 隐私 > “Cookie 和网站数据”，只清你认得的网站；Electron 程序先完全退出再删。"
+refs = [
+  "https://chromium.googlesource.com/chromium/src/+/HEAD/content/public/browser/browsing_data_remover.h",
+  "https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria",
+]
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "crashpad-reports"
@@ -338,11 +345,13 @@ owner = "Chromium / Electron 程序"
 category = "log"
 tier = "safe"
 owner_from_path = true
-match = ['%APPDATA%\**\Crashpad', '%LOCALAPPDATA%\**\Crashpad', '%LOCALAPPDATA%\**\Crash Reports']
-what = "程序崩溃报告"
-why = "程序崩溃时记录现场，准备上传给开发者"
-lose = "只是丢掉以前的崩溃记录，不影响使用。"
+kind = "dir"
+match = ['%APPDATA%\**\Crashpad', '%LOCALAPPDATA%\**\Crashpad']
+when_child = ["settings.dat", "metadata", "reports"]
+what = "程序崩溃报告（Crashpad 记录库）"
+why = "Chromium / Electron 程序崩溃时，crashpad_handler 把现场记在这里准备上传；文件夹里有 settings.dat、metadata、reports、attachments"
+lose = "只是丢掉以前没传出去的崩溃记录，不影响使用；程序下次启动会自己建一个新的空记录库（换一个匿名编号）。"
 how = "delete"
-how_detail = "直接删除即可。"
-refs = []
-verified_on = "2026-09-23"
+how_detail = "直接删除即可；程序正在运行时个别文件被占用，跳过就行。"
+refs = ["https://chromium.googlesource.com/crashpad/crashpad/+/HEAD/doc/overview_design.md"]
+verified_on = "2026-11-02"

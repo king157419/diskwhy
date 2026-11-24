@@ -394,11 +394,20 @@ where
     let started_at = crate::explain::now_unix();
     let batch_id = new_id("");
 
+    // 执行开始时再查一遍（预检之后才打开的程序 / 之后才改过的文件）：有程序正从里面运行的清单项、在用的旧版本整项不动；
+    // 临时文件夹这类按年龄挑的单元，在用 / 又变新了的整个子项跳过（不只删一半，见 preflight::busy_at_start）。
+    let (busy_items, busy_units) = super::preflight::busy_at_start(plan, started_at);
     // 整项再过一次保护路径；拦下的项不进队列
     let item_blocked: Vec<Option<String>> = plan
         .items
         .iter()
-        .map(|i| i.blocked.clone().or_else(|| protector.check(&i.path)))
+        .enumerate()
+        .map(|(ii, i)| {
+            i.blocked
+                .clone()
+                .or_else(|| protector.check(&i.path))
+                .or_else(|| busy_items.iter().find(|(k, _)| *k == ii).map(|(_, why)| why.clone()))
+        })
         .collect();
     let active = |ii: usize| item_blocked[ii].is_none();
     let needs_q = plan
@@ -410,7 +419,8 @@ where
 
     // 预检之后才打开的浏览器 / Electron 程序：它们的磁盘缓存用“全共享（含删除）”打开，直接删会删在它们脚下
     // （PHASE_J_CRASH.md 隐患 5）。执行开始时再问一次 Restart Manager；问不出来按“正在用”处理。
-    let live_caches: Vec<String> = super::preflight::live_chromium_cache_dirs(plan).into_iter().map(|(d, _)| format!("{d}\\")).collect();
+    let mut live_caches: Vec<String> = super::preflight::live_chromium_cache_dirs(plan).into_iter().map(|(d, _)| format!("{d}\\")).collect();
+    live_caches.extend(busy_units);
 
     let (batch_dir, manifest, manifest_path) = match (plan.quarantine_root(), needs_q) {
         (Some(dest_root), true) => {

@@ -27,7 +27,12 @@ fn lower(s: &str) -> String {
 
 /// 生成计划（快速部分 + 枚举）。被拦下的项保留在计划里（带原因，界面上列出来），但不枚举内容、不会执行。
 pub fn build_plan(result: &ScanResult, ctx: &ExplainCtx, protector: &Protector, reqs: &[PlanRequest], strategy: Strategy) -> Plan {
-    let mut plan = build_plan_quick(result, ctx, protector, reqs, strategy);
+    build_plan_forced(result, ctx, protector, reqs, &[], strategy)
+}
+
+/// 同 [`build_plan`]，`forced` 里的路径（大小写不敏感）是用户二次确认后强制加入的，见 [`build_plan_quick_forced`]。
+pub fn build_plan_forced(result: &ScanResult, ctx: &ExplainCtx, protector: &Protector, reqs: &[PlanRequest], forced: &[String], strategy: Strategy) -> Plan {
+    let mut plan = build_plan_quick_forced(result, ctx, protector, reqs, forced, strategy);
     enumerate_plan(&mut plan, &Progress::default());
     plan
 }
@@ -36,6 +41,22 @@ pub fn build_plan(result: &ScanResult, ctx: &ExplainCtx, protector: &Protector, 
 /// 规则一致性）。**不枚举磁盘内容**，`entries` 为空；之后由 [`enumerate_plan`] 填。确认弹层先用它的结果
 /// （扫描时的大小）立刻出现，枚举和预检在后台做完再更新。
 pub fn build_plan_quick(result: &ScanResult, ctx: &ExplainCtx, protector: &Protector, reqs: &[PlanRequest], strategy: Strategy) -> Plan {
+    build_plan_quick_forced(result, ctx, protector, reqs, &[], strategy)
+}
+
+/// 同 [`build_plan_quick`]，`forced` 里的路径（大小写不敏感，和 `reqs` 里的写法对上即可）是用户在界面上二次确认后
+/// **强制**加入的：keep 档、认不出来、AI 推测、`how` 里没有“删除”、和规则对不上的都不再整项拒绝（档位门槛 /
+/// 规则一致性不拦），标成 [`PlanItem::forced`]，执行时只进回收站 / 暂存区。保护路径和节点本身的硬拦照旧，
+/// 预检的其余护栏（热文件 / 占用 / 云 / 链接 / 里面的保护路径）照旧。本来就能过闸的路径不受影响（不标 forced）。
+pub fn build_plan_quick_forced(
+    result: &ScanResult,
+    ctx: &ExplainCtx,
+    protector: &Protector,
+    reqs: &[PlanRequest],
+    forced: &[String],
+    strategy: Strategy,
+) -> Plan {
+    let forced: Vec<String> = forced.iter().map(|p| lower(&crate::scan::normalize_root(p))).collect();
     let mut warnings = Vec::new();
     // 去重 + 去掉被别的项包含的项（删父目录内容时子项自然包含在内）。
     let mut paths: Vec<&PlanRequest> = Vec::new();
@@ -67,7 +88,8 @@ pub fn build_plan_quick(result: &ScanResult, ctx: &ExplainCtx, protector: &Prote
         if !keep[i] {
             continue;
         }
-        items.push(build_item(result, ctx, protector, r, &norm[i], &mut cluster_cache));
+        let f = forced.contains(&lower(&norm[i]));
+        items.push(build_item(result, ctx, protector, r, &norm[i], f, &mut cluster_cache));
     }
     Plan {
         id: new_id("plan-"),
@@ -102,7 +124,21 @@ fn blocked_item(path: &str, reason: String) -> PlanItem {
         enum_errors: Vec::new(),
         cluster: 4096,
         ntfs: false,
+        version_root: None,
+        age_root: None,
+        min_age_days: None,
+        msix_alias: None,
+        forced: false,
     }
+}
+
+/// 商店应用重定向：(LocalCache 里的前缀, 程序看到的 AppData 前缀)，两边共同的尾部去掉。
+fn msix_alias(ctx: &ExplainCtx, full: &str) -> Option<(String, String)> {
+    let m = ctx.msix_redirect(full)?;
+    let a: Vec<&str> = full.split('\\').filter(|s| !s.is_empty()).collect();
+    let b: Vec<&str> = m.mapped.split('\\').filter(|s| !s.is_empty()).collect();
+    let common = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x.eq_ignore_ascii_case(y)).count();
+    Some((a[..a.len() - common].join("\\"), b[..b.len() - common].join("\\")))
 }
 
 fn build_item(
@@ -111,6 +147,7 @@ fn build_item(
     protector: &Protector,
     req: &PlanRequest,
     path: &str,
+    forced: bool,
     cluster_cache: &mut HashMap<String, (u64, bool)>,
 ) -> PlanItem {
     // 1. 保护路径（最先查，连解释都不用做）
@@ -148,21 +185,36 @@ fn build_item(
         enum_errors: Vec::new(),
         cluster: 4096,
         ntfs: false,
+        version_root: None,
+        age_root: None,
+        min_age_days: None,
+        msix_alias: msix_alias(ctx, &full),
+        forced: false,
     };
     // 3. 节点本身（系统保留 / 映射 / 无权限 / 云占位 / 其余小文件）
     if let Some(why) = node_gate(node) {
         item.blocked = Some(why);
         return item;
     }
-    // 4. 档位门槛
-    if let Some(why) = tier_gate(&e) {
-        item.blocked = Some(why);
-        return item;
+    // 4. 档位门槛 + 5. 规则一致性：用户二次确认过的（forced）不拦，改成只进回收站 / 暂存区
+    let gate = tier_gate(&e).or_else(|| rule_consistent(ctx, &e.source, &full, node, req.expect_rule.as_deref()).err());
+    if let Some(why) = gate {
+        if !forced {
+            item.blocked = Some(why);
+            return item;
+        }
+        item.forced = true;
     }
-    // 5. 规则一致性
-    if let Err(why) = rule_consistent(ctx, &e.source, &full, node, req.expect_rule.as_deref()) {
-        item.blocked = Some(why);
-        return item;
+    // 旧版本规则：记下它所在的那个版本文件夹（预检 / 执行时整个文件夹一起看占用）。
+    if let Source::Rule { id, inherited_from, .. } = &e.source {
+        if ctx.rules.by_id(id).is_some_and(|r| r.keep_latest.is_some()) {
+            item.version_root = Some(inherited_from.clone().unwrap_or_else(|| full.clone()));
+        }
+        // 按年龄挑的规则（临时文件夹）：记下规则命中的文件夹，它下面每个直接子项单独看年龄 / 占用。
+        if let Some(n) = ctx.rules.by_id(id).and_then(|r| r.min_age_days) {
+            item.age_root = Some(inherited_from.clone().unwrap_or_else(|| full.clone()));
+            item.min_age_days = Some(n);
+        }
     }
     let vol = crate::scan::volume_root_of(&full).unwrap_or_default();
     (item.cluster, item.ntfs) =

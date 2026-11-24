@@ -12,7 +12,11 @@
 //! - 启发式候选：规则完全没覆盖到的地方，名字像 `node_modules` / `target` / `bin` / `obj` 或里面有
 //!   `.rustc_info.json` 的文件夹，按启发式解释；结果是可删的 `rust-target` / `node-modules` / `dotnet-build`
 //!   时出候选（review 档，默认不选）。
-//! - 商店应用重定向的 LocalCache 区域不列（那里的路径预检时按真实 AppData 路径解释，规则一致性对不上）。
+//! - 商店应用重定向的 LocalCache 区域不列（那里的路径预检时按真实 AppData 路径解释，规则一致性对不上）；
+//!   例外：`keep_latest`（旧版本）规则自己写了 LocalCache 路径的模式时，只按这些模式往里找（比如商店版 Claude 自带的
+//!   Claude Code 旧版本），规则一致性按写明的模式对得上。
+//! - `keep_latest` 规则里“正在用的版本”（[`ExplainCtx::is_current_version`]）当 keep：不出候选，外层文件夹里有它也算
+//!   “里面有更严格的”。
 //!
 //! 同一条规则 / 启发式的所有路径合成一组，界面上一行。
 
@@ -31,6 +35,11 @@ pub struct CandidatePath {
     pub bytes: u64,
     /// 能不能直接删（能的话清理页可以勾选，预检时会再判断一遍）。
     pub deletable: bool,
+    /// 硬拦（保护路径 / 系统保留 / 映射 / 读不了 / 云占位 / 硬链接）的短原因（≤ 6 个字）：这种路径怎么都不能勾。
+    /// None 而且 `deletable = false`：规则说不建议直接删（要手动 / 用自带工具 / 里面有更严格的），界面上可以
+    /// 二次确认后强制勾选（预检时按 `forced` 处理，只进回收站 / 暂存区）。
+    #[serde(default)]
+    pub hard: Option<String>,
 }
 
 /// 一组候选（同一条规则或同一种启发式）。
@@ -110,7 +119,7 @@ const RULE_LABELS: &[(&str, &str)] = &[
     ("chromium-generic-sw-cache", "网页离线缓存"),
     ("crashpad-reports", "崩溃报告"),
     ("wechat-files-cache", "微信文件缓存"),
-    ("wechat-render-cache", "微信浏览器缓存"),
+    ("wechat-radium", "微信小程序数据"),
     ("wechat-logs", "微信日志"),
     ("wechat-update", "微信更新包"),
     ("wechat-appdata", "微信程序数据"),
@@ -136,6 +145,7 @@ const RULE_LABELS: &[(&str, &str)] = &[
     ("npm-global", "npm 全局工具"),
     ("pnpm-store", "pnpm 仓库"),
     ("yarn-cache", "Yarn 缓存"),
+    ("yarn-berry-cache", "Yarn 新版缓存"),
     ("bun-cache", "Bun 缓存"),
     ("playwright-browsers", "Playwright 浏览器"),
     ("electron-download-cache", "Electron 下载缓存"),
@@ -178,6 +188,10 @@ const RULE_LABELS: &[(&str, &str)] = &[
     ("codex-desktop-local", "Codex 桌面程序"),
     ("codex-runtimes-cache", "Codex 运行时"),
     ("codex-runtimes-previous", "Codex 旧运行时"),
+    ("claude-code-old-versions", "Claude Code 旧版本"),
+    ("codex-command-runner-old", "Codex 沙盒旧版本"),
+    ("codex-cua-node-old", "Codex 旧 Node 运行时"),
+    ("wps-office-old-versions", "WPS 旧版本"),
     ("aclos-game-recorder", "ACLOS 数据"),
     ("aclos-highlight-videos", "无畏时刻录像"),
     ("aclos-old-installer", "ACLOS 旧安装包"),
@@ -191,6 +205,7 @@ const RULE_LABELS: &[(&str, &str)] = &[
     ("hiberfil", "休眠文件"),
     ("recycle-bin", "回收站"),
     ("thumbnail-cache", "缩略图缓存"),
+    ("explorer-cache-dir", "资源管理器缓存"),
     ("inetcache", "IE 缓存"),
     ("directx-shader-cache", "DirectX 缓存"),
     ("windows-error-reports", "错误报告"),
@@ -234,17 +249,44 @@ fn rule_deletable_kind(how: &[How]) -> bool {
 
 /// 节点本身能不能动（和预检的 node_gate 一致）。
 fn node_ok(n: &Node) -> bool {
-    n.kind != NodeKind::Rest && !n.system_reserved && !n.mapped && !n.inaccessible && !n.cloud_placeholder && !n.hardlink_dup
+    node_hard(n).is_none()
+}
+
+/// 节点本身怎么都不能动的短原因（≤ 6 个字）；能动为 None。
+pub fn node_hard(n: &Node) -> Option<&'static str> {
+    if n.kind == NodeKind::Rest {
+        Some("零散文件")
+    } else if n.system_reserved {
+        Some("系统保留")
+    } else if n.mapped {
+        Some("映射目录")
+    } else if n.inaccessible {
+        Some("没有权限")
+    } else if n.cloud_placeholder {
+        Some("云端文件")
+    } else if n.hardlink_dup {
+        Some("不腾空间")
+    } else {
+        None
+    }
 }
 
 struct Walker<'a> {
     ctx: &'a ExplainCtx,
-    blocked: &'a dyn Fn(&str) -> bool,
+    blocked: &'a dyn Fn(&str) -> Option<String>,
     groups: HashMap<String, CandidateGroup>,
+    /// 正在商店应用的 LocalCache 区域里（只找旧版本规则，不做启发式）。
+    in_msix: bool,
 }
 
 /// 扫描树 → 清理候选（按 bytes 降序）。`blocked(path)` 返回 true 表示保护路径拦下（不能直接删）。
 pub fn cleanup_candidates(tree: &Node, ctx: &ExplainCtx, blocked: &dyn Fn(&str) -> bool) -> Vec<CandidateGroup> {
+    cleanup_candidates_with(tree, ctx, &|p: &str| blocked(p).then(|| "系统保护".to_string()))
+}
+
+/// 同 [`cleanup_candidates`]，`blocked(path)` 返回保护路径的短原因（≤ 6 个字，见 `protect::short_reason`），
+/// 填进 [`CandidatePath::hard`]。
+pub fn cleanup_candidates_with(tree: &Node, ctx: &ExplainCtx, blocked: &dyn Fn(&str) -> Option<String>) -> Vec<CandidateGroup> {
     let rs = &ctx.rules;
     let root_segs = split_lower(&tree.path);
     let active: Vec<u32> = (0..rs.patterns.len() as u32)
@@ -253,7 +295,7 @@ pub fn cleanup_candidates(tree: &Node, ctx: &ExplainCtx, blocked: &dyn Fn(&str) 
             p.matches(&root_segs) || p.could_match_below(&root_segs)
         })
         .collect();
-    let mut w = Walker { ctx, blocked, groups: HashMap::new() };
+    let mut w = Walker { ctx, blocked, groups: HashMap::new(), in_msix: false };
     let mut segs = root_segs;
     let mut chain: Vec<&Node> = Vec::new();
     w.walk(tree, &mut segs, &active, None, None, &mut chain);
@@ -284,6 +326,20 @@ impl<'a> Walker<'a> {
         r.tier != Tier::Keep && r.scope == Scope::Tree && r.how.iter().any(|h| *h != How::None)
     }
 
+    /// keep_latest：`parent` 的第 `idx` 个子项（精确命中规则 `ri`）是不是正在用的版本（同一父目录同一规则只算一次）。
+    fn is_current(&self, cache: &mut Vec<(usize, Vec<bool>)>, ri: usize, parent: &Node, idx: usize) -> bool {
+        if self.ctx.rules.rules[ri].keep_latest.is_none() {
+            return false;
+        }
+        if let Some((_, v)) = cache.iter().find(|(r, _)| *r == ri) {
+            return v[idx];
+        }
+        let v = self.ctx.current_versions(ri, parent, &self.ctx.match_segs(&parent.path));
+        let f = v[idx];
+        cache.push((ri, v));
+        f
+    }
+
     /// 这个节点的“实际档位”：safe 规则落在个人文件夹下降为 review（和解释一致）。
     fn effective_tier(&self, ri: usize, segs: &[String]) -> Tier {
         let r = &self.ctx.rules.rules[ri];
@@ -300,7 +356,8 @@ impl<'a> Walker<'a> {
         let rs = &self.ctx.rules;
         let mut other = 0u64;
         let mut strict = false;
-        for c in &node.children {
+        let mut cur_cache: Vec<(usize, Vec<bool>)> = Vec::new();
+        for (ci, c) in node.children.iter().enumerate() {
             if c.kind == NodeKind::Rest {
                 continue;
             }
@@ -312,7 +369,8 @@ impl<'a> Walker<'a> {
                     if ri != outer {
                         other += c.allocated;
                         let r = &rs.rules[ri];
-                        let t = if r.tier == Tier::Safe && self.ctx.is_protected(segs) { Tier::Review } else { r.tier };
+                        // 旧版本规则里正在用的版本当 keep（和解释一致）。
+                        let t = if self.is_current(&mut cur_cache, ri, node, ci) { Tier::Keep } else { self.effective_tier(ri, segs) };
                         if t == Tier::Keep || !rule_deletable_kind(&r.how) || (outer_tier == Tier::Safe && t == Tier::Review) {
                             strict = true;
                         }
@@ -332,16 +390,17 @@ impl<'a> Walker<'a> {
         (other, strict)
     }
 
-    fn add(&mut self, key: String, make: impl FnOnce() -> CandidateGroup, path: String, bytes: u64, deletable: bool) {
+    fn add(&mut self, key: String, make: impl FnOnce() -> CandidateGroup, path: String, bytes: u64, deletable: bool, hard: Option<String>) {
         let g = self.groups.entry(key).or_insert_with(make);
         g.bytes += bytes;
         if deletable {
             g.deletable_bytes += bytes;
         }
-        g.paths.push(CandidatePath { path, bytes, deletable });
+        let hard = if deletable { None } else { hard };
+        g.paths.push(CandidatePath { path, bytes, deletable, hard });
     }
 
-    fn add_rule(&mut self, ri: usize, tier: Tier, path: String, bytes: u64, deletable: bool) {
+    fn add_rule(&mut self, ri: usize, tier: Tier, path: String, bytes: u64, deletable: bool, hard: Option<String>) {
         let r = &self.ctx.rules.rules[ri];
         // 降档（safe → review）的路径单独成组，免得一组里档位不一致。
         let key = if tier == r.tier { r.id.clone() } else { format!("{}@review", r.id) };
@@ -380,7 +439,7 @@ impl<'a> Walker<'a> {
             deletable_bytes: 0,
             paths: Vec::new(),
         };
-        self.add(key.clone(), make, path, bytes, deletable);
+        self.add(key.clone(), make, path, bytes, deletable, hard);
     }
 
     /// 规则没覆盖到的文件夹：看看是不是可删的编译产物 / 依赖。命中返回 true（不再往里走）。
@@ -401,7 +460,8 @@ impl<'a> Walker<'a> {
         if e.tier == Tier::Keep || !e.how.contains(&How::Delete) {
             return false;
         }
-        let deletable = !(self.blocked)(&node.path);
+        let hard = (self.blocked)(&node.path);
+        let deletable = hard.is_none();
         let key = format!("h:{name}");
         let (name_s, label_s) = (name.clone(), label.to_string());
         let make = || CandidateGroup {
@@ -423,7 +483,7 @@ impl<'a> Walker<'a> {
             deletable_bytes: 0,
             paths: Vec::new(),
         };
-        self.add(key.clone(), make, node.path.clone(), node.allocated, deletable);
+        self.add(key.clone(), make, node.path.clone(), node.allocated, deletable, hard);
         true
     }
 
@@ -440,13 +500,21 @@ impl<'a> Walker<'a> {
     ) {
         let rs = &self.ctx.rules;
         chain.push(node);
-        for c in &node.children {
+        let mut cur_cache: Vec<(usize, Vec<bool>)> = Vec::new();
+        for (ci, c) in node.children.iter().enumerate() {
             if c.kind == NodeKind::Rest {
                 continue;
             }
             segs.push(c.name.to_lowercase());
-            // 商店应用的 LocalCache\{Local,Roaming,LocalLow}：不列。
-            if c.kind == NodeKind::Dir && self.ctx.msix_redirect(&join(&c.path, "x")).is_some() {
+            // 商店应用的 LocalCache\{Local,Roaming,LocalLow}：不列；只有写明了 LocalCache 路径的旧版本规则往里找。
+            if !self.in_msix && c.kind == NodeKind::Dir && self.ctx.msix_redirect(&join(&c.path, "x")).is_some() {
+                let ka: Vec<u32> =
+                    self.filter_active(active, segs).into_iter().filter(|&i| rs.rules[rs.patterns[i as usize].0].keep_latest.is_some()).collect();
+                if !ka.is_empty() && !c.children.is_empty() {
+                    self.in_msix = true;
+                    self.walk(c, segs, &ka, inherited, inside_rule, chain);
+                    self.in_msix = false;
+                }
                 segs.pop();
                 continue;
             }
@@ -455,23 +523,34 @@ impl<'a> Walker<'a> {
             let full = if c.kind == NodeKind::Dir { c.path.clone() } else { join(&node.path, &c.name) };
             let mut descend = c.kind == NodeKind::Dir && !c.children.is_empty();
             let mut next_inside = inside_rule;
+            // 旧版本规则里正在用的版本：keep，不出候选；里面也不再按这条规则 / 启发式找。
+            let current = exact.is_some_and(|ri| self.is_current(&mut cur_cache, ri, node, ci));
             match exact {
+                Some(ri) if current => next_inside = Some(ri),
                 Some(ri) if Some(ri) != inside_rule && self.rule_candidate(ri) => {
                     let tier = self.effective_tier(ri, segs);
                     let r = &rs.rules[ri];
                     let (other, strict) = if c.kind == NodeKind::Dir { self.inside(c, segs, &ca, ri, tier) } else { (0, false) };
-                    let can_delete = rule_deletable_kind(&r.how) && node_ok(c) && !(self.blocked)(&full);
+                    let hard = node_hard(c).map(str::to_string).or_else(|| (self.blocked)(&full));
+                    let can_delete = rule_deletable_kind(&r.how) && hard.is_none();
+                    // 按年龄挑的规则（临时文件夹）：只算 N 天以上没改过的直接子项（预检 / 执行时按真实修改时间再挑一遍）。
+                    let size = match r.min_age_days {
+                        Some(n) if c.kind == NodeKind::Dir => super::old_children_bytes(c, self.ctx.now - n as i64 * 86_400),
+                        _ => c.allocated,
+                    };
                     if can_delete && !strict {
                         // 整个文件夹 / 文件就是一个候选，不再往里看。
-                        self.add_rule(ri, tier, full, c.allocated, true);
+                        if size > 0 {
+                            self.add_rule(ri, tier, full, size, true, None);
+                        }
                         descend = false;
                     } else {
-                        self.add_rule(ri, tier, full, c.allocated.saturating_sub(other), false);
+                        self.add_rule(ri, tier, full, size.min(c.allocated.saturating_sub(other)), false, hard);
                         next_inside = Some(ri);
                     }
                 }
                 Some(ri) if Some(ri) == inside_rule => {}
-                None if inherited.is_none() && inside_rule.is_none() => {
+                None if inherited.is_none() && inside_rule.is_none() && !self.in_msix => {
                     if self.try_heuristic(c, chain) {
                         descend = false;
                     }

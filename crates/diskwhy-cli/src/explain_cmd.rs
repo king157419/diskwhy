@@ -1,6 +1,6 @@
 //! `diskwhy-cli explain <root> --top 50`：扫描后对前 N 大目录逐个解释，并统计覆盖率。
 
-use super::Args;
+use crate::legacy::Args;
 use diskwhy_core::action::protect::Protector;
 use diskwhy_core::explain::candidates::{cleanup_candidates, CandidateGroup};
 use diskwhy_core::explain::{tier_summary, ExplainCtx, Explanation, Source, Tier, TierSummary};

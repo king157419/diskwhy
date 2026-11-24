@@ -2,12 +2,13 @@
 import { computed, onMounted, watch } from "vue";
 import TitleBar from "./components/TitleBar.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
+import ForceConfirm from "./components/ForceConfirm.vue";
 import HomePage from "./pages/HomePage.vue";
 import CleanupPage from "./pages/CleanupPage.vue";
 import ExplorePage from "./pages/ExplorePage.vue";
 import QuarantinePage from "./pages/QuarantinePage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
-import { dialogSeq, execPhase, init, message, notice, page, report } from "./store";
+import { dialogSeq, execPhase, forceAsk, init, message, notice, page, report } from "./store";
 
 const pages = {
   home: HomePage,
@@ -33,7 +34,7 @@ watch(notice, (v) => {
 <template>
   <div class="app">
     <TitleBar :modal="modal" />
-    <component :is="pages[page]" :key="page" class="page" :inert="modal" />
+    <component :is="pages[page]" :key="page" class="page" :inert="modal || !!forceAsk" />
 
     <div class="banners" aria-live="polite">
       <div v-if="message" class="banner err" role="alert">
@@ -52,6 +53,8 @@ watch(notice, (v) => {
 
     <!-- 确认 → 执行中 → 完成都在这个弹层里；界面重载后重新附着到正在进行的清理时没有预检报告 -->
     <ConfirmDialog v-if="modal" :key="dialogSeq" :report="report" />
+    <!-- 勾 keep / 认不出来 / 不建议直接删的东西时的二次确认 -->
+    <ForceConfirm v-if="forceAsk && !modal" />
   </div>
 </template>
 
@@ -104,13 +107,14 @@ watch(notice, (v) => {
   color: var(--ink);
   border-left: 3px solid var(--danger);
 }
+/* 提示 / 报错写全（阶段 L：不截成三行加省略号）；特别长的在框里滚动，提示条不会盖住半个窗口 */
 .b-text {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
+  max-height: calc(1.4em * 6);
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
   user-select: text;
 }
 .b-x {

@@ -85,6 +85,7 @@ id = "ollama-updates"
 owner = "Ollama"
 category = "installer"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\Ollama\updates_v2', '%LOCALAPPDATA%\Ollama\updates']
 what = "Ollama 自动更新时下载的新版安装包"
 why = "Ollama 官方 Windows 文档：%LOCALAPPDATA%\\Ollama 里放的是日志和下载的更新（downloaded updates）；本机 updates_v2 里是一个按哈希命名的文件夹，装着新版安装程序"

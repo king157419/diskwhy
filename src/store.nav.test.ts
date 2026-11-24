@@ -360,12 +360,19 @@ describe("reloadViews：清理之后", () => {
 });
 
 describe("F7：缩放后图顶上的根标题条", () => {
-  it("单击它 = 收起到这个根这一级（链停在它这里，和点面包屑上它那一级一样）", async () => {
+  it("单击它 = 收起这个根自己（阶段 L：和链上别的容器的标题栏一样；和下面那一层的「收起」不再是同一件事）", async () => {
     await store.digTo("C:\\Users\\king\\AppData\\Local\\Temp");
-    // 根标题条（图的根 = AppData）发出的是「往里挖到 AppData」：链截到 AppData
-    await store.mapClick({ kind: "dir", path: "C:\\Users\\king\\AppData" }, { at: 1000, detail: 1 });
+    // 下面那一层（Local）的「收起」：链截到 AppData
+    await store.mapClick({ kind: "head", path: "C:\\Users\\king\\AppData\\Local", outer: "C:\\Users\\king\\AppData\\Local" }, { at: 1000, detail: 1 });
     expect(paths()).toEqual(["Users", "king", "AppData"]);
-    expect(store.crumbs.value.map((c) => c.name)).toEqual(["C:", "Users", "king", "AppData"]);
+    await store.digTo("C:\\Users\\king\\AppData\\Local\\Temp");
+    // 根标题条（图的根 = AppData）的「收起」：AppData 自己收起，链截到它之前
+    await store.mapClick({ kind: "head", path: "C:\\Users\\king\\AppData", outer: "C:\\Users\\king\\AppData" }, { at: 3000, detail: 1 });
+    expect(paths()).toEqual(["Users", "king"]);
+    expect(store.crumbs.value.map((c) => c.name)).toEqual(["C:", "Users", "king"]);
+    // 根是外壳合并块（Users \ king）：按外层收起 = 两层一起收起
+    await store.mapClick({ kind: "head", path: "C:\\Users\\king", outer: "C:\\Users" }, { at: 5000, detail: 1 });
+    expect(store.chain.value).toEqual([]);
   });
 });
 

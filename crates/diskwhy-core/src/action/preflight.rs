@@ -2,7 +2,7 @@
 //!
 //! | # | 护栏 | 在哪 | 结果 |
 //! |---|---|---|---|
-//! | 1 | 档位门槛：只有 safe / review 可进清单；keep、未知（Unknown）、AI 推测（Llm）一律拒绝；`how` 里没有“删除”的也拒绝（给出该用的工具） | [`tier_gate`] | 整项拒绝 |
+//! | 1 | 档位门槛：只有 safe / review 可进清单；keep、未知（Unknown）、AI 推测（Llm）一律拒绝；`how` 里没有“删除”的也拒绝（给出该用的工具）。例外：用户二次确认后强制加入的（`forced`）不拒绝，改成只进回收站 / 暂存区 | [`tier_gate`] | 整项拒绝 |
 //! | 2 | 保护路径硬编码（本身 / 里面 / 祖先） | [`super::protect`] | 整项拒绝；条目级命中则跳过该条 |
 //! | 3 | 规则一致性：路径必须被该规则的 match 命中（或在 tree 规则命中的文件夹里面），不许删规则目录的父目录；加入清单时的规则和现在算出来的必须一样 | [`rule_consistent`] | 整项拒绝 |
 //! | 4 | 热文件：30 分钟内修改过的跳过并计数 | [`preflight`] | 跳过该条 |
@@ -189,6 +189,9 @@ pub struct ItemReport {
     /// 会删掉的空子文件夹个数（清单项本身的文件夹保留）。
     pub dirs_to_remove: usize,
     pub enum_errors: Vec<String>,
+    /// 用户二次确认后强制加入的（见 [`super::PlanItem::forced`]）：只进回收站 / 暂存区。
+    #[serde(default)]
+    pub forced: bool,
 }
 
 /// 警告。
@@ -412,6 +415,10 @@ pub fn preflight_with(plan: &mut Plan, protector: &Protector, opts: &PreflightOp
     let live = skip_live_chromium_caches(plan, opts);
     timing.insert("live_cache_check".into(), tl.elapsed().as_millis() as u64);
     all_procs.extend(live);
+    // 旧版本文件夹：有一个文件在用 / 刚改过就整个跳过（不只删一半）。
+    let tv = std::time::Instant::now();
+    all_procs.extend(skip_busy_units(plan, opts.now));
+    timing.insert("busy_version_check".into(), tv.elapsed().as_millis() as u64);
     all_procs.sort_by_key(|p| p.pid);
     all_procs.dedup_by_key(|p| p.pid);
     skip_cross_volume_hardlinks(plan);
@@ -535,6 +542,257 @@ pub fn skip_live_chromium_caches(plan: &mut Plan, opts: &PreflightOptions) -> Ve
         procs.extend(p.iter().cloned());
     }
     procs
+}
+
+// ───────────────────────── 整个单元要么全删、要么全不动 ─────────────────────────
+//
+// “单元”：
+// - 旧版本文件夹（keep_latest 规则，[`super::PlanItem::version_root`]）；
+// - 按年龄挑的规则（min_age_days，比如 %TEMP%）命中的文件夹里的**每个直接子项**（[`super::PlanItem::age_root`]）。
+// 单元里只要有一个文件被占用 / 刚改过 / 太新（年龄规则）/ 有程序正从里面运行，整个单元的条目都跳过，不会只删一半。
+// 另外（不分规则）：任何清单项里有程序正在运行（进程映像在里面），整项跳过（“正在运行”）。
+
+/// 交给 Restart Manager 的文件最多这么多个（程序本体 .exe / .dll 等排在前面）。
+const UNIT_RM_MAX_FILES: usize = 4000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitKind {
+    Version,
+    Age(u32),
+}
+
+struct Unit {
+    /// 单元根（原样大小写）。
+    root: String,
+    kind: UnitKind,
+    /// (清单项, 条目)。
+    members: Vec<(usize, usize)>,
+}
+
+/// 条目所属的单元：旧版本项 → 版本文件夹；年龄项 → 规则文件夹下的第一层子项；别的 → None。
+fn unit_of(item: &super::PlanItem, path: &str) -> Option<(String, UnitKind)> {
+    if let Some(r) = &item.version_root {
+        return Some((r.clone(), UnitKind::Version));
+    }
+    let (root, n) = (item.age_root.as_ref()?, item.min_age_days?);
+    let k = root.split('\\').filter(|s| !s.is_empty()).count();
+    let segs: Vec<&str> = path.split('\\').filter(|s| !s.is_empty()).collect();
+    if segs.len() <= k {
+        return Some((path.to_string(), UnitKind::Age(n)));
+    }
+    Some((segs[..=k].join("\\"), UnitKind::Age(n)))
+}
+
+/// 清单里所有单元（小写根 → 单元），只看没被拦下的项。
+fn unit_groups(plan: &Plan) -> BTreeMap<String, Unit> {
+    let mut m: BTreeMap<String, Unit> = BTreeMap::new();
+    for (ii, it) in plan.items.iter().enumerate() {
+        if it.blocked.is_some() || (it.version_root.is_none() && it.age_root.is_none()) {
+            continue;
+        }
+        for (ei, e) in it.entries.iter().enumerate() {
+            if let Some((root, kind)) = unit_of(it, &e.path) {
+                m.entry(root.to_lowercase()).or_insert_with(|| Unit { root, kind, members: Vec::new() }).members.push((ii, ei));
+            }
+        }
+    }
+    m
+}
+
+fn is_module(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    [".exe", ".dll", ".node", ".pyd", ".sys", ".ocx"].iter().any(|x| l.ends_with(x))
+}
+
+/// 这些条目里的文件，交给 Restart Manager 问（程序本体在前，最多 [`UNIT_RM_MAX_FILES`] 个）。
+fn unit_files<'a>(plan: &'a Plan, members: impl Iterator<Item = &'a (usize, usize)>) -> Vec<String> {
+    let mut files: Vec<&str> = members
+        .map(|&(ii, ei)| &plan.items[ii].entries[ei])
+        .filter(|e| e.kind == EntryKind::File && !is_cloud_attrs(e.attrs, e.reparse_tag))
+        .map(|e| e.path.as_str())
+        .collect();
+    files.sort_by_key(|p| !is_module(p));
+    files.into_iter().take(UNIT_RM_MAX_FILES).map(str::to_string).collect()
+}
+
+/// 单元里（或它在商店应用重定向下的另一种写法里）正在运行的程序。
+fn running_in(plan: &Plan, images: &[winops::RunningImage], u: &Unit) -> Vec<LockingProcess> {
+    let mut p = winops::images_under(images, &u.root);
+    if let Some(alias) = u.members.first().and_then(|&(ii, _)| plan.items[ii].alias_of(&u.root)) {
+        p.extend(winops::images_under(images, &alias));
+    }
+    p
+}
+
+/// 一个条目的修改时间（Unix 秒）：预检取到的指纹优先，没有就用列目录时的。
+fn entry_mtime(e: &super::Entry) -> i64 {
+    e.fp.map(|f| winops::ft_to_unix(f.mtime_ft)).unwrap_or(e.mtime)
+}
+
+/// 问 Restart Manager：这些单元里哪些有程序在用（先整体问一次，没人用就不再逐个问）。返回 (小写根, 进程)。
+/// **问不出来就当它在用**：宁可这次不删，也不在运行中的程序脚下删掉一半。
+fn rm_busy_units(plan: &Plan, units: &[(&String, &Unit)]) -> Vec<(String, Vec<LockingProcess>)> {
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let total: usize = units.iter().map(|(_, u)| u.members.len()).sum();
+    if total <= UNIT_RM_MAX_FILES {
+        let all = unit_files(plan, units.iter().flat_map(|(_, u)| u.members.iter()));
+        if let Ok(p) = winops::rm_locking_processes(&all) {
+            if p.is_empty() {
+                return Vec::new();
+            }
+        }
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let found: std::sync::Mutex<Vec<(String, Vec<LockingProcess>)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((key, u)) = units.get(k) else { break };
+                let files = unit_files(plan, u.members.iter());
+                match winops::rm_locking_processes(&files) {
+                    Ok(p) if p.is_empty() => {}
+                    Ok(p) => found.lock().unwrap_or_else(|e| e.into_inner()).push(((*key).clone(), p)),
+                    Err(_) => found.lock().unwrap_or_else(|e| e.into_inner()).push(((*key).clone(), Vec::new())),
+                }
+            });
+        }
+    });
+    found.into_inner().unwrap_or_default()
+}
+
+/// 预检：单元要么整个删，要么整个不动；有程序在里面运行的清单项整项不动。单元里只要有一个文件
+/// - 探测时就被占用，或 Restart Manager 查到有程序在用（问不出来也算），或有程序正从里面运行，或
+/// - 30 分钟内改过；年龄规则的单元：有文件是 N 天内改的（按刚取到的指纹里的修改时间），
+///
+/// 这个单元的**所有**条目都改成跳过。逐个文件的“跳过被占用的”会把一个还在用的旧版本 / 临时文件夹删掉一半。
+/// `now` 是 Unix 秒。返回查到的进程。
+pub fn skip_busy_units(plan: &mut Plan, now: i64) -> Vec<LockingProcess> {
+    let images = winops::running_images();
+    skip_busy_units_with(plan, now, &images)
+}
+
+/// 同 [`skip_busy_units`]，进程快照由调用方给（测试用）。
+pub fn skip_busy_units_with(plan: &mut Plan, now: i64, images: &[winops::RunningImage]) -> Vec<LockingProcess> {
+    let mut procs = Vec::new();
+    let groups = unit_groups(plan);
+    let mut reasons: BTreeMap<String, SkipReason> = BTreeMap::new();
+    for (key, u) in &groups {
+        let mut reason: Option<SkipReason> = None;
+        for &(ii, ei) in &u.members {
+            match &plan.items[ii].decisions[ei] {
+                Decision::Skip { reason: r @ SkipReason::Locked { .. } } => reason = Some(r.clone()),
+                Decision::Skip { reason: r @ SkipReason::Hot { .. } } if reason.is_none() => reason = Some(r.clone()),
+                _ => {}
+            }
+        }
+        if let (None, UnitKind::Age(n)) = (&reason, u.kind) {
+            let cutoff = now - n as i64 * 86_400;
+            if u.members.iter().any(|&(ii, ei)| entry_mtime(&plan.items[ii].entries[ei]) >= cutoff) {
+                reason = Some(SkipReason::Recent { days: n });
+            }
+        }
+        if reason.is_none() {
+            let p = running_in(plan, images, u);
+            if !p.is_empty() {
+                procs.extend(p.iter().cloned());
+                reason = Some(SkipReason::Running { processes: p });
+            }
+        }
+        if let Some(r) = reason {
+            reasons.insert(key.clone(), r);
+        }
+    }
+    // 剩下的单元问 Restart Manager（运行中的 exe / 加载的 dll / 打开着的文件都看得出来）
+    let rest: Vec<(&String, &Unit)> = groups.iter().filter(|(k, _)| !reasons.contains_key(*k)).collect();
+    for (key, p) in rm_busy_units(plan, &rest) {
+        procs.extend(p.iter().cloned());
+        reasons.insert(key, SkipReason::Locked { processes: p });
+    }
+    for (key, r) in &reasons {
+        for &(ii, ei) in &groups[key].members {
+            let d = &mut plan.items[ii].decisions[ei];
+            if matches!(d, Decision::Delete | Decision::RemoveLink | Decision::Pending) {
+                *d = Decision::Skip { reason: r.clone() };
+            }
+        }
+    }
+    // 不分规则：清单项里有程序正在运行 → 整项不动（不属于上面单元的项；单元项已经按单元看过了）
+    for item in plan.items.iter_mut().filter(|i| i.blocked.is_none() && i.version_root.is_none() && i.age_root.is_none()) {
+        let mut p = winops::images_under(images, &item.path);
+        if let Some(a) = item.alias_of(&item.path) {
+            p.extend(winops::images_under(images, &a));
+        }
+        if p.is_empty() {
+            continue;
+        }
+        procs.extend(p.iter().cloned());
+        let r = SkipReason::Running { processes: p };
+        for d in item.decisions.iter_mut() {
+            if matches!(d, Decision::Delete | Decision::RemoveLink | Decision::Pending) {
+                *d = Decision::Skip { reason: r.clone() };
+            }
+        }
+    }
+    procs
+}
+
+/// 执行开始时再查一遍（预检之后才打开的程序、之后才改过的文件）：
+/// 返回 (要整项拦下的清单项下标 + 原因, 要跳过的单元前缀（小写，文件夹带结尾 `\`）)。
+/// 年龄规则的单元按每个文件现在的修改时间再查一遍年龄。
+pub fn busy_at_start(plan: &Plan, now: i64) -> (Vec<(usize, String)>, Vec<String>) {
+    let images = winops::running_images();
+    let mut items_out = Vec::new();
+    let mut prefixes = Vec::new();
+    let groups = unit_groups(plan);
+    let mut bad: Vec<String> = Vec::new();
+    for (key, u) in &groups {
+        let mut busy = !running_in(plan, &images, u).is_empty();
+        if let (false, UnitKind::Age(n)) = (busy, u.kind) {
+            let cutoff = now - n as i64 * 86_400;
+            busy = u.members.iter().any(|&(ii, ei)| {
+                let e = &plan.items[ii].entries[ei];
+                matches!(plan.items[ii].decisions[ei], Decision::Delete)
+                    && std::fs::symlink_metadata(crate::win::long_path(&e.path))
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .is_some_and(|d| d.as_secs() as i64 >= cutoff)
+            });
+        }
+        if busy {
+            bad.push(key.clone());
+        }
+    }
+    let rest: Vec<(&String, &Unit)> = groups.iter().filter(|(k, _)| !bad.contains(k)).collect();
+    bad.extend(rm_busy_units(plan, &rest).into_iter().map(|(k, _)| k));
+    for key in bad {
+        let u = &groups[&key];
+        let whole_item = u.members.first().is_some_and(|&(ii, _)| plan.items[ii].version_root.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&u.root)));
+        if whole_item {
+            let ii = u.members[0].0;
+            items_out.push((ii, format!("旧版本「{}」现在有程序在用，整个跳过（不会只删一半）", u.root)));
+        } else {
+            let is_dir = u.members.iter().any(|&(ii, ei)| !plan.items[ii].entries[ei].path.eq_ignore_ascii_case(&u.root));
+            prefixes.push(if is_dir { format!("{key}\\") } else { key.clone() });
+        }
+    }
+    for (ii, item) in plan.items.iter().enumerate() {
+        if item.blocked.is_some() || item.version_root.is_some() || item.age_root.is_some() {
+            continue;
+        }
+        let mut p = winops::images_under(&images, &item.path);
+        if let Some(a) = item.alias_of(&item.path) {
+            p.extend(winops::images_under(&images, &a));
+        }
+        if !p.is_empty() {
+            let names: Vec<String> = p.iter().map(|x| x.name.clone()).collect();
+            items_out.push((ii, format!("正在运行：{}（整个文件夹不动）", names.join("、"))));
+        }
+    }
+    (items_out, prefixes)
 }
 
 /// 清单里正在被某个程序用着的 Chromium 缓存文件夹（小写）+ 用它的进程。预检时用一次，执行开始时（[`super::execute`]）
@@ -843,7 +1101,7 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
         total_bytes += wd_bytes;
         total_skipped += sk_count;
         link_count += links;
-        if it.blocked.is_none() && it.tier == Tier::Review && (wd_count > 0 || (pending && wd_bytes > 0)) {
+        if it.blocked.is_none() && (it.tier == Tier::Review || it.forced) && (wd_count > 0 || (pending && wd_bytes > 0)) {
             review_items.push(ReviewNote { path: it.path.clone(), what: it.what.clone(), lose: it.lose.clone(), bytes: wd_bytes });
         }
         items.push(ItemReport {
@@ -868,6 +1126,7 @@ fn report_impl(plan: &Plan, locked_processes: Vec<LockingProcess>, pending: bool
             skipped_by_reason: by_reason,
             dirs_to_remove: if it.blocked.is_none() { it.dirs.len() } else { 0 },
             enum_errors: it.enum_errors.clone(),
+            forced: it.forced,
         });
     }
 

@@ -7,19 +7,30 @@
 // 并显示更深的层级；单击文件 / 其他 / 伪块 = 选中；单击已展开容器的标题栏 = 收起到它的父级。
 // - 每个容器的行 / 列结构固定（treemap.ts），块只沿原来的行 / 列伸缩：过渡里没有块横穿别的块；伸缩后太细的行并成「其他」；
 // - pk 的内容区不够大（按像素）就把图的根下移一层：镜头推近（每块从旧位置按同一个比例映射过去），反方向是拉远；
-//   缩放后图的根画成铺满整张图的容器，顶上一条和链上祖先同样式的标题栏（单击 = 收起到这一级）；
+//   缩放后图的根画成铺满整张图的容器，顶上一条和链上祖先同样式的标题栏（单击 = 收起这个根，镜头拉远；阶段 L 以前是「收起到这一级」）；
 // - 怎么动由 tmmotion.ts 算：离场的块先跟着祖先（或镜头）移动并淡出，压在它要缩进去的那一块上面，约 230 ms 后才删；
 // - 图自己变大变小（切视图 / 窗口）不逐块过渡：整张图淡出 → 新布局直接到位 → 淡入；
 // - 块上的字：按实际量字决定写法（tmtree.ts fitLabel），过渡开始时字先淡出、过半后用最终的写法淡入；
 // - 块按 key 稳定排序、用 z-index 分层（DOM 顺序不变 → 不会被挪动 → CSS 过渡真的生效，块在原地长大）。
 // 外观（阶段 K 第 2 / 3 轮）：链上的状态只用中性色（墨黑 / 灰），绝不用三档颜色；悬停 / 选中 / 正在看的文件夹三种状态一眼分得清；
 // 键盘：整张图只有一块在 Tab 序列里，方向键按画面位置走，Enter / Space = 单击；链上容器的标题栏 = 「收起」按钮。
+// 阶段 L：链上容器标题栏右端画一颗看得见的「收起」按钮（图标 + 字；pk 是反色实心、祖先是描边的，安静一级；窄了只留图标、再窄不画，fitChainHead），
+// 过渡里跟着标题栏的字一起淡出 / 淡入（hdcOld）；
+// 悬停 / 钉住的卡片内容写全（不截断），挂在 <body> 上量出大小再放（tipplace.ts），靠图边也整张看得见；悬停卡片不压住钉住的卡片。
+// 阶段 M：认不出来的块有 AI 推测时，卡片的说明写推测（写全），标签那一行多一个中性的「AI 推测」小标签（虚线框，不用三档颜色）。
+// 阶段 M 收尾（用户定的「统一调淡 · 更淡」，分档的方案看上去像出了毛病，否掉了）：展开了东西时，不在展开链上、也不在最深的展开块（pk）
+// 里面的块全部同一档调淡——块上盖一层页面底色（::after，A / C 0.62、B 0.5），C 的墨框和硬投影换成铅笔灰。链上的块（祖先容器、
+// 它们的标题栏和「收起」按钮、缩放后的根标题条）、pk 里面的、选中的、悬停的、键盘聚焦的从不调淡；悬停调淡的容器的标题栏时，
+// 它和它里面画出来的块一起亮起来。哪些块调淡由 tmtree.ts outsideChain 算（纯函数），存在 Tile.dim 上（离场的块沿用最后的值）。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { ScanSummary, TreemapNode } from "../api";
+import { tmKey, type ScanSummary, type TreemapNode } from "../api";
+import { shellNoteFor, tmNoteFor, type AiNotes } from "../ai";
+import AiTag from "./AiTag.vue";
 import { isHardTag, loseTag } from "../labels";
 import { bigEnough, contentBox, pickMapRoot, samePath, tileBox, type HiddenSlot, type LayoutOptions, type Rect, type TileBox, type TileTokens, type TmInput, type TmItem } from "../treemap";
 import {
   countLabel,
+  fitChainHead,
   fitHead,
   fitLabel,
   headHit,
@@ -28,16 +39,19 @@ import {
   navStep,
   navTargets,
   otherSig,
+  outsideChain,
   pathKey,
   rootCandidates,
   tileNode,
   tipName,
+  type HeadPill,
   type LabelFit,
   type LabelMetrics,
   type MapHit,
   type NavDir,
 } from "../tmtree";
 import { planMotion, tileZ, type Box, type MotionTile } from "../tmmotion";
+import { placeAtPointer, placeBeside, type PlaceBox } from "../tipplace";
 import { theme } from "../theme";
 import { sizeParts } from "../capacity";
 
@@ -57,6 +71,8 @@ const props = defineProps<{
   pin?: boolean;
   /** 认不出来的文件夹 / 文件的第一条线索（pathKey → 线索；来自列表数据） */
   clues?: ReadonlyMap<string, string>;
+  /** 阶段 M：这次运行里收到过的 AI 推测（pathKey → 推测）：数据里还没带上时用它补；换了它卡片就重算 */
+  notes?: AiNotes;
 }>();
 const emit = defineEmits<{ hit: [h: MapHit, ev: { at: number; detail: number }]; unsel: []; peek: [path: string] }>();
 
@@ -72,7 +88,12 @@ let peekTimer: ReturnType<typeof setTimeout> | undefined;
 let ro: ResizeObserver | null = null;
 /** 上一次窗口大小变化的时间：拖窗口时块直接跟着变（连淡入淡出都不做） */
 let winResizedAt = -1e9;
-const onWinResize = () => (winResizedAt = performance.now());
+/** 窗口大小（悬停 / 钉住的卡片夹在窗口里） */
+const vp = ref({ w: typeof window === "undefined" ? 0 : window.innerWidth, h: typeof window === "undefined" ? 0 : window.innerHeight });
+const onWinResize = () => {
+  winResizedAt = performance.now();
+  vp.value = { w: window.innerWidth, h: window.innerHeight };
+};
 /** 系统设置了「减少动画」：不做过渡，离场的块直接删 */
 const reduced = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 /**
@@ -110,13 +131,15 @@ onMounted(() => {
   ro.observe(wrap.value);
   window.addEventListener("resize", onWinResize);
   document.addEventListener("mousedown", onDocDown, true);
-  // 字体加载完以后重新量一次字
-  document.fonts?.ready.then(() => {
-    measured.clear();
-    labelCache.clear();
-    fontVer.value++;
-  });
+  // 字体加载完以后重新量一次字；后来才按需加载的字体（例如 unicode-range 分出去的拉丁扩展，第一次出现 é 这类字时才下载）加载完也再量一次
+  document.fonts?.ready.then(onFontsLoaded);
+  document.fonts?.addEventListener("loadingdone", onFontsLoaded);
 });
+function onFontsLoaded() {
+  measured.clear();
+  labelCache.clear();
+  fontVer.value++;
+}
 onBeforeUnmount(() => {
   ro?.disconnect();
   clearTimeout(stillTimer);
@@ -124,8 +147,10 @@ onBeforeUnmount(() => {
   clearTimeout(txTimer);
   clearTimeout(peekTimer);
   fadeAnim?.cancel();
+  pinAnim?.cancel();
   window.removeEventListener("resize", onWinResize);
   document.removeEventListener("mousedown", onDocDown, true);
+  document.fonts?.removeEventListener("loadingdone", onFontsLoaded);
 });
 
 // ── 设计令牌（tokens.css 的 --tm-*）：间隙、圆角上限、描边、投影、最小块都由主题决定，切主题时重读 ──
@@ -352,6 +377,9 @@ interface Tile {
   hd: boolean;
   /** 容器在链上的状态（标题栏的样子）：pk / 链上的祖先 / 不在链上；刚变成叶子时标题栏按它原来的样子淡掉 */
   hdc: "pk" | "on" | "";
+  /** 上一次标题栏的状态（和 txOld 配对）：字先淡出时标题栏的写法（「收起」按钮在不在、给 pk 留的位置）照上一次的算，
+   *  淡出的字不会被重新截断，按钮也跟着字一起淡出 / 过半再淡入；null = 没有上一次 */
+  hdcOld: "pk" | "on" | "" | null;
   /** 新出现的块从哪里长出来（null = 原地淡入） */
   from: Box | null;
   /** 出现的地方还压着正在让开的兄弟：晚这么多 ms 再淡入（0 = 不晚；子块跟着父块） */
@@ -360,6 +388,8 @@ interface Tile {
   born: number;
   /** 正在离场 */
   gone: boolean;
+  /** 展开时调淡：不在展开链上、也不在 pk 里面（outsideChain）；离场的块沿用最后的值 */
+  dim: boolean;
   z: number;
   /** 离场的块什么时候删 */
   until: number;
@@ -413,6 +443,7 @@ function inner(b: Box, container: boolean): Box {
 const fading = (x: Tile) => x.fd > txShown.value;
 const lbOf = (x: Tile): TileBox => (fading(x) ? (x.lbOld ?? x.b) : x.b);
 const txIt = (x: Tile): TmItem => (fading(x) ? (x.txOld ?? x.it) : x.it);
+const hdOf = (x: Tile): Tile["hdc"] => (fading(x) && x.hdcOld !== null ? x.hdcOld : x.hdc);
 
 const tiles = computed<Tile[]>(() => {
   void tick.value;
@@ -423,11 +454,14 @@ const tiles = computed<Tile[]>(() => {
   const group: TileTokens = { ...leaf, r: t.gR, bw: t.gBw, flatPx: 0 };
   const now = performance.now();
   const instant = still.value || reduced || !prevLive.size;
+  // 标题栏的状态和块的类（.pk / .on）同一个判断：pk = pkKey 那一块（pk 画不出来时退到最深的链上的块，也算）
+  const pkK = pkKey.value;
+  const dims = outsideChain(L.items, pkK);
   // 投影只给顶层块（容器 / 顶层大块），里面的小块只有描边
   const live: Tile[] = L.items.map((it) => {
     const b = tileBox(it.rect, it.container ? group : leaf, it.depth === 1);
-    const hdc: Tile["hdc"] = !it.container ? "" : it.chain && it.depth > 0 && samePath(tileNode(it)?.path, pk.value) ? "pk" : it.chain ? "on" : "";
-    return { key: it.key, rk: rkeyOf.get(it.key) ?? it.key, it, b, lbOld: null, txOld: null, fd: 0, hd: false, hdc, from: null, late: 0, born: 0, gone: false, z: zOf(it), until: 0 };
+    const hdc: Tile["hdc"] = !it.container ? "" : it.key === pkK ? "pk" : it.chain ? "on" : "";
+    return { key: it.key, rk: rkeyOf.get(it.key) ?? it.key, it, b, lbOld: null, txOld: null, fd: 0, hd: false, hdc, hdcOld: null, from: null, late: 0, born: 0, gone: false, dim: dims.has(it.key), z: zOf(it), until: 0 };
   });
   const done = () => {
     for (const x of live) rkeyOf.set(x.key, x.rk);
@@ -484,6 +518,9 @@ const tiles = computed<Tile[]>(() => {
         const old = s.fd > txShownNow;
         x.lbOld = old ? (s.lbOld ?? s.b) : s.b;
         x.txOld = old ? (s.txOld ?? s.it) : s.it;
+        // 标题栏照上一次画出来的样子淡出（上一次没有标题栏 = 不在链上）
+        const shown = s.it.container || s.hd ? s.hdc : "";
+        x.hdcOld = old ? (s.hdcOld ?? shown) : shown;
       }
     }
     // 容器变成了叶子：标题栏按原来的样子留着、淡掉
@@ -576,27 +613,46 @@ function tone(it: TmItem): string {
 }
 
 // ── 容器标题栏：名字露不出 6 个字时不写大小；截断用界面字体的「…」 ──
+/**
+ * 链上容器标题栏右端的「收起」按钮（阶段 L）：尺寸和下面 CSS 的 .pill 一致——左内边距 5 + 图标 12 + 间隔 3 + 「收起」+ 右内边距 7，
+ * 只有图标的宽 20；和前面的内容隔 6（标题栏的 gap），按钮往右多伸 4（margin-right: -4px，贴近标题栏右边）
+ */
+const PILL = { padL: 5, icon: 12, gap: 3, padR: 7, iconOnly: 20, before: 6, pull: 4 };
+const pillW = computed(() => {
+  void fontVer.value;
+  const t = tk.value;
+  // C：标题字体（霞鹜文楷）700 12px；A / B：界面字体 600 11.5px（和 CSS 一致）
+  const font = theme.value === "C" ? `700 12px ${t.heading}` : `600 11.5px ${t.ui}`;
+  const full = Math.ceil(PILL.padL + PILL.icon + PILL.gap + textW(font, "收起") + PILL.padR);
+  return { full: full + PILL.before - PILL.pull, icon: PILL.iconOnly + PILL.before - PILL.pull };
+});
+type HeadFit = ReturnType<typeof fitHead> & { pill: HeadPill };
 const heads = computed(() => {
   const f = headFonts.value;
   const t = tk.value;
+  const pw = pillW.value;
   void txShown.value;
   // 大小是等宽数字（tabular-nums）：canvas 量不出来，数字都当成「0」量（「1」比比例数字宽，按原样量会少算 1–2 px，名字被硬裁掉最后一个字）
   const num = (s: string) => s.replace(/\d/g, "0");
   const m = { name: (s: string) => textW(f.name, s), size: (s: string) => textW(f.size, num(s)), ell: textW(f.ell, "…"), gap: 6 };
-  const out = new Map<string, ReturnType<typeof fitHead>>();
+  const out = new Map<string, HeadFit>();
   for (const x of tiles.value) {
     if (!x.it.container && !x.hd) continue;
-    const isPk = pkKey.value === x.key;
+    // 框、内容、链上的状态三样一起取：字正在淡出时全按上一次的（= 上一次最终的写法，一个字都不变），过半以后全按这一次的。
+    // 不能混着用——旧的框配新的状态，会在淡出的字上给新出现的按钮让位置（字被重新截断），收起时按钮也会比字先一步消失
+    const hs = hdOf(x);
+    const isPk = hs === "pk";
     const bw = isPk ? (theme.value === "C" ? 3 : 2) : t.gBw;
     const tx = txIt(x);
-    // 标题栏左右内边距 8；链上的有收起箭头（14 + 间隔 6）；pk 留出加载小点的位置（6 + 6）；再留 2 px 量字误差
+    // 标题栏左右内边距 8；pk 留出加载小点的位置（6 + 6）；再留 2 px 量字误差
     let avail = lbOf(x).w - 2 * bw - 16 - 4;
-    if (x.it.chain) avail -= 20;
     if (isPk) avail -= 12;
-    out.set(x.rk, fitHead(tx.name, full(tx.size), avail, m));
+    // 链上的容器（单击标题栏 = 收起）：右端放「收起」按钮，窄了先换成只有图标的、再窄不放；刚变成叶子、标题栏正在淡掉的也照原样放
+    out.set(x.rk, hs !== "" ? fitChainHead(tx.name, full(tx.size), avail, m, pw) : { ...fitHead(tx.name, full(tx.size), avail, m), pill: "none" });
   }
   return out;
 });
+const pillOf = (x: Tile): HeadPill => heads.value.get(x.rk)?.pill ?? "none";
 
 // ── 叶子块上的字（F3）：按量出来的字宽 / 行高决定写法 ──
 const NO_LABEL: LabelFit = { mode: "none", big: false, name: "", cut: false, ix: 0, iy: 0 };
@@ -654,10 +710,10 @@ function onHead(x: Tile, e: Event) {
   if (h) emit("hit", h, tapInfo(e));
 }
 
-// ── 悬停卡片 / 钉住的卡片 ──
+// ── 悬停卡片 / 钉住的卡片（阶段 L：内容全部写出来、不截断；挂在 <body> 上、position: fixed，量出大小再放，永远整张看得见） ──
 const hover = ref<TmItem | null>(null);
-const tipPos = ref({ x: 0, y: 0 });
-const TIP_W = 236;
+/** 鼠标的窗口坐标（普通变量，不是 ref：鼠标每动一下只挪卡片，不让整张图的模板重跑一遍） */
+let mouse = { x: 0, y: 0 };
 /** 预取（F8）：鼠标在一个还没取过的文件夹块上停 120 ms，就让 store 在后台取它的子树（不改任何状态） */
 let peekKey: string | null = null;
 const PEEK_MS = 120;
@@ -670,29 +726,49 @@ function peekAt(x: Tile) {
   const path = n.path;
   peekTimer = setTimeout(() => emit("peek", path), PEEK_MS);
 }
+/** 悬停在调淡的容器的标题栏上：这块的 key（它和它里面画出来的块一起亮起来）；null = 没有 */
+const litKey = ref<string | null>(null);
+const lit = computed(() => {
+  const k = litKey.value;
+  const s = new Set<string>();
+  if (!k) return s;
+  const by = byKey.value;
+  for (const it of items.value) {
+    for (let p: string | null = it.key; p !== null; p = by.get(p)?.parentKey ?? null) {
+      if (p === k) {
+        s.add(it.key);
+        break;
+      }
+    }
+  }
+  return s;
+});
+/** 这块现在调淡（悬停 / 选中 / 键盘聚焦由 CSS 另外排除） */
+const dimOn = (x: Tile) => x.dim && !lit.value.has(x.key);
 function onMove(e: MouseEvent, x: Tile) {
   peekAt(x);
   const it = x.it;
+  const lk = it.container && x.dim && !x.gone && (e.target as Element | null)?.closest?.(".gh") ? x.key : null;
+  if (litKey.value !== lk) litKey.value = lk;
   if (it.container || x.gone) {
     hover.value = null;
     return;
   }
   hover.value = it;
-  const r = wrap.value!.getBoundingClientRect();
-  let tx = e.clientX - r.left + 14;
-  let ty = e.clientY - r.top + 16;
-  if (tx + TIP_W + 14 > r.width) tx = e.clientX - r.left - TIP_W - 14;
-  if (ty + 110 > r.height) ty = e.clientY - r.top - 110;
-  tipPos.value = { x: tx, y: ty };
+  // 只记坐标、直接挪卡片（不读布局）：卡片的大小换了内容才量一次（tipSz）
+  mouse = { x: e.clientX, y: e.clientY };
+  placeTip();
 }
 function onLeave() {
   hover.value = null;
+  litKey.value = null;
   peekKey = null;
   clearTimeout(peekTimer);
 }
 // 布局变了（展开 / 收起）：悬停的那块可能已经不在原来的位置，等鼠标再动
 watch(items, () => {
   hover.value = null;
+  litKey.value = null;
   peekKey = null;
   clearTimeout(peekTimer);
 });
@@ -705,16 +781,22 @@ function shellText(it: TmItem): string {
   return `${parts[0]} ${full(it.value)} · ${parts[parts.length - 1]} ${full(n.allocated)}`;
 }
 
-/** 卡片内容：名字、大小、一句说明（认不出来的写第一条线索，没有线索就只写「认不出来」） */
+/**
+ * 卡片内容：名字、大小、一句说明（认不出来的：有 AI 推测写推测、加「AI 推测」标签；没有就写第一条线索，没有线索只写「认不出来」）。
+ * 「其他」块不是一个真实的项，不带推测
+ */
 function tipOf(it: TmItem) {
   const n = tileNode(it);
   const tn = tone(it);
   const pseudo = (it.ref as { pseudo?: string } | undefined)?.pseudo;
   const cnt = countLabel(it);
+  // 外壳合并块（key = 外层路径，n = 内层）：内层没问过时借链上问过的上层的推测（ai.ts shellNoteFor）
+  const ai = it.kind === "other" || pseudo ? null : n && it.key !== tmKey(n) ? shellNoteFor(props.data, it.key, n, props.notes) : tmNoteFor(n, props.notes);
   let what = "";
   if (it.kind === "other") what = `${it.mergedCount} 个小项合计`;
   else if (pseudo) what = PSEUDO_TIP[pseudo] ?? "";
   else if (n?.kind === "Rest") what = cnt ? `${cnt.num} 个小文件合计` : n.what;
+  else if (ai) what = ai.what.trim();
   else if (n && n.tier === "unknown") what = props.clues?.get(pathKey(n.path)) ?? "认不出来";
   else what = n?.what ?? "";
   if (!what && tn === "mix") what = "认不出来";
@@ -724,6 +806,7 @@ function tipOf(it: TmItem) {
     tone: tn,
     shell: shellText(it),
     what,
+    ai: !!ai,
     lose: n && n.tier === "review" ? n.lose_kind : null,
     loseText: n && n.tier === "review" ? loseTag(n) : null,
   };
@@ -747,30 +830,100 @@ const tip = computed(() => {
   if (!it || it.container || it.key === pinKey.value) return null;
   return tipOf(it);
 });
-/** 钉住的卡片：放在那块的右边（放不下放左边，都放不下放下面 / 上面），跟着块的目标位置走 */
+/** 钉住的卡片：内容 + 那块的目标位置（块在图里的坐标） */
 const pinTip = computed(() => {
   const k = pinKey.value;
   if (!k || !props.pin || !selOk.value || props.selKey !== k) return null;
   const x = tiles.value.find((t) => t.key === k && !t.gone);
   if (!x) return null;
-  const { w: W, h: H } = size.value;
-  const b = x.b;
-  const M = 10;
-  const pos: Record<string, string> = {};
-  let left = b.x + b.w + M;
-  if (left + TIP_W > W - 4) left = b.x - TIP_W - M;
-  if (left >= 4) {
-    // 靠下的块：卡片底边对齐块的底边（不量卡片多高也不会出界）
-    if (b.y + 130 > H) pos.bottom = Math.max(4, H - (b.y + b.h)) + "px";
-    else pos.top = Math.max(4, b.y) + "px";
-  } else {
-    left = Math.min(Math.max(4, b.x + b.w / 2 - TIP_W / 2), W - TIP_W - 4);
-    if (b.y + b.h + M + 120 <= H) pos.top = b.y + b.h + M + "px";
-    else pos.bottom = Math.max(4, H - b.y + M) + "px";
-  }
-  pos.left = left + "px";
-  return { ...tipOf(x.it), pos };
+  return { key: k, b: boxOf(x.b), ...tipOf(x.it) };
 });
+
+/** 卡片的大小：内容（或主题 / 字体 / 窗口）变了才量一次——同一张卡片跟着鼠标走时不再读布局 */
+type Measured = { of: string; w: number; h: number };
+const tipEl = ref<HTMLElement | null>(null);
+const pinEl = ref<HTMLElement | null>(null);
+const tipSz = ref<Measured | null>(null);
+const pinSz = ref<Measured | null>(null);
+function sigOf(t: ReturnType<typeof tipOf> | null): string | null {
+  if (!t) return null;
+  return [t.name, t.size, t.tone, t.shell, t.what, t.ai ? "ai" : "", t.loseText ?? "", theme.value, fontVer.value, vp.value.w].join("\u0000");
+}
+const measure = (el: HTMLElement | null, of: string | null): Measured | null => (el && of ? { of, w: el.offsetWidth, h: el.offsetHeight } : null);
+// flush: post = 新内容已经写进卡片、浏览器还没画：量完马上放好，第一帧就在对的位置（量好之前卡片是 visibility: hidden）
+watch(
+  () => sigOf(tip.value),
+  (s) => {
+    tipSz.value = measure(tipEl.value, s);
+    placeTip();
+  },
+  { flush: "post" },
+);
+watch(() => (pinTip.value ? pinTip.value.key + "\u0000" + sigOf(pinTip.value) : null), (s) => (pinSz.value = measure(pinEl.value, s)), { flush: "post" });
+
+/**
+ * 悬停卡片：指针右下，放不下翻到左边 / 上边，夹在窗口里；钉住的卡片在旁边时换到不压住它的那一边。
+ * 直接写元素的 left / top（模板里不绑 style）：鼠标每动一下只挪这一张卡片，不重跑整张图的模板。
+ */
+function placeTip() {
+  const el = tipEl.value;
+  if (!el) return;
+  const s = tipSz.value;
+  const ready = !!s && s.of === sigOf(tip.value);
+  const pp = pinPlace.value;
+  const avoid = pp && pp.ready ? { x: pp.x, y: pp.y, w: pp.w, h: pp.h } : null;
+  const p = ready && s ? placeAtPointer(mouse, s, { x: 0, y: 0, w: vp.value.w, h: vp.value.h }, avoid) : { x: mouse.x + 14, y: mouse.y + 16 };
+  el.style.left = Math.round(p.x) + "px";
+  el.style.top = Math.round(p.y) + "px";
+  el.style.visibility = ready ? "visible" : "hidden";
+}
+/**
+ * 钉住的卡片：放在那块的旁边（tipplace.placeBeside），夹在图里；图比卡片还小时夹在窗口里。
+ * 图在窗口里的位置在这里读（getBoundingClientRect）：它跟着块（tiles，图一变大小就重排）、卡片大小和窗口大小重算。
+ * 图在窗口里挪动而大小不变时不会重算——现在不会发生（图在 flex 布局里，上面多一条横幅 / 换视图都会改它的大小）；
+ * 以后要是有这种挪法（比如页面能滚动），在这里加一个依赖（滚动 / ResizeObserver 记下的位置）
+ */
+const pinPlace = computed(() => {
+  const p = pinTip.value;
+  const el = wrap.value;
+  if (!p || !el) return null;
+  const s = pinSz.value;
+  const ready = !!s && s.of === p.key + "\u0000" + sigOf(p);
+  const o = el.getBoundingClientRect();
+  const b: PlaceBox = { x: o.left + p.b.x, y: o.top + p.b.y, w: p.b.w, h: p.b.h };
+  const w = s?.w ?? 0;
+  const h = s?.h ?? 0;
+  const fitsMap = w + 12 <= o.width && h + 12 <= o.height;
+  const area: PlaceBox = fitsMap ? { x: o.left, y: o.top, w: o.width, h: o.height } : { x: 0, y: 0, w: vp.value.w, h: vp.value.h };
+  const pos = ready && s ? placeBeside(b, { w, h }, area) : { x: b.x + b.w + 10, y: b.y };
+  return { key: p.key, ready, x: Math.round(pos.x), y: Math.round(pos.y), w, h };
+});
+const pinStyle = computed(() => {
+  const p = pinPlace.value;
+  return p ? { left: p.x + "px", top: p.y + "px", visibility: p.ready ? undefined : ("hidden" as const) } : {};
+});
+/** 钉住的块在过渡里换了位置：卡片跟着它的目标位置一起滑过去（和块的位置过渡同样的时长 / 缓动） */
+let pinAnim: Animation | null = null;
+watch(
+  pinPlace,
+  (now, before) => {
+    const el = pinEl.value;
+    if (!el || !now || !before || reduced || still.value || typeof el.animate !== "function") return;
+    if (!now.ready || !before.ready || now.key !== before.key || now.w !== before.w || now.h !== before.h) return;
+    if (Math.abs(now.x - before.x) < 1 && Math.abs(now.y - before.y) < 1) return;
+    // 上一段还没滑完：从它现在画在哪里接着滑
+    let from = { left: before.x + "px", top: before.y + "px" };
+    if (pinAnim && pinAnim.playState === "running") {
+      const cs = getComputedStyle(el);
+      from = { left: cs.left, top: cs.top };
+      pinAnim.cancel();
+    }
+    pinAnim = el.animate([from, { left: now.x + "px", top: now.y + "px" }], { duration: 260, easing: "cubic-bezier(0.2, 0.7, 0.2, 1)" });
+  },
+  { flush: "post" },
+);
+// 钉住的卡片换了位置 / 窗口变了：悬停卡片照新的情况重新放（不压住钉住的卡片）
+watch([pinPlace, vp], () => placeTip(), { flush: "post" });
 
 // ── 键盘：只有一块在 Tab 序列里（roving tabindex），方向键按画面位置走 ──
 /** 最近一次键盘 / 鼠标落在的块和它的各级父块：那块没了（收起了 / 被并进「其他」）就落到还在的最近的父块上 */
@@ -905,6 +1058,7 @@ function headTitle(x: Tile): string | undefined {
         loading && pkKey === x.key,
         rovingKey === x.key,
         heads.get(x.rk),
+        dimOn(x),
       ]"
       :ref="(el) => setEl(x.rk, el)"
       class="tm-tile"
@@ -927,7 +1081,7 @@ function headTitle(x: Tile): string | undefined {
                 sel: curKey === x.key,
               },
             ],
-        { gone: x.gone, txo: fading(x) },
+        { gone: x.gone, txo: fading(x), dim: dimOn(x) },
       ]"
       :style="boxStyle(x, !x.it.container && curKey === x.key)"
       :data-k="DEV ? x.key : undefined"
@@ -949,7 +1103,7 @@ function headTitle(x: Tile): string | undefined {
         :class="x.it.container ? undefined : ['out', 'was-' + x.hdc]"
         :role="headTarget(x) && !x.gone ? 'button' : undefined"
         :tabindex="headTarget(x) && !x.gone ? (rovingKey === x.key ? 0 : -1) : undefined"
-        :aria-label="headTarget(x) && !x.gone ? (x.it.depth === 0 ? '收起到 ' : '收起 ') + x.it.name : undefined"
+        :aria-label="headTarget(x) && !x.gone ? '收起 ' + x.it.name : undefined"
         :aria-expanded="headTarget(x) && !x.gone ? 'true' : undefined"
         :title="headTitle(x)"
         @click.stop="onHead(x, $event)"
@@ -958,7 +1112,11 @@ function headTitle(x: Tile): string | undefined {
       >
         <span v-if="heads.get(x.rk)?.name !== ''" class="gn">{{ heads.get(x.rk)?.name ?? txIt(x).name }}<span v-if="heads.get(x.rk)?.cut" class="el">…</span></span>
         <i v-if="heads.get(x.rk)?.size !== false" class="num">{{ full(txIt(x).size) }}</i>
-        <svg v-if="x.it.chain" class="up" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6" /></svg>
+        <!-- 「收起」按钮（整条标题栏都能点，这里只是让人一眼看出来）：两个往里收的箭头 + 「收起」；窄了只留图标、再窄不画 -->
+        <span v-if="pillOf(x) !== 'none'" class="pill" :class="{ ico: pillOf(x) === 'icon' }">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4v6h6M14 10l7-7M4 14h6v6M3 21l7-7" /></svg>
+          <b v-if="pillOf(x) === 'full'">收起</b>
+        </span>
       </div>
       <!-- 字放在里面一层（绝对定位、四周留白由 fitLabel 算好）：块自己没有内边距，过渡里块再小也不会被内边距撑大、压到邻块 -->
       <span v-if="!x.it.container && lab(x).mode !== 'none'" class="in" :style="inStyle(lab(x))">
@@ -982,18 +1140,25 @@ function headTitle(x: Tile): string | undefined {
         <span class="in"><span class="a">名</span><span class="b num">0</span></span>
       </div>
     </div>
-    <div v-if="tip" class="tip" :style="{ left: tipPos.x + 'px', top: tipPos.y + 'px' }">
-      <div class="t1"><i class="dot" :class="tip.tone"></i><span class="tn">{{ tip.name }}</span><span class="s num">{{ tip.size }}</span></div>
-      <div v-if="tip.shell" class="t2 num">{{ tip.shell }}</div>
-      <div v-if="tip.what" class="t2">{{ tip.what }}</div>
-      <div v-if="tip.loseText" class="t3"><span class="tag" :class="{ hard: isHardTag(tip.lose) }">{{ tip.loseText }}</span></div>
-    </div>
-    <div v-if="pinTip" class="tip pin" :style="pinTip.pos" role="status">
-      <div class="t1"><i class="dot" :class="pinTip.tone"></i><span class="tn">{{ pinTip.name }}</span><span class="s num">{{ pinTip.size }}</span></div>
-      <div v-if="pinTip.shell" class="t2 num">{{ pinTip.shell }}</div>
-      <div v-if="pinTip.what" class="t2">{{ pinTip.what }}</div>
-      <div v-if="pinTip.loseText" class="t3"><span class="tag" :class="{ hard: isHardTag(pinTip.lose) }">{{ pinTip.loseText }}</span></div>
-    </div>
+    <!-- 卡片挂在 <body> 上（position: fixed）：不被图的 overflow: hidden 裁掉，靠图边的块卡片也整张看得见 -->
+    <Teleport to="body">
+      <div v-if="tip" ref="tipEl" class="tip">
+        <div class="t1"><i class="dot" :class="tip.tone"></i><span class="tn">{{ tip.name }}</span><span class="s num">{{ tip.size }}</span></div>
+        <div v-if="tip.shell" class="t2 num">{{ tip.shell }}</div>
+        <div v-if="tip.what" class="t2">{{ tip.what }}</div>
+        <div v-if="tip.loseText || tip.ai" class="t3">
+          <span v-if="tip.loseText" class="tag" :class="{ hard: isHardTag(tip.lose) }">{{ tip.loseText }}</span><AiTag v-if="tip.ai" />
+        </div>
+      </div>
+      <div v-if="pinTip" :key="pinTip.key" ref="pinEl" class="tip pin" :style="pinStyle" role="status">
+        <div class="t1"><i class="dot" :class="pinTip.tone"></i><span class="tn">{{ pinTip.name }}</span><span class="s num">{{ pinTip.size }}</span></div>
+        <div v-if="pinTip.shell" class="t2 num">{{ pinTip.shell }}</div>
+        <div v-if="pinTip.what" class="t2">{{ pinTip.what }}</div>
+        <div v-if="pinTip.loseText || pinTip.ai" class="t3">
+          <span v-if="pinTip.loseText" class="tag" :class="{ hard: isHardTag(pinTip.lose) }">{{ pinTip.loseText }}</span><AiTag v-if="pinTip.ai" />
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -1097,25 +1262,118 @@ function headTitle(x: Tile): string | undefined {
     color var(--dur-1) var(--ease),
     opacity var(--dur-1) var(--ease);
 }
-.g .gh .up,
-.gh.out .up {
+/* 「收起」按钮（阶段 L）：链上容器标题栏的右端，图标 + 「收起」。整条标题栏都能点，按钮只是让人一眼看出来。
+   只用中性色，绝不用三档颜色 / 强调色。分两级：
+   - 最深那个（pk）最强：实底标题栏上一颗反色的实心按钮（墨色底 → 浅色按钮；B 的浅色底 → 深色按钮）；
+   - 祖先（和缩放后的根条）安静一级：浅底 + 墨线描边的按钮（和「图例」这些按钮同一种样子），悬停 / 键盘聚焦标题栏时反过来变成墨色实心。
+     链很深时右上角不会叠出一串一样的黑徽章，一眼看得出哪个是现在这一层。
+   描边用 outline（画在按钮里面，不占尺寸）：尺寸和脚本里的 PILL 一致（量名字还剩多少地方用） */
+.g .gh .pill,
+.gh.out .pill {
+  /* 定位 = 画在标题栏的焦点环上面（焦点环从按钮后面穿过去，见下面 :focus-visible） */
+  position: relative;
   flex: none;
-  width: 14px;
-  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
   margin-left: auto;
+  margin-right: -4px;
+  padding: 0 7px 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--ink);
+  outline: 1px solid var(--ink);
+  outline-offset: -1px;
+  font-family: var(--ui);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  /* opacity 和标题栏里别的字一样 110ms（过渡里跟着字一起淡出 / 淡入） */
+  transition:
+    opacity 110ms var(--ease),
+    background-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease),
+    outline-color var(--dur-1) var(--ease),
+    box-shadow var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease);
+}
+.g .gh .pill.ico,
+.gh.out .pill.ico {
+  padding: 0 4px;
+}
+.gh .pill b {
+  font-weight: inherit;
+}
+.gh .pill svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
   fill: none;
   stroke: currentColor;
-  stroke-width: 2.2;
+  stroke-width: 2.6;
   stroke-linecap: round;
   stroke-linejoin: round;
-  opacity: 0.55;
-  transition: opacity var(--dur-1) var(--ease);
+}
+/* 最深那个（pk）：实底标题栏上一颗反色的实心按钮（不要描边） */
+.g.pk .gh .pill,
+.gh.out.was-pk .pill {
+  background: var(--surface);
+  color: var(--ink);
+  outline-color: transparent;
+}
+/* 悬停在标题栏任何地方（整条都是按钮）：祖先的按钮变成墨色实心，按钮外面亮一圈，图标往里一捏再弹回来（= 收起这个动作；停下来时图标是原大小，1x 屏上也清楚）。
+   亮圈浓一些（标题栏悬停时底色也变深，太淡的圈会和它混在一起） */
+.g .gh:hover .pill,
+.g .gh:focus-visible .pill {
+  background: var(--ink);
+  color: var(--surface);
+}
+.g .gh:hover .pill {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ink) 34%, transparent);
+}
+.g.pk .gh:hover .pill,
+.g.pk .gh:focus-visible .pill {
+  background: var(--surface);
+  color: var(--ink);
+}
+.g.pk .gh:hover .pill {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--surface) 50%, transparent);
+}
+.g .gh:hover .pill svg {
+  animation: pill-pinch 480ms;
+}
+/* 先收进去（缓入缓出），再带一点回弹弹回原大小 */
+@keyframes pill-pinch {
+  0% {
+    animation-timing-function: cubic-bezier(0.4, 0, 0.6, 1);
+  }
+  35% {
+    transform: scale(0.66);
+    animation-timing-function: cubic-bezier(0.3, 1.6, 0.5, 1);
+  }
+}
+.g .gh:active .pill {
+  transform: translateY(1px);
+}
+/* 键盘焦点：标题栏的焦点环照旧在里面一圈（-4px，和别的标题栏一样，不贴着块的描边）；按钮压在环上面，
+   外面描一圈它自己的字色（= 和标题栏底色同一侧的颜色），环在按钮两边断开，看上去是从按钮后面穿过去 */
+.g .gh:focus-visible .pill,
+.g.pk .gh:focus-visible .pill {
+  box-shadow: 0 0 0 2px currentColor;
+}
+/* 减少动画：图标不捏、按下不位移（亮圈照常出现） */
+@media (prefers-reduced-motion: reduce) {
+  .g .gh:hover .pill svg {
+    animation: none;
+  }
+  .g .gh:active .pill {
+    transform: none;
+  }
 }
 .g:hover .gh {
   color: var(--ink);
-}
-.g .gh:hover .up {
-  opacity: 1;
 }
 /* 展开链上的容器：只用中性色（绝不用三档颜色）。祖先：标题字加深加粗、描边加深一级；最深那个（pk）再强一级 */
 .g.on {
@@ -1153,6 +1411,15 @@ function headTitle(x: Tile): string | undefined {
   50% {
     opacity: 0.6;
   }
+}
+/* 有「收起」按钮时小点放在按钮前面（按钮始终贴着右边） */
+.g.wait .gh:has(.pill)::after {
+  order: 1;
+  margin-left: auto;
+}
+.g.wait .gh .pill {
+  order: 2;
+  margin-left: 0;
 }
 /* A 纸本：祖先的标题栏垫一层浅灰；悬停只加深字和描边（和祖先的灰底分得开） */
 [data-theme="A"] .g.on .gh,
@@ -1253,12 +1520,17 @@ function headTitle(x: Tile): string | undefined {
 [data-theme="C"] .gh.out.was-pk i {
   color: rgba(255, 255, 255, 0.72);
 }
-[data-theme="C"] .g.pk .gh .up,
-[data-theme="C"] .gh.out.was-pk .up {
-  opacity: 0.9;
-}
 [data-theme="C"] .g.pk .gh:hover {
   background: #33332e;
+}
+/* C：按钮的字用标题字体（和标题栏的名字、「图例」按钮一样），胶囊形；祖先的白按钮描边粗一点（墨线是 C 的样子） */
+[data-theme="C"] .g .gh .pill,
+[data-theme="C"] .gh.out .pill {
+  font-family: var(--heading);
+  font-size: 12px;
+  font-weight: 700;
+  outline-width: 1.5px;
+  outline-offset: -1.5px;
 }
 /* 块上的字（F4）：过渡开始时，位置要变的块上的字约 60 ms 淡出，过渡过半后换成最终的写法再淡入；
    离场的块（残影）字立刻隐藏，只留色块淡出——不会出现新旧两层字叠在一起 */
@@ -1273,7 +1545,7 @@ function headTitle(x: Tile): string | undefined {
     opacity: 0;
   }
 }
-/* !important：标题栏里各部分自己的不透明度（收起箭头 .55 / pk .9 / 悬停 1）不能盖掉淡出（过渡仍然生效） */
+/* !important：标题栏里各部分（名字 / 大小 / 「收起」按钮）自己的样式不能盖掉淡出（过渡仍然生效） */
 .tm-tile.txo .in,
 .tm-tile.txo > .gh > * {
   opacity: 0 !important;
@@ -1471,30 +1743,44 @@ function headTitle(x: Tile): string | undefined {
   width: 300px;
   height: 120px;
 }
+/* 悬停 / 钉住的卡片（阶段 L）：挂在 <body> 上、position: fixed（位置由脚本量出大小后算好，写在 left / top 里）。
+   内容全部写出来、不截断：名字可以折行（长文件名在任意处断开），说明多长写多长；宽度随内容在 236–300px 之间，高度自动。
+   层级 50：压在标题栏（40）/ 图例弹层（20）上面；在提示横幅（60）、确认对话框（80）、A / B 的纸纹（200）下面 */
 .tip {
-  position: absolute;
-  z-index: 1000;
-  width: 236px;
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 50;
+  width: max-content;
+  min-width: 236px;
+  max-width: min(300px, calc(100vw - 16px));
   padding: 12px 14px;
   background: var(--surface);
+  color: var(--ink);
   border-radius: var(--r);
   box-shadow: 0 16px 40px -12px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--line);
   font-size: var(--fs-sub);
+  line-height: 1.4;
   pointer-events: none;
 }
-/* 钉住的卡片（整宽方块图里选中一块）：跟着块的目标位置走 */
+/* 悬停卡片：量好、放好之前看不见（位置由 placeTip 直接写在元素上，放好才写 visibility: visible） */
+.tip:not(.pin) {
+  visibility: hidden;
+}
+/* 钉住的卡片（整宽方块图里选中一块）：出现时轻轻淡入；块换位置时由脚本让它跟着滑过去 */
 .tip.pin {
-  z-index: 999;
-  transition:
-    left var(--dur-3) var(--ease),
-    top var(--dur-3) var(--ease),
-    bottom var(--dur-3) var(--ease);
+  z-index: 49;
   animation: tip-in var(--dur-2) var(--ease);
 }
 @keyframes tip-in {
   from {
     opacity: 0;
     transform: translateY(3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tip.pin {
+    animation: none;
   }
 }
 [data-theme="B"] .tip {
@@ -1506,38 +1792,74 @@ function headTitle(x: Tile): string | undefined {
   box-shadow: 4px 4px 0 #141412;
   border-radius: 12px;
 }
+/* 第一行：色点 + 名字（折行）+ 大小（不折行，对齐名字的第一行） */
 .tip .t1 {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   font-weight: var(--w-semi);
   font-size: 14px;
+  line-height: 20px;
   min-width: 0;
+}
+.tip .t1 .dot {
+  margin-top: 6px;
+}
+[data-theme="C"] .tip .t1 .dot {
+  margin-top: 5px;
 }
 .tip .t1 .tn {
+  flex: 1 1 auto;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .tip .t1 .s {
+  flex: none;
   margin-left: auto;
+  padding-left: 4px;
   white-space: nowrap;
 }
 .tip .t2 {
   margin-top: 4px;
-  color: var(--ink3);
+  color: var(--ink2);
   font-size: var(--fs-meta);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 .tip .t3 {
   margin-top: 10px;
   display: flex;
   align-items: center;
   gap: 8px;
+}
+/* 后果标签：文字来自规则（用户规则也能写长），在卡片里可以折行、不伸出卡片；一行时高度和别处的标签一样 */
+.tip .t3 .tag {
+  flex: 0 1 auto;
+  min-width: 0;
+  height: auto;
+  min-height: 20px;
+  padding-top: 1px;
+  padding-bottom: 1px;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* C 的标签是胶囊（999px）：折成几行时改成同样圆的圆角矩形（11px = 一行高的一半，一行时看上去和胶囊一样） */
+[data-theme="C"] .tip .t3 .tag {
+  min-height: 22px;
+  border-radius: 11px;
+}
+/* 「AI 推测」：固定的四个字，不折行（尺寸见 base.css 的 .tag.ai） */
+.tip .t3 .tag.ai {
+  flex: none;
+  min-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  white-space: nowrap;
+}
+[data-theme="C"] .tip .t3 .tag.ai {
+  min-height: 0;
+  border-radius: 999px;
 }
 </style>
 
@@ -1604,6 +1926,39 @@ function headTitle(x: Tile): string | undefined {
 }
 @media (prefers-reduced-motion: reduce) {
   .tm-tile {
+    transition: none !important;
+  }
+}
+/* 展开时调淡（阶段 M 收尾，「统一调淡 · 更淡」）：不在展开链上、也不在 pk 里面的块（.dim，outsideChain）同一档——
+   盖一层页面底色，底色、字、标题栏一起淡下去（A / C 0.62、B 0.5）；C 的墨框和硬投影换成铅笔灰（≈ #84827c）。
+   层在字（.in / 标题栏）上面、描边下面（paint 包含把它裁在块里）；平时透明度 0，取消调淡时淡出。
+   调淡晚 90 ms 再开始（鼠标扫过去不闪），取消立刻开始。选中的、悬停的叶子、键盘聚焦的不调淡（容器的悬停按标题栏算，脚本里另外处理） */
+.tm-tile::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 9;
+  pointer-events: none;
+  background: var(--bg);
+  opacity: 0;
+  transition: opacity var(--dur-2) var(--ease);
+}
+.tm-tile.dim:not(.sel, :focus-visible, .lf:hover)::after {
+  opacity: 0.62;
+  transition-delay: 90ms;
+}
+[data-theme="B"] .tm-tile.dim:not(.sel, :focus-visible, .lf:hover)::after {
+  opacity: 0.5;
+}
+[data-theme="C"] .tm-tile.dim:not(.sel, :focus-visible, .lf:hover) {
+  --stroke: color-mix(in srgb, #141412 50%, #f4f0e6);
+  border-color: color-mix(in srgb, #141412 50%, #f4f0e6);
+}
+.map.still .tm-tile::after {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tm-tile::after {
     transition: none !important;
   }
 }

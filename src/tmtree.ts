@@ -273,6 +273,35 @@ export function layoutMap(
   return { root: node.path, items: layoutTreemap(input, frame, opt, canon, frame, head, hidden), hidden };
 }
 
+// ───── 展开时调淡：链外的块统一盖一层页面底色 ─────
+
+/**
+ * 展开了东西时要调淡的块（用户定的「统一调淡 · 更淡」：只有一档，不按远近分级、不分左右）。
+ * 每块顺着 parentKey 往上找最近的链上的块：找到的是 pk（最深的展开块）= 在 pk 里面，不调淡；
+ * 是别的链上的块（祖先容器、外壳合并块、缩放后的根标题条）或者一直到顶都没有 = 在外面，调淡。
+ * 链上的块自己从不调淡（祖先容器、它们的标题栏和「收起」按钮、根标题条都清楚）；pk 为空（什么都没展开）或不在图上时一块也不调淡。
+ */
+export function outsideChain<T extends { key: string; parentKey: string | null; chain: boolean }>(items: readonly T[], pk: string | null): Set<string> {
+  const out = new Set<string>();
+  const by = new Map(items.map((t) => [t.key, t]));
+  if (!pk || !by.has(pk)) return out;
+  for (const t of items) {
+    if (t.chain) continue;
+    let p = t.parentKey;
+    while (p !== null) {
+      const a = by.get(p);
+      if (!a) {
+        p = null;
+        break;
+      }
+      if (a.chain) break;
+      p = a.parentKey;
+    }
+    if (p !== pk) out.add(t.key);
+  }
+  return out;
+}
+
 // ───── 单击翻译（TreemapView 把 DOM 事件翻译成 MapHit，store.mapClick 执行） ─────
 
 /** 方块图里被单击的东西 */
@@ -316,12 +345,12 @@ export function tileHit(it: { key: string; kind: TmItemKind; ref?: unknown; merg
 
 /**
  * 单击容器的标题栏：path = 内层（往里挖），outer = 块的 key（外层路径，收起按它算）。
- * 自动缩放后图顶上的根标题条（depth 0）：收起到这个根这一级（和点面包屑上它那一级一样：链停在它这里）。
+ * 自动缩放后图顶上的根标题条（depth 0）也一样 = 收起这个根自己（阶段 L：标题条上写着「收起」，就得真的把它收起来；
+ * 以前是「收起到这一级」，和下面那一层容器的「收起」做的是同一件事）。根收起以后图的根跟着往上移（镜头拉远）。
  */
-export function headHit(it: Pick<TmItem, "key" | "ref"> & { depth?: number }): MapHit | null {
+export function headHit(it: Pick<TmItem, "key" | "ref">): MapHit | null {
   const n = tileNode(it);
   if (!n) return null;
-  if (it.depth === 0) return { kind: "dir", path: n.path };
   return { kind: "head", path: n.path, outer: it.key };
 }
 
@@ -396,6 +425,38 @@ export function fitHead(
   // 窄到名字只露得出一两个字（「W…」猜不出是什么）：只写大小（全名在标题栏的提示里）
   if (n < 3 && sizeW - m.gap <= avail) return { name: "", cut: false, size: true };
   return { name: head(n), cut: true, size: false };
+}
+
+/** 链上容器标题栏右端的「收起」按钮：图标 + 「收起」/ 只有图标 / 不画 */
+export type HeadPill = "full" | "icon" | "none";
+
+/**
+ * 链上容器（已展开、单击标题栏 = 收起）的标题栏：右端放一个「收起」按钮，名字 / 大小在剩下的地方按 fitHead 写。
+ * 按钮从完整的（图标 + 「收起」）往下退：名字还能露出 fullMin 个字（或者整个放得下）才放完整的；
+ * 再窄换成只有图标的，名字至少露出 iconMin 个字；再窄就不放按钮（整条标题栏照样能点），空间全给名字和大小。
+ * pill.full / pill.icon = 按钮占的宽度（含它和前面内容的间隔），avail = 标题栏能写字的宽度（不含按钮）。
+ */
+export function fitChainHead(
+  name: string,
+  size: string,
+  avail: number,
+  m: { name: (s: string) => number; size: (s: string) => number; ell: number; gap: number },
+  pill: { full: number; icon: number },
+  fullMin = 6,
+  iconMin = 4,
+): { name: string; cut: boolean; size: boolean; pill: HeadPill } {
+  const len = Array.from(name).length;
+  const tries: [HeadPill, number, number][] = [
+    ["full", pill.full, fullMin],
+    ["icon", pill.icon, iconMin],
+  ];
+  for (const [mode, w, min] of tries) {
+    const room = avail - w;
+    if (room <= 0) continue;
+    const r = fitHead(name, size, room, m);
+    if (r.name !== "" && (!r.cut || Array.from(r.name).length >= Math.min(min, len))) return { ...r, pill: mode };
+  }
+  return { ...fitHead(name, size, avail, m), pill: "none" };
 }
 
 // ───── 叶子块上的字（F3）：按实际量出来的字宽 / 行高决定写法，永不硬裁 ─────

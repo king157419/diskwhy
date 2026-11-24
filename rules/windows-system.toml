@@ -248,11 +248,15 @@ tier = "safe"
 match = ['%SystemRoot%\Temp']
 what = "系统级临时文件"
 why = "系统服务、安装程序运行时留下的中间文件"
-lose = "不丢数据；正在使用的文件会删不掉，跳过即可。"
+lose = "7 天以上没动过的一般没人再用；最近的可能属于正在进行或等重启才完成的安装（本机实测：vminst.log 还在写）。DiskWhy 只删 7 天以上没改过的（和“磁盘清理”一样），最近的和正在用的不动。"
 how = ["delete", "builtin_tool"]
-how_detail = "推荐用“设置 > 系统 > 存储 > 临时文件”清理；手动删需要管理员权限。"
-refs = ["https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32"]
-verified_on = "2026-09-23"
+min_age_days = 7
+how_detail = "DiskWhy 只删 7 天以上没改过的：里面每个文件 / 子文件夹单独看，子文件夹里有一个文件是最近改的、或者有程序正在用，整个子文件夹都不动。也可以用“设置 > 系统 > 存储 > 临时文件”或“磁盘清理”。"
+refs = [
+  "https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32",
+  "https://learn.microsoft.com/windows-server/administration/windows-commands/cleanmgr",
+]
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "user-temp"
@@ -262,17 +266,22 @@ tier = "safe"
 match = ['%TEMP%', '%LOCALAPPDATA%\Temp']
 what = "你账户下的临时文件"
 why = "软件运行、解压、安装时放中间文件的地方，本该用完就删，但很多软件会遗留"
-lose = "一般不丢数据；正在运行的程序可能还在用其中一部分（会删不掉，跳过即可）。刚下载还没安装完的安装包也可能在这里。"
+lose = "7 天以上没动过的一般没人再用；最近几天的可能是：正在运行的程序（比如 Claude Code 会话）的文件、装到一半或要等重启才装完的安装包、已经下载好等下次启动安装的软件更新。这些删了要重下，有的回不来。所以 DiskWhy 只删 7 天以上没改过的（和“磁盘清理”一样）。"
 how = ["delete", "builtin_tool"]
-how_detail = "关掉不用的程序后删除里面的内容；或用“设置 > 系统 > 存储 > 临时文件”。"
-refs = ["https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32"]
-verified_on = "2026-09-23"
+min_age_days = 7
+how_detail = "DiskWhy 只删 7 天以上没改过的：里面每个文件 / 子文件夹单独看，子文件夹里有一个文件是最近改的、或者有程序正在用，整个子文件夹都不动。也可以用“设置 > 系统 > 存储 > 临时文件”或“磁盘清理”（默认只删 7 天没访问过的）。"
+refs = [
+  "https://support.microsoft.com/en-us/windows/free-up-drive-space-in-windows-85529ccb-c365-490d-b548-831022bc9b32",
+  "https://learn.microsoft.com/windows-server/administration/windows-commands/cleanmgr",
+]
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "windows-update-download"
 owner = "Windows 更新"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%SystemRoot%\SoftwareDistribution\Download']
 what = "Windows 更新下载的安装包"
 why = "Windows 更新先把补丁下载到这里再安装"
@@ -301,6 +310,7 @@ id = "delivery-optimization"
 owner = "Windows 更新"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = [
   '%SystemRoot%\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization',
   '%SystemRoot%\SoftwareDistribution\DeliveryOptimization',
@@ -425,38 +435,60 @@ id = "thumbnail-cache"
 owner = "Windows 资源管理器"
 category = "cache"
 tier = "safe"
+lose_kind = "slower"
+kind = "file"
 match = [
-  '%LOCALAPPDATA%\Microsoft\Windows\Explorer',
   '%LOCALAPPDATA%\Microsoft\Windows\Explorer\thumbcache_*.db',
   '%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db',
 ]
 what = "缩略图和图标缓存"
-why = "资源管理器把图片、视频的缩略图存下来，打开文件夹时不用每次重新生成"
-lose = "不丢数据；删掉后第一次打开图片多的文件夹会慢一点，缩略图重新生成。"
+why = "资源管理器把图片、视频的缩略图和程序图标存下来，打开文件夹时不用每次重新生成"
+lose = "不丢数据；删掉后第一次打开图片多的文件夹会慢一点，缩略图和图标会重新生成。"
 how = ["builtin_tool", "delete"]
 how_detail = "用“磁盘清理”勾选“缩略图”最省事（这些文件被资源管理器占用，手动删常常删不掉）。"
 refs = []
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
+
+[[rule]]
+id = "explorer-cache-dir"
+owner = "Windows 资源管理器"
+category = "system"
+tier = "keep"
+scope = "self"
+kind = "dir"
+match = ['%LOCALAPPDATA%\Microsoft\Windows\Explorer']
+what = "缩略图和图标缓存所在的文件夹"
+why = "里面的 thumbcache_*.db、iconcache_*.db 是缓存（单独标绿）；另外还有开始菜单的推荐过滤表和启动日志"
+lose = "不要整个删，请点进去只清缩略图和图标缓存。"
+how = "none"
+how_detail = ""
+refs = []
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "inetcache"
 owner = "Windows / IE 内核"
 category = "cache"
 tier = "safe"
-match = ['%LOCALAPPDATA%\Microsoft\Windows\INetCache']
+lose_kind = "redownload"
+match = [
+  '%LOCALAPPDATA%\Microsoft\Windows\INetCache\IE',
+  '%LOCALAPPDATA%\Microsoft\Windows\INetCache\Content.IE5',
+]
 what = "旧版 IE 内核的网页缓存"
 why = "用到老式网页控件的程序会把网页文件缓存到这里"
-lose = "不丢数据，网页下次重新下载。"
+lose = "不丢数据，网页下次联网重新下载。同一个文件夹下的 Content.Outlook（Outlook 打开附件时的副本）不在这一项里。"
 how = ["builtin_tool", "delete"]
-how_detail = "“磁盘清理”勾选“Internet 临时文件”，或直接删里面的内容。"
+how_detail = "“磁盘清理”勾选“Internet 临时文件”，或直接删这两个子文件夹的内容。"
 refs = []
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "directx-shader-cache"
 owner = "DirectX"
 category = "cache"
 tier = "safe"
+lose_kind = "slower"
 match = ['%LOCALAPPDATA%\D3DSCache']
 what = "DirectX 着色器缓存"
 why = "游戏和图形程序编译好的着色器存在这里，下次加载更快"

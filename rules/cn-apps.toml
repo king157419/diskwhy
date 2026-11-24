@@ -36,22 +36,20 @@ refs = []
 verified_on = "2026-09-23"
 
 [[rule]]
-id = "wechat-render-cache"
+id = "wechat-radium"
 owner = "微信"
-category = "cache"
-tier = "safe"
-match = [
-  '%APPDATA%\Tencent\xwechat\radium',
-  '%APPDATA%\Tencent\WeChat\radium',
-  '%APPDATA%\Tencent\xwechat\xplayer',
-]
-what = "微信内置浏览器、小程序和视频播放器的缓存"
-why = "打开公众号文章、小程序、视频号时，微信把网页资源和小程序包存在这里"
-lose = "不丢聊天记录；删掉后小程序、公众号文章要重新加载，个别小程序可能需要重新登录。"
-how = ["delete", "builtin_tool"]
-how_detail = "先完全退出微信（托盘图标右键退出），再删除；或用微信“设置 → 存储空间 → 清理缓存”。"
+category = "userdata"
+tier = "review"
+lose_kind = "unsure"
+lose_short = "小程序数据会丢"
+match = ['%APPDATA%\Tencent\xwechat\radium', '%APPDATA%\Tencent\WeChat\radium']
+what = "微信内置浏览器和小程序的运行数据"
+why = "微信 4.x 的 radium 里有内置浏览器的完整资料（Cookie、历史、Local Storage、IndexedDB）、小程序的代码包和本地存储（applet\\local\\<小程序>\\usr、mmkv）、设备编号 device_uuid_0；真正的网页缓存（Cache、Code Cache、GPUCache）在 web\\profiles 里，会单独标绿"
+lose = "不丢聊天记录；但公众号文章和网页要重新登录，小程序存在本机的数据（草稿、设置、登录状态）会丢，只存在本机的找不回来。"
+how = "builtin_tool"
+how_detail = "用微信“设置 → 存储空间 → 清理缓存”；不要手动删整个文件夹。"
 refs = []
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "wechat-logs"
@@ -61,6 +59,7 @@ tier = "safe"
 match = [
   '%APPDATA%\Tencent\xwechat\log',
   '%APPDATA%\Tencent\xwechat\crashinfo',
+  '%APPDATA%\Tencent\xwechat\xplayer\dump',
   '%APPDATA%\Tencent\WeChat\log',
   '%APPDATA%\Tencent\WeChat\xweb\crash',
 ]
@@ -70,13 +69,14 @@ lose = "只是丢掉日志，不影响聊天记录和使用。"
 how = "delete"
 how_detail = "退出微信后删除。"
 refs = []
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "wechat-update"
 owner = "微信"
 category = "installer"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%APPDATA%\Tencent\xwechat\update', '%APPDATA%\Tencent\WeChat\update']
 what = "微信自动更新下载的安装包"
 why = "微信后台下载新版本，准备下次启动时升级"
@@ -228,6 +228,7 @@ id = "feishu-update"
 owner = "飞书"
 category = "installer"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%APPDATA%\LarkShell\update']
 what = "飞书自动更新下载的安装包"
 why = "飞书在后台下载新版本，准备升级"
@@ -417,6 +418,7 @@ id = "netease-music-cache"
 owner = "网易云音乐"
 category = "cache"
 tier = "safe"
+lose_kind = "redownload"
 match = ['%LOCALAPPDATA%\NetEase\CloudMusic\Cache', '%LOCALAPPDATA%\NetEase\CloudMusic\Temp']
 what = "网易云音乐的歌曲缓存（听过的歌临时存一份）"
 why = "在线听歌时缓存下来，再听同一首不用重新下载"
@@ -431,14 +433,14 @@ id = "netease-music-logs"
 owner = "网易云音乐"
 category = "log"
 tier = "safe"
-match = ['%LOCALAPPDATA%\NetEase\CloudMusic\Log', '%LOCALAPPDATA%\NetEase\CloudMusic\dumps', '%LOCALAPPDATA%\NetEase\CloudMusic\cloudmusic.elog']
-what = "网易云音乐的日志和崩溃记录"
+match = ['%LOCALAPPDATA%\NetEase\CloudMusic\Log', '%LOCALAPPDATA%\NetEase\CloudMusic\cloudmusic.elog']
+what = "网易云音乐的日志"
 why = "程序运行记录，出问题时排查用"
 lose = "只是丢掉日志，不影响使用。"
 how = "delete"
 how_detail = "退出网易云音乐后删除。"
 refs = []
-verified_on = "2026-09-23"
+verified_on = "2026-11-02"
 
 [[rule]]
 id = "netease-music-data"
@@ -541,8 +543,8 @@ category = "app"
 tier = "keep"
 match = ['%LOCALAPPDATA%\Kingsoft\WPS Office', '%LOCALAPPDATA%\Kingsoft']
 what = "WPS Office 的程序本体（只给当前账户装的版本）"
-why = "WPS 默认装在这里；每次升级会建一个新的版本号文件夹，旧版本有时会残留"
-lose = "直接删 WPS 就打不开了。如果看到两个版本号文件夹，旧的多半是升级残留，但 DiskWhy 不能确认哪个在用，建议用 WPS 自己的修复 / 卸载重装来清理。"
+why = "WPS 默认装在这里；每次升级会建一个新的版本号文件夹，旧版本会残留（见“旧版本”规则 wps-office-old-versions）"
+lose = "直接删 WPS 就打不开了。升级后残留的旧版本号文件夹 DiskWhy 会单独标出来（可以清理），正在用的那个版本不能删。"
 how = "manual"
 how_detail = "“设置 > 应用”里卸载或修复 WPS；卸载前确认云文档已同步。"
 refs = []
